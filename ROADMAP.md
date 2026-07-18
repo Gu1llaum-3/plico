@@ -1,0 +1,92 @@
+# Roadmap plico
+
+> Philosophie constante : **orchestrer** `git`, `sops`, `docker compose` — ne rien
+> réimplémenter. Chaque ajout doit rester compréhensible par un mainteneur seul.
+> Pull-only assumé : pas de webhook, la fenêtre de déploiement est un choix, pas
+> une contrainte.
+
+## ✅ v0 — MVP (livré)
+
+- Polling git par stack (clone/fetch incrémental, auth HTTPS par domaine via
+  `GIT_ASKPASS` = le binaire lui-même, auto-réparation d'un clone corrompu)
+- **Gate de backup pré-déploiement bloquant** (`.deploy/pre-deploy.sh` du repo
+  prioritaire, fallback global ; `exit ≠ 0` → pas de déploiement, retry au tick
+  suivant) + hook post-déploiement non bloquant
+- Secrets SOPS **déchiffrés en mémoire** (`sops exec-env`, chiffrement partiel
+  `.sops.yaml`/`encrypted_regex` supporté) ; mode tmpfs Linux en option
+- `pull` + `up -d --remove-orphans` ; un pull qui échoue ne touche pas la stack
+- Vérification post-up (healthchecks), verrou par stack, sémaphore global,
+  arrêt gracieux qui draine les runs en vol
+- `/healthz` sémantique, logs slog JSON avec `run_id`, state.json atomique,
+  notifications ntfy dédupliquées (même échec = une seule alerte)
+- Tooling : mise (tasks), lefthook, smoke test e2e (git + docker + sops/age)
+  en CI GitHub Actions, releases GoReleaser (linux/darwin/freebsd × amd64/arm64)
+
+## 🎯 v1 — Opérabilité (priorité 1 : le différenciateur)
+
+C'est ce qui transforme le daemon en outil qu'on opère. Rien de tout ceci
+n'existe dans doco-cd.
+
+- [ ] **Planning par stack** (F5–F8) : expression cron + fenêtre horaire,
+      surcharge du global par stack, timezone configurable, comportement DST
+      documenté (lib pressentie : robfig/cron)
+- [ ] **Distinction check / apply** (F6) : détecter et notifier « déploiement
+      en attente » en journée, appliquer dans la fenêtre
+- [ ] **CLI cliente** via socket unix (F24–F30) : `status`, `check-now`,
+      `deploy-now`, `dry-run`, `validate` ; `--skip-pre` interdit sans
+      `--force` + notification `pre_hook_skipped`
+- [ ] **config.d/<stack>.toml + SIGHUP** (F21–F23) : deep-merge (scalaire
+      surchargé, map fusionnée, tableau REMPLACÉ, champs protégés non
+      surchargeables), fichier invalide = stack ignorée + alerte
+- [ ] **Multi-notifiers** (F31–F33) : webhook générique (Teams/Google Chat) +
+      SMTP, filtrage par événement et par canal
+- [ ] **Heartbeat Uptime Kuma** par stack (F36)
+
+## 🔭 v1.x — Combler l'écart doco-cd (à la carte, dans cet ordre)
+
+- [ ] **`path` par stack (monorepo)** : pointer un sous-répertoire du repo —
+      effort faible, forte valeur, aligné avec le modèle existant
+- [ ] **Détection de dérive (« reconciliation-lite »)** : re-check périodique
+      de la santé des stacks entre les déploiements via `compose ps` →
+      notification sur dérive (unhealthy, service arrêté à la main). **Pas de
+      remédiation automatique** : backup + alerte + humain, toujours
+- [ ] **Options compose fines par stack** : `profiles`, `env_files`
+      additionnels, `remove_orphans` désactivable, args `up` supplémentaires
+- [ ] **`plico healthcheck`** : sous-commande qui sonde son propre /healthz
+      (HEALTHCHECK Docker, watchdog systemd)
+- [ ] **`/metrics` Prometheus** : `deployments_total`, `deploy_errors_total`,
+      `poll_duration_seconds`, `deployments_active`… (nommage inspiré de
+      doco-cd)
+- [ ] **Renovate/Dependabot** sur le repo (deps Go + versions mise épinglées)
+- [ ] Clone shallow (`--depth 1`) en option ; `ref` = tag ou SHA épinglé
+
+## 🌅 v2+ — Plus tard, peut-être
+
+- [ ] **Podman** : nouvelle implémentation de l'interface `compose.Runtime`
+      (prévue pour, rien d'autre à toucher)
+- [ ] Rollback données assisté (restic restore guidé — jamais automatique)
+- [ ] Image conteneur officielle (en assumant les compromis socket/volume)
+- [ ] Quiesce standardisé avant dump (label/convention), si le besoin émerge
+      des hooks réels
+
+## 🚫 Hors périmètre — décisions, pas des oublis
+
+| Écarté | Pourquoi |
+|---|---|
+| **Webhooks** | Pull-only assumé : sans rolling deploy, l'instantanéité n'apporte rien ; la fenêtre de déploiement est le vrai besoin |
+| **Swarm** | Abandonné en amont, aucune nouveauté — aucun intérêt |
+| **Reconciliation événementielle** (events Docker → redeploy auto) | Complexité forte, contraire à la philosophie backup + alerte + humain ; la détection de dérive en couvre l'essentiel |
+| **Auto-discovery de stacks** | Magique ; tout doit être explicite dans la config |
+| **Build d'images** | C'est le travail d'une CI, pas d'un déployeur |
+| **Sources OCI, providers de secrets externes** (Vault, 1Password…) | sops + age suffisent ; chaque provider est une surface de maintenance |
+| **Zéro-downtime dans plico** | Si nécessaire un jour : blue-green derrière Traefik/Caddy, orchestré par les hooks pre/post-deploy existants — hors du binaire |
+
+## Mémo sécurité (contexte, pas une tâche)
+
+Le « jamais en clair sur disque » couvre le périmètre plico (base_dir,
+worktrees, logs — ce que restic sauvegarde). Les valeurs interpolées vivent
+ensuite dans la config des conteneurs (`/var/lib/docker`, `docker inspect`) :
+propriété inhérente à l'injection par variables d'environnement, commune à
+tous les outils du genre. Au reboot, `unless-stopped` **redémarre** les
+conteneurs avec leur config existante — ni sops, ni la clé age, ni plico ne
+sont sollicités ; la clé n'est nécessaire qu'au prochain déploiement.
