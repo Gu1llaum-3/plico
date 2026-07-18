@@ -53,6 +53,20 @@ func NewRunner(log *slog.Logger) Runner {
 }
 
 func (r *osRunner) Run(ctx context.Context, c Cmd) (Result, error) {
+	// Retry ETXTBSY: on Linux, exec-ing a freshly written script can race a
+	// concurrent fork that inherited the (already closed) write descriptor
+	// (golang/go#22315). Transient by nature; a short retry absorbs it.
+	for attempt := 0; ; attempt++ {
+		res, err := r.runOnce(ctx, c)
+		if err != nil && errors.Is(err, syscall.ETXTBSY) && attempt < 3 && ctx.Err() == nil {
+			time.Sleep(time.Duration(10<<attempt) * time.Millisecond)
+			continue
+		}
+		return res, err
+	}
+}
+
+func (r *osRunner) runOnce(ctx context.Context, c Cmd) (Result, error) {
 	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 	cmd.Dir = c.Dir
 	cmd.Env = append(os.Environ(), c.Env...)
