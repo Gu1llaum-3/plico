@@ -55,16 +55,19 @@ func (f *fakeRuntime) PS(context.Context, compose.Options) ([]compose.Service, e
 	return f.services, f.psErr
 }
 
-// eventRecorder implements notify.Notifier.
+// eventRecorder implements notify.Notifier and records whether the context
+// it was called with was still alive (a dead ctx = undeliverable in real life).
 type eventRecorder struct {
-	mu     sync.Mutex
-	events []notify.Event
+	mu      sync.Mutex
+	events  []notify.Event
+	ctxErrs []error
 }
 
-func (r *eventRecorder) Notify(_ context.Context, ev notify.Event) error {
+func (r *eventRecorder) Notify(ctx context.Context, ev notify.Event) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, ev)
+	r.ctxErrs = append(r.ctxErrs, ctx.Err())
 	return nil
 }
 
@@ -86,6 +89,7 @@ func (r *eventRecorder) last() notify.Event {
 
 type harness struct {
 	deployer *Deployer
+	cfg      *config.Config
 	stack    config.StackConfig
 	runtime  *fakeRuntime
 	events   *eventRecorder
@@ -156,7 +160,7 @@ func newHarness(t *testing.T) *harness {
 		gitFake, // sops tmpfs path unused in these tests
 		discard(),
 	)
-	return &harness{deployer: d, stack: cfg.Stacks[0], runtime: rt, events: events, store: store, worktree: worktree}
+	return &harness{deployer: d, cfg: cfg, stack: cfg.Stacks[0], runtime: rt, events: events, store: store, worktree: worktree}
 }
 
 func (h *harness) writePreHook(t *testing.T, body string) {
@@ -386,6 +390,118 @@ func TestConcurrentRunIsSkipped(t *testing.T) {
 	}
 	if first := <-done; first != OutcomeDeployed {
 		t.Errorf("first run outcome = %s, want deployed", first)
+	}
+}
+
+func TestRepeatedPreHookFailureNotifiesOnce(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "exit 1")
+
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeFailed {
+		t.Fatalf("first run outcome = %s", outcome)
+	}
+	first := len(h.events.types())
+	if first == 0 {
+		t.Fatal("first failure must notify")
+	}
+	st, _ := h.store.Get("web")
+	if st.LastFailedSHA != newSHA || st.LastFailedStage != StagePreHook {
+		t.Fatalf("failure not recorded for dedup: %+v", st)
+	}
+
+	// Next poll ticks retry the same revision: no new notifications.
+	for i := 0; i < 3; i++ {
+		if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeFailed {
+			t.Fatalf("retry outcome = %s", outcome)
+		}
+	}
+	if got := len(h.events.types()); got != first {
+		t.Errorf("retries re-notified: %d events after retries, %d after first failure\n%v",
+			got, first, h.events.types())
+	}
+}
+
+func TestFailureAtDifferentStageNotifiesAgain(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "exit 1")
+	if h.deployer.RunStack(context.Background(), h.stack) != OutcomeFailed {
+		t.Fatal("first run should fail at pre_hook")
+	}
+	// The hook is fixed but now the pull fails: this is new information.
+	h.writePreHook(t, "exit 0")
+	h.runtime.pullErr = errors.New("registry down")
+	if h.deployer.RunStack(context.Background(), h.stack) != OutcomeFailed {
+		t.Fatal("second run should fail at pull")
+	}
+	ev := h.events.last()
+	if ev.Type != notify.DeployFailed || ev.Stage != StagePull {
+		t.Errorf("stage change must re-notify, last = %s/%s", ev.Type, ev.Stage)
+	}
+}
+
+func TestRecoveryAfterFailureNotifiesSuccess(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "exit 1")
+	if h.deployer.RunStack(context.Background(), h.stack) != OutcomeFailed {
+		t.Fatal("first run should fail")
+	}
+	h.writePreHook(t, "exit 0")
+	if h.deployer.RunStack(context.Background(), h.stack) != OutcomeDeployed {
+		t.Fatal("second run should deploy")
+	}
+	ev := h.events.last()
+	if ev.Type != notify.DeploySuccess {
+		t.Errorf("last event = %s, want deploy_success", ev.Type)
+	}
+	st, _ := h.store.Get("web")
+	if st.LastFailedSHA != "" || st.LastFailedStage != "" {
+		t.Errorf("success must clear failure-dedup fields: %+v", st)
+	}
+}
+
+func TestQueueSlotTimeoutNotifiesAndPersists(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "exit 0")
+	h.cfg.RunTimeout = config.Duration{Duration: 300 * time.Millisecond}
+	// Saturate the deployment semaphore (cap = MaxConcurrentDeploys = 2).
+	h.deployer.sem <- struct{}{}
+	h.deployer.sem <- struct{}{}
+
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeFailed {
+		t.Fatalf("outcome = %s", outcome)
+	}
+	ev := h.events.last()
+	if ev.Type != notify.DeployFailed || ev.Stage != StageQueue {
+		t.Errorf("last event = %s/%s, want deploy_failed/queue_wait", ev.Type, ev.Stage)
+	}
+	st, _ := h.store.Get("web")
+	if st.LastDeployedSHA != oldSHA || st.LastStatus != state.StatusFailed || st.LastFailedStage != StageQueue {
+		t.Errorf("state = %+v", st)
+	}
+}
+
+func TestFailureNotificationSurvivesExpiredRunContext(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "sleep 30")
+	h.cfg.RunTimeout = config.Duration{Duration: 300 * time.Millisecond}
+
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeFailed {
+		t.Fatalf("outcome = %s", outcome)
+	}
+	ev := h.events.last()
+	if ev.Type != notify.PreHookFailed {
+		t.Fatalf("last event = %s", ev.Type)
+	}
+	h.events.mu.Lock()
+	lastCtxErr := h.events.ctxErrs[len(h.events.ctxErrs)-1]
+	h.events.mu.Unlock()
+	if lastCtxErr != nil {
+		t.Errorf("failure notification was sent on a dead context (%v): it would never be delivered", lastCtxErr)
 	}
 }
 

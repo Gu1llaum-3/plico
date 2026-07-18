@@ -54,6 +54,15 @@ func (c *Client) SyncAndResolve(ctx context.Context, repoURL, ref, dir string) (
 
 func (c *Client) syncOnce(ctx context.Context, repoURL, ref, dir string) (string, error) {
 	if _, statErr := os.Stat(filepath.Join(dir, ".git")); statErr != nil {
+		// The clone dir is only a cache. A leftover dir without .git (an
+		// interrupted first clone, manual debris) would make `git clone`
+		// refuse "destination path already exists": wipe it first.
+		if _, err := os.Stat(dir); err == nil {
+			c.log.Warn("removing leftover non-git directory before clone", "dir", dir)
+			if err := os.RemoveAll(dir); err != nil {
+				return "", fmt.Errorf("removing leftover dir: %w", err)
+			}
+		}
 		if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 			return "", err
 		}

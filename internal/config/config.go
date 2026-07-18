@@ -175,6 +175,9 @@ func (c *Config) Validate() error {
 	if c.PollInterval.Duration < 5*time.Second {
 		return fmt.Errorf("poll_interval must be >= 5s, got %s", c.PollInterval.Duration)
 	}
+	if c.MaxConcurrentDeploys < 1 {
+		return fmt.Errorf("max_concurrent_deploys must be >= 1, got %d", c.MaxConcurrentDeploys)
+	}
 	if c.Ntfy.URL != "" {
 		if _, err := url.ParseRequestURI(c.Ntfy.URL); err != nil {
 			return fmt.Errorf("ntfy.url: %w", err)
@@ -203,15 +206,26 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("stack %q: sops_mode must be \"exec-env\" or \"tmpfs\", got %q", st.Name, st.SopsMode)
 		}
 		for _, f := range st.SopsFiles {
-			if filepath.IsAbs(f) || strings.Contains(f, "..") {
+			if filepath.IsAbs(f) || escapesRepo(f) {
 				return fmt.Errorf("stack %q: sops file %q must be a repo-relative path", st.Name, f)
 			}
 		}
-		if strings.Contains(st.ComposeFile, "..") {
+		if filepath.IsAbs(st.ComposeFile) || escapesRepo(st.ComposeFile) {
 			return fmt.Errorf("stack %q: compose_file %q must not escape the repo", st.Name, st.ComposeFile)
 		}
 	}
 	return nil
+}
+
+// escapesRepo reports whether a relative path climbs out of the repo. It
+// checks path segments, so filenames merely containing ".." (a..b.env) pass.
+func escapesRepo(p string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // Location returns the parsed timezone (validated beforehand).

@@ -55,16 +55,26 @@ func TestResolve(t *testing.T) {
 		}
 	})
 
-	t.Run("non-executable repo hook is ignored", func(t *testing.T) {
+	t.Run("non-executable repo hook is an error, not a silent skip", func(t *testing.T) {
 		t.Parallel()
 		repo := t.TempDir()
 		writeScript(t, filepath.Join(repo, RepoPreDeploy), "exit 0", 0o644)
-		res, err := Resolve(repo, RepoPreDeploy, "")
-		if err != nil {
-			t.Fatal(err)
+		_, err := Resolve(repo, RepoPreDeploy, "")
+		if err == nil {
+			t.Fatal("a committed hook without +x must block the deploy, not bypass the gate")
 		}
-		if res.Path != "" {
-			t.Errorf("non-executable hook resolved: %+v", res)
+		if !strings.Contains(err.Error(), "not executable") {
+			t.Errorf("error = %v", err)
+		}
+	})
+
+	t.Run("non-executable repo hook errors even with a global fallback", func(t *testing.T) {
+		t.Parallel()
+		repo, global := t.TempDir(), filepath.Join(t.TempDir(), "global.sh")
+		writeScript(t, filepath.Join(repo, RepoPreDeploy), "exit 0", 0o644)
+		writeScript(t, global, "exit 0", 0o755)
+		if _, err := Resolve(repo, RepoPreDeploy, global); err == nil {
+			t.Fatal("the repo-declared gate must not be silently replaced by the global hook")
 		}
 	})
 

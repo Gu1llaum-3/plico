@@ -100,7 +100,11 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
 	s.running[st.Name] = time.Now()
 	s.mu.Unlock()
 
-	outcome := s.deployer.RunStack(ctx, st)
+	// Detached context: shutdown must stop NEW ticks but let an in-flight
+	// deployment finish (Run waits on the WaitGroup) — cancelling here would
+	// SIGKILL a docker compose up mid-flight and leave the stack half
+	// updated. Each run stays bounded by its own run_timeout.
+	outcome := s.deployer.RunStack(context.WithoutCancel(ctx), st)
 
 	s.mu.Lock()
 	delete(s.running, st.Name)

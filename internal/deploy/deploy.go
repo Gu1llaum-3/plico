@@ -56,6 +56,7 @@ func (o Outcome) String() string {
 // Pipeline stages, used in logs and notifications.
 const (
 	StageGitSync   = "git_sync"
+	StageQueue     = "queue_wait"
 	StageCheckout  = "checkout"
 	StagePreHook   = "pre_hook"
 	StageSops      = "sops"
@@ -66,7 +67,13 @@ const (
 	StageStateSave = "state_save"
 )
 
-const verifyPollInterval = 5 * time.Second
+const (
+	verifyPollInterval = 5 * time.Second
+	// notifyTimeout bounds each notification send. Notifications run on a
+	// context detached from the run: a deploy that died on run_timeout must
+	// still be able to deliver its failure alert.
+	notifyTimeout = 30 * time.Second
+)
 
 type Deployer struct {
 	cfg      *config.Config
@@ -121,13 +128,6 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	defer cancel()
 
 	dir := filepath.Join(d.cfg.BaseDir, st.Name)
-	ev := func(t notify.EventType, oldSHA, newSHA, stage, detail string) {
-		_ = d.notifier.Notify(ctx, notify.Event{
-			Type: t, Stack: st.Name, RunID: runID, Ref: st.Ref,
-			OldSHA: oldSHA, NewSHA: newSHA, Stage: stage, Detail: detail,
-			Time: time.Now(),
-		})
-	}
 
 	// 1. git sync — a fetch failure is not a deploy failure: nothing was
 	// going to be deployed. Logged, visible via the scheduler snapshot.
@@ -146,46 +146,82 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	}
 	log.Info("git delta detected", "old_sha", oldSHA, "new_sha", newSHA)
 
+	// A failed revision is retried every tick (self-healing), but the same
+	// (revision, stage) failure is only notified once — not every minute.
+	repeat := prev.LastFailedSHA == newSHA
+
+	// Notifications run on a detached context (see notifyTimeout).
+	ev := func(t notify.EventType, stage, detail string) {
+		nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
+		defer cancel()
+		_ = d.notifier.Notify(nctx, notify.Event{
+			Type: t, Stack: st.Name, RunID: runID, Ref: st.Ref,
+			OldSHA: oldSHA, NewSHA: newSHA, Stage: stage, Detail: detail,
+			Time: time.Now(),
+		})
+	}
+	// fail records the failure (keeping deployedSHA as the deployed revision
+	// and remembering what failed for dedup) and notifies unless this exact
+	// failure was already notified on a previous tick.
+	fail := func(t notify.EventType, stage, detail, deployedSHA, status string) {
+		if repeat && prev.LastFailedStage == stage {
+			log.Warn("repeated failure on same revision, notification suppressed",
+				"stage", stage, "sha", newSHA)
+		} else {
+			ev(t, stage, detail)
+		}
+		d.saveState(log, st.Name, state.StackState{
+			LastDeployedSHA: deployedSHA, LastStatus: status, LastRunID: runID,
+			UpdatedAt: time.Now(), LastFailedSHA: newSHA, LastFailedStage: stage,
+		})
+	}
+
 	// Concurrency budget: only taken once real work is due.
 	select {
 	case d.sem <- struct{}{}:
 		defer func() { <-d.sem }()
 	case <-ctx.Done():
-		log.Error("timed out waiting for a deployment slot")
+		log.Error("timed out waiting for a deployment slot", "stage", StageQueue)
+		fail(notify.DeployFailed, StageQueue,
+			"timed out waiting for a free deployment slot (max_concurrent_deploys)",
+			oldSHA, state.StatusFailed)
 		return OutcomeFailed
 	}
 
-	ev(notify.DeployQueued, oldSHA, newSHA, "", "")
+	if !repeat {
+		ev(notify.DeployQueued, "", "")
+	}
 
 	// 4. checkout the exact revision being deployed.
 	if err := d.git.CheckoutDetached(ctx, st.Repo, dir, newSHA); err != nil {
 		log.Error("checkout failed", "stage", StageCheckout, "error", err)
-		ev(notify.DeployFailed, oldSHA, newSHA, StageCheckout, err.Error())
+		fail(notify.DeployFailed, StageCheckout, err.Error(), oldSHA, state.StatusFailed)
 		return OutcomeFailed
 	}
 
-	ev(notify.DeployStart, oldSHA, newSHA, "", "")
+	if !repeat {
+		ev(notify.DeployStart, "", "")
+	}
 
 	// 6. pre-deploy hook — the backup gate (F9–F14).
 	hctx := hooks.Context{Stack: st.Name, Dir: dir, GitRef: st.Ref, OldSHA: oldSHA, NewSHA: newSHA}
 	res, err := hooks.Resolve(dir, hooks.RepoPreDeploy, d.cfg.Hooks.PreDeployPath)
 	if err != nil {
 		log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
-		ev(notify.PreHookFailed, oldSHA, newSHA, StagePreHook, err.Error())
-		d.saveState(log, st.Name, oldSHA, state.StatusPreHookFailed, runID)
+		fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
 		return OutcomeFailed
 	}
 	if res.Path == "" {
 		log.Info("no pre-deploy hook found, continuing", "stage", StagePreHook)
-		ev(notify.PreHookSkipped, oldSHA, newSHA, StagePreHook, "no pre-deploy hook in repo or config")
+		ev(notify.PreHookSkipped, StagePreHook, "no pre-deploy hook in repo or config")
 	} else {
 		log.Info("running pre-deploy hook", "hook", res.Path, "source", res.Source)
 		hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration)
 		if err != nil {
 			log.Error("pre-deploy hook failed, deployment aborted", "stage", StagePreHook, "error", err)
-			ev(notify.PreHookFailed, oldSHA, newSHA, StagePreHook,
-				fmt.Sprintf("%v\n%s", err, execx.Tail(hres.Stderr, 1024)))
-			d.saveState(log, st.Name, oldSHA, state.StatusPreHookFailed, runID)
+			fail(notify.PreHookFailed, StagePreHook,
+				fmt.Sprintf("%v\n%s", err, execx.Tail(hres.Stderr, 1024)),
+				oldSHA, state.StatusPreHookFailed)
 			return OutcomeFailed
 		}
 	}
@@ -195,8 +231,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	cleanup, err := d.setupSops(ctx, st, dir, runID, &opts)
 	if err != nil {
 		log.Error("sops setup failed", "stage", StageSops, "error", err)
-		ev(notify.DeployFailed, oldSHA, newSHA, StageSops, err.Error())
-		d.saveState(log, st.Name, oldSHA, state.StatusFailed, runID)
+		fail(notify.DeployFailed, StageSops, err.Error(), oldSHA, state.StatusFailed)
 		return OutcomeFailed
 	}
 	defer cleanup()
@@ -205,8 +240,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	if st.ForcePullEnabled() {
 		if err := d.runtime.Pull(ctx, opts); err != nil {
 			log.Error("pull failed, running stack untouched", "stage", StagePull, "error", err)
-			ev(notify.DeployFailed, oldSHA, newSHA, StagePull, err.Error())
-			d.saveState(log, st.Name, oldSHA, state.StatusFailed, runID)
+			fail(notify.DeployFailed, StagePull, err.Error(), oldSHA, state.StatusFailed)
 			return OutcomeFailed
 		}
 	}
@@ -214,8 +248,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	// 9. up.
 	if err := d.runtime.Up(ctx, opts); err != nil {
 		log.Error("up failed", "stage", StageUp, "error", err)
-		ev(notify.DeployFailed, oldSHA, newSHA, StageUp, err.Error())
-		d.saveState(log, st.Name, oldSHA, state.StatusFailed, runID)
+		fail(notify.DeployFailed, StageUp, err.Error(), oldSHA, state.StatusFailed)
 		return OutcomeFailed
 	}
 
@@ -224,8 +257,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	// revert (or a forced deploy once the v1 CLI lands).
 	if err := d.verify(ctx, opts, st.VerifyTimeout.Duration); err != nil {
 		log.Error("post-up verification failed", "stage", StageVerify, "error", err)
-		ev(notify.DeployFailed, oldSHA, newSHA, StageVerify, err.Error())
-		d.saveState(log, st.Name, newSHA, state.StatusFailed, runID)
+		fail(notify.DeployFailed, StageVerify, err.Error(), newSHA, state.StatusFailed)
 		return OutcomeFailed
 	}
 
@@ -238,17 +270,17 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 		}
 	}
 
-	// 12. state save.
+	// 12. state save — success clears the failure-dedup fields.
 	if err := d.store.Put(st.Name, state.StackState{
 		LastDeployedSHA: newSHA, LastStatus: state.StatusSuccess,
 		LastRunID: runID, UpdatedAt: time.Now(),
 	}); err != nil {
 		log.Error("state save failed", "stage", StageStateSave, "error", err)
-		ev(notify.DeployFailed, oldSHA, newSHA, StageStateSave, err.Error())
+		ev(notify.DeployFailed, StageStateSave, err.Error())
 		return OutcomeFailed
 	}
 
-	ev(notify.DeploySuccess, oldSHA, newSHA, "", "")
+	ev(notify.DeploySuccess, "", "")
 	log.Info("deployed", "sha", newSHA)
 	return OutcomeDeployed
 }
@@ -335,10 +367,8 @@ func assess(services []compose.Service) (bad, pending []string) {
 	return bad, pending
 }
 
-func (d *Deployer) saveState(log *slog.Logger, stack, sha, status, runID string) {
-	if err := d.store.Put(stack, state.StackState{
-		LastDeployedSHA: sha, LastStatus: status, LastRunID: runID, UpdatedAt: time.Now(),
-	}); err != nil {
+func (d *Deployer) saveState(log *slog.Logger, stack string, st state.StackState) {
+	if err := d.store.Put(stack, st); err != nil {
 		log.Error("state save failed", "error", err)
 	}
 }

@@ -109,6 +109,8 @@ repo = "https://example.com/repo.git"
 		{"poll too small", "poll_interval = \"1s\"\n" + base, ">= 5s"},
 		{"bad timezone", "timezone = \"Mars/Olympus\"\n" + base, "timezone"},
 		{"undefined env var", base + "\n[ntfy]\nurl = \"${PLICO_UNDEFINED_VAR_42}\"\n", "PLICO_UNDEFINED_VAR_42"},
+		{"negative max_concurrent_deploys", "max_concurrent_deploys = -1\n" + base, ">= 1"},
+		{"traversal sops segment", base + "\nsops_files = [\"a/../../evil.env\"]\n", "repo-relative"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -123,6 +125,35 @@ repo = "https://example.com/repo.git"
 	}
 }
 
+func TestDoubleDotsInFilenamesAreValid(t *testing.T) {
+	t.Parallel()
+	cfg := `
+base_dir = "/opt/docker"
+[[stack]]
+name = "app"
+repo = "https://example.com/repo.git"
+compose_file = "docker-compose..prod.yml"
+sops_files = ["secrets..enc.env"]
+`
+	if _, err := Load(writeConfig(t, cfg)); err != nil {
+		t.Fatalf("filenames containing '..' must be valid: %v", err)
+	}
+}
+
+func TestCommentedEnvVarDoesNotBlockStartup(t *testing.T) {
+	t.Parallel()
+	cfg := `
+base_dir = "/opt/docker"
+# token = "${PLICO_SURELY_UNSET_VAR}"
+[[stack]]
+name = "app"  # inline comment with ${PLICO_SURELY_UNSET_TOO}
+repo = "https://example.com/repo.git"
+`
+	if _, err := Load(writeConfig(t, cfg)); err != nil {
+		t.Fatalf("unset var in a comment must not be fatal: %v", err)
+	}
+}
+
 func TestInterpolate(t *testing.T) {
 	t.Setenv("PLICO_A", "va")
 	tests := []struct {
@@ -133,6 +164,11 @@ func TestInterpolate(t *testing.T) {
 		{"x = \"$${PLICO_A}\"", "x = \"${PLICO_A}\"", false}, // escape
 		{"x = \"$PLICO_A\"", "x = \"$PLICO_A\"", false},      // bare $VAR untouched
 		{"x = \"${PLICO_MISSING_XYZ}\"", "", true},
+		{"# x = \"${PLICO_MISSING_XYZ}\"", "# x = \"${PLICO_MISSING_XYZ}\"", false}, // full-line comment
+		{"x = \"${PLICO_A}\" # ${PLICO_MISSING_XYZ}", "x = \"va\" # ${PLICO_MISSING_XYZ}", false},
+		{"x = \"a#${PLICO_A}\"", "x = \"a#va\"", false},             // '#' inside a basic string is not a comment
+		{"x = 'lit#${PLICO_A}'", "x = 'lit#va'", false},             // '#' inside a literal string either
+		{"x = \"esc\\\"#${PLICO_A}\"", "x = \"esc\\\"#va\"", false}, // escaped quote does not end the string
 	}
 	for _, tt := range tests {
 		got, err := Interpolate(tt.in)

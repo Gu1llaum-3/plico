@@ -66,6 +66,30 @@ func TestArgvConstruction(t *testing.T) {
 	}
 }
 
+// PS must address the project by name only: no -f (no compose-file parsing),
+// no sops prefix, no env-files — inspecting containers must never re-trigger
+// secret decryption during the verify polls.
+func TestPSBypassesComposeFileAndSopsPrefix(t *testing.T) {
+	t.Parallel()
+	fake := &execx.FakeRunner{Script: []execx.Response{{}}}
+	opts := Options{
+		Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web",
+		CmdPrefix: []string{"sops", "exec-env", "a.enc.env", "--"},
+		ExtraArgs: []string{"--env-file", "/dev/shm/x.env"},
+	}
+	if _, err := NewDocker(fake).PS(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.Calls[0]
+	if c.Name != "docker" {
+		t.Errorf("PS must not go through the sops prefix, Name = %q", c.Name)
+	}
+	want := []string{"compose", "-p", "web", "ps", "-a", "--format", "json"}
+	if !reflect.DeepEqual(c.Args, want) {
+		t.Errorf("Args = %v\nwant  %v", c.Args, want)
+	}
+}
+
 // Realistic NDJSON output of `docker compose ps -a --format json` (compose >= 2.21).
 const ndjsonFixture = `{"Command":"nginx","ExitCode":0,"Health":"healthy","ID":"1a","Name":"web-nginx-1","Service":"nginx","State":"running"}
 {"Command":"postgres","ExitCode":0,"Health":"starting","ID":"2b","Name":"web-db-1","Service":"db","State":"running"}

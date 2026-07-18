@@ -54,12 +54,16 @@ type Resolution struct {
 	Source string // "repo" | "global" | ""
 }
 
-// Resolve picks the hook to run. A global path that is configured but
-// missing or not executable is an error: a declared backup gate that
-// silently disappears must block the deployment, not skip it.
+// Resolve picks the hook to run. A hook that is declared but unusable is an
+// error, never a silent skip: a repo hook that exists without the executable
+// bit, or a configured global path that is missing, must block the
+// deployment — a declared backup gate cannot silently disappear.
 func Resolve(repoDir, repoRelPath, globalPath string) (Resolution, error) {
 	repoHook := filepath.Join(repoDir, repoRelPath)
-	if isExecutable(repoHook) {
+	if info, err := os.Stat(repoHook); err == nil && !info.IsDir() {
+		if info.Mode()&0o111 == 0 {
+			return Resolution{}, fmt.Errorf("repo hook %s exists but is not executable (missing chmod +x?)", repoRelPath)
+		}
 		return Resolution{Path: repoHook, Source: "repo"}, nil
 	}
 	if globalPath == "" {

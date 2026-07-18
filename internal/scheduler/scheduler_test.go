@@ -110,6 +110,63 @@ func TestSnapshotShowsRunningStack(t *testing.T) {
 	}
 }
 
+// ctxCheckRunner blocks until released, then records whether its context
+// survived a scheduler shutdown (a graceful drain must not cancel it).
+type ctxCheckRunner struct {
+	started  chan struct{}
+	release  chan struct{}
+	mu       sync.Mutex
+	ctxErrs  []error
+	startOne sync.Once
+}
+
+func (c *ctxCheckRunner) RunStack(ctx context.Context, _ config.StackConfig) deploy.Outcome {
+	c.startOne.Do(func() { close(c.started) })
+	<-c.release
+	c.mu.Lock()
+	c.ctxErrs = append(c.ctxErrs, ctx.Err())
+	c.mu.Unlock()
+	return deploy.OutcomeDeployed
+}
+
+func TestShutdownDrainsWithoutCancellingInFlightRuns(t *testing.T) {
+	t.Parallel()
+	runner := &ctxCheckRunner{started: make(chan struct{}), release: make(chan struct{})}
+	cfg := &config.Config{
+		PollInterval: config.Duration{Duration: time.Hour},
+		Stacks:       []config.StackConfig{{Name: "web"}},
+	}
+	s := New(cfg, runner, discard())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+
+	<-runner.started // a run is in flight
+	cancel()         // SIGTERM arrives
+
+	select {
+	case <-done:
+		t.Fatal("Run returned before the in-flight run finished: no drain")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(runner.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after drain")
+	}
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	for _, err := range runner.ctxErrs {
+		if err != nil {
+			t.Errorf("in-flight run saw a cancelled context (%v): docker compose up would be SIGKILLed mid-deploy", err)
+		}
+	}
+}
+
 func TestSkippedOutcomeDoesNotOverwriteLast(t *testing.T) {
 	t.Parallel()
 	runner := &countingRunner{outcome: deploy.OutcomeDeployed}

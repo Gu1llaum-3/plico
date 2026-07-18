@@ -73,6 +73,38 @@ func TestSyncAndResolveClonesFirstTime(t *testing.T) {
 	}
 }
 
+func TestLeftoverNonGitDirIsWipedBeforeClone(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "stack")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Debris from an interrupted first clone: no .git, dir non-empty.
+	junk := filepath.Join(dir, "leftover.txt")
+	if err := os.WriteFile(junk, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &execx.FakeRunner{Script: []execx.Response{
+		{Result: execx.Result{}},                           // clone
+		{Result: execx.Result{}},                           // fetch
+		{Result: execx.Result{Stdout: []byte("bbb222\n")}}, // rev-parse
+	}}
+	c := New(fake, nil, discard())
+	sha, err := c.SyncAndResolve(context.Background(), "https://example.com/r.git", "main", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sha != "bbb222" {
+		t.Errorf("sha = %q", sha)
+	}
+	if _, err := os.Stat(junk); !errors.Is(err, os.ErrNotExist) {
+		t.Error("leftover dir was not wiped: git clone would refuse a non-empty destination")
+	}
+	if fake.Calls[0].Args[0] != "clone" {
+		t.Errorf("first call should be clone, got %v", fake.Calls[0].Args)
+	}
+}
+
 func TestAskpassEnvForMatchingHost(t *testing.T) {
 	t.Parallel()
 	dir := mkClone(t)

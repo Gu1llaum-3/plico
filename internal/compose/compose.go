@@ -54,8 +54,16 @@ func (d *docker) Up(ctx context.Context, o Options) error {
 	return err
 }
 
+// PS deliberately addresses the project by name only (-p, no -f, no sops
+// prefix, no env-files): inspecting running containers must not re-parse the
+// compose file nor re-trigger secret decryption — a transient sops/KMS flake
+// during the verify polls would otherwise fail a healthy deployment.
 func (d *docker) PS(ctx context.Context, o Options) ([]Service, error) {
-	res, err := d.run(ctx, o, "ps", "-a", "--format", "json")
+	res, err := d.runner.Run(ctx, execx.Cmd{
+		Name: "docker",
+		Args: []string{"compose", "-p", o.Project, "ps", "-a", "--format", "json"},
+		Dir:  o.Dir,
+	})
 	if err != nil {
 		return nil, err
 	}

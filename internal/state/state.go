@@ -26,6 +26,10 @@ type StackState struct {
 	LastStatus      string    `json:"last_status"`
 	LastRunID       string    `json:"last_run_id"`
 	UpdatedAt       time.Time `json:"updated_at"`
+	// LastFailedSHA/Stage dedupe notifications: retrying the same revision
+	// that already failed at the same stage is logged but not re-notified.
+	LastFailedSHA   string `json:"last_failed_sha,omitempty"`
+	LastFailedStage string `json:"last_failed_stage,omitempty"`
 }
 
 // Store is a concurrency-safe view of the state file.
