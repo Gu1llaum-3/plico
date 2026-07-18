@@ -25,6 +25,10 @@ poll_interval = "60s"
 # in the repeated hour it runs once.
 # schedule = "0 22 * * *"
 # window = "2h"
+# Out-of-window checks (F6): fetch + diff at every poll tick and notify
+# "deployment queued" once per pending revision, without deploying.
+# Overridable per stack; ignored for stacks without a schedule.
+# check = true
 
 # Hard ceiling for one full deployment run (git + hook + pull + up + verify).
 run_timeout = "30m"

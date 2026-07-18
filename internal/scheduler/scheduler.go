@@ -34,6 +34,8 @@ import (
 // StackRunner is what the scheduler needs from the deployer.
 type StackRunner interface {
 	RunStack(ctx context.Context, st config.StackConfig) deploy.Outcome
+	// CheckStack fetches and diffs without deploying (F6).
+	CheckStack(ctx context.Context, st config.StackConfig) deploy.Outcome
 }
 
 // catchUpLimit bounds the firing catch-up loop: robfig/cron's Next() is
@@ -177,11 +179,19 @@ func (s *Scheduler) Run(ctx context.Context) {
 		s.mu.Lock()
 		s.lastTick = now
 		s.mu.Unlock()
-		for _, st := range s.due(now.In(s.loc)) {
+		apply, check := s.due(now.In(s.loc))
+		for _, st := range apply {
 			wg.Add(1)
 			go func(st config.StackConfig) {
 				defer wg.Done()
-				s.runOne(ctx, st)
+				s.runOne(ctx, st, false)
+			}(st)
+		}
+		for _, st := range check {
+			wg.Add(1)
+			go func(st config.StackConfig) {
+				defer wg.Done()
+				s.runOne(ctx, st, true)
 			}(st)
 		}
 	}
@@ -199,17 +209,18 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// due returns the stacks to process this tick. A stack without a schedule is
-// always due; a scheduled stack is due while its window is open.
-func (s *Scheduler) due(now time.Time) []config.StackConfig {
+// due returns the stacks to process this tick: apply gets the full pipeline,
+// check only fetch+diff+queued-notification (F6). A stack without a schedule
+// is always apply-due; a scheduled stack is apply-due while its window is
+// open, and check-due outside it when checks are enabled.
+func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 	grace := s.cfg.PollInterval.Duration // tolerated discovery lateness (ticker jitter)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []config.StackConfig
 	for _, st := range s.cfg.Stacks {
 		ss, scheduled := s.scheds[st.Name]
 		if !scheduled {
-			out = append(out, st)
+			apply = append(apply, st)
 			continue
 		}
 		// A run in flight only defers accounting for the window it was
@@ -307,14 +318,17 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 			ss.windowFiring = time.Time{}
 		}
 
-		if justOpened || (!ss.windowFiring.IsZero() && now.Before(ss.windowUntil)) {
-			out = append(out, st)
+		switch {
+		case justOpened || (!ss.windowFiring.IsZero() && now.Before(ss.windowUntil)):
+			apply = append(apply, st)
+		case st.CheckEnabled():
+			check = append(check, st)
 		}
 	}
-	return out
+	return apply, check
 }
 
-func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
+func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig, checkOnly bool) {
 	s.mu.Lock()
 	if _, inFlight := s.running[st.Name]; inFlight {
 		// The deployer's TryLock would skip anyway; avoid goroutine churn.
@@ -324,9 +338,10 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
 	s.running[st.Name] = time.Now()
 	// Capture which firing this run belongs to NOW: a long run may outlive
 	// its window, and crediting whatever window is open at completion time
-	// would consume a later firing that this run never observed.
+	// would consume a later firing that this run never observed. Checks
+	// never belong to a window and never consume a firing.
 	var dispatchFiring time.Time
-	if ss, ok := s.scheds[st.Name]; ok {
+	if ss, ok := s.scheds[st.Name]; ok && !checkOnly {
 		dispatchFiring = ss.windowFiring
 		ss.dispatched = dispatchFiring
 	}
@@ -336,11 +351,16 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
 	// deployment finish (Run waits on the WaitGroup) — cancelling here would
 	// SIGKILL a docker compose up mid-flight and leave the stack half
 	// updated. Each run stays bounded by its own run_timeout.
-	outcome := s.deployer.RunStack(context.WithoutCancel(ctx), st)
+	var outcome deploy.Outcome
+	if checkOnly {
+		outcome = s.deployer.CheckStack(context.WithoutCancel(ctx), st)
+	} else {
+		outcome = s.deployer.RunStack(context.WithoutCancel(ctx), st)
+	}
 
 	s.mu.Lock()
 	delete(s.running, st.Name)
-	if ss, ok := s.scheds[st.Name]; ok {
+	if ss, ok := s.scheds[st.Name]; ok && !checkOnly {
 		ss.dispatched = time.Time{}
 	}
 	if outcome != deploy.OutcomeSkipped {

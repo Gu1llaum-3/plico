@@ -38,6 +38,7 @@ const (
 	OutcomeUpToDate                // no git delta, nothing done
 	OutcomeDeployed
 	OutcomeFailed
+	OutcomeQueued // check only: a delta is pending until the next window (F6)
 )
 
 func (o Outcome) String() string {
@@ -48,6 +49,8 @@ func (o Outcome) String() string {
 		return "up_to_date"
 	case OutcomeDeployed:
 		return "deployed"
+	case OutcomeQueued:
+		return "queued"
 	default:
 		return "failed"
 	}
@@ -192,7 +195,9 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 		return OutcomeFailed
 	}
 
-	if !repeat {
+	if !repeat && prev.LastQueuedSHA != newSHA {
+		// A pending revision already announced by an out-of-window check
+		// (F6) is not re-announced when its window finally applies it.
 		ev(notify.DeployQueued, "", "")
 	}
 
@@ -274,7 +279,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 		}
 	}
 
-	// 12. state save — success clears the failure-dedup fields.
+	// 12. state save — success clears the failure- and queued-dedup fields.
 	if err := d.store.Update(st.Name, func(s2 *state.StackState) {
 		s2.LastDeployedSHA = newSHA
 		s2.LastStatus = state.StatusSuccess
@@ -282,6 +287,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 		s2.UpdatedAt = time.Now()
 		s2.LastFailedSHA = ""
 		s2.LastFailedStage = ""
+		s2.LastQueuedSHA = ""
 	}); err != nil {
 		log.Error("state save failed", "stage", StageStateSave, "error", err)
 		ev(notify.DeployFailed, StageStateSave, err.Error())
@@ -291,6 +297,56 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	ev(notify.DeploySuccess, "", "")
 	log.Info("deployed", "sha", newSHA)
 	return OutcomeDeployed
+}
+
+// CheckStack is the out-of-window half of F6: fetch + SHA diff only, never
+// a deployment. A pending revision is announced with deploy_queued exactly
+// once (deduped via state.LastQueuedSHA); the window's apply run will not
+// re-announce it.
+func (d *Deployer) CheckStack(ctx context.Context, st config.StackConfig) Outcome {
+	lock := d.stackLock(st.Name)
+	if !lock.TryLock() {
+		return OutcomeSkipped // a deploy is running; it owns the stack
+	}
+	defer lock.Unlock()
+
+	runID := newRunID()
+	log := d.log.With("run_id", runID, "stack", st.Name, "mode", "check")
+
+	ctx, cancel := context.WithTimeout(ctx, d.cfg.RunTimeout.Duration)
+	defer cancel()
+
+	dir := filepath.Join(d.cfg.BaseDir, st.Name)
+	newSHA, err := d.git.SyncAndResolve(ctx, st.Repo, st.Ref, dir)
+	if err != nil {
+		log.Error("git sync failed", "stage", StageGitSync, "error", err)
+		return OutcomeFailed
+	}
+
+	prev, _ := d.store.Get(st.Name)
+	switch newSHA {
+	case prev.LastDeployedSHA:
+		return OutcomeUpToDate
+	case prev.LastQueuedSHA:
+		return OutcomeQueued // already announced, stays pending
+	case prev.LastFailedSHA:
+		return OutcomeQueued // already reported as failing; no new announcement
+	}
+
+	log.Info("git delta detected, queued until the next deployment window",
+		"old_sha", prev.LastDeployedSHA, "new_sha", newSHA)
+	nctx, ncancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
+	defer ncancel()
+	_ = d.notifier.Notify(nctx, notify.Event{
+		Type: notify.DeployQueued, Stack: st.Name, RunID: runID, Ref: st.Ref,
+		OldSHA: prev.LastDeployedSHA, NewSHA: newSHA,
+		Detail: "pending until the next deployment window",
+		Time:   time.Now(),
+	})
+	d.saveState(log, st.Name, func(s2 *state.StackState) {
+		s2.LastQueuedSHA = newSHA
+	})
+	return OutcomeQueued
 }
 
 // setupSops fills opts with either the exec-env prefix or tmpfs env-files.

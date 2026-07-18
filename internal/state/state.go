@@ -39,6 +39,9 @@ type StackState struct {
 	// the anchor is reset instead of synthesizing phantom past firings.
 	LastFiring   time.Time `json:"last_firing,omitzero"`
 	ScheduleSpec string    `json:"schedule_spec,omitempty"`
+	// LastQueuedSHA dedupes the out-of-window "deployment queued"
+	// notification (F6): one announcement per pending revision.
+	LastQueuedSHA string `json:"last_queued_sha,omitempty"`
 }
 
 // Store is a concurrency-safe view of the state file.

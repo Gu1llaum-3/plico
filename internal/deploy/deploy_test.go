@@ -509,6 +509,70 @@ func TestFailureNotificationSurvivesExpiredRunContext(t *testing.T) {
 	}
 }
 
+func TestCheckStackQueuesOncePerRevision(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	// First check: announce the pending revision, touch nothing.
+	if outcome := h.deployer.CheckStack(context.Background(), h.stack); outcome != OutcomeQueued {
+		t.Fatalf("outcome = %s, want queued", outcome)
+	}
+	wantEvents(t, h.events.types(), notify.DeployQueued)
+	if len(h.runtime.pulls)+len(h.runtime.ups) != 0 {
+		t.Fatal("a check must never touch compose")
+	}
+	st, _ := h.store.Get("web")
+	if st.LastQueuedSHA != newSHA {
+		t.Errorf("LastQueuedSHA = %q, want %q", st.LastQueuedSHA, newSHA)
+	}
+	if st.LastDeployedSHA != oldSHA {
+		t.Errorf("a check must not move the deployed SHA, got %q", st.LastDeployedSHA)
+	}
+
+	// Subsequent checks on the same revision: silent.
+	for i := 0; i < 3; i++ {
+		if outcome := h.deployer.CheckStack(context.Background(), h.stack); outcome != OutcomeQueued {
+			t.Fatalf("repeat check outcome = %s", outcome)
+		}
+	}
+	wantEvents(t, h.events.types(), notify.DeployQueued)
+}
+
+func TestApplyAfterCheckDoesNotReannounceQueued(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "exit 0")
+
+	if h.deployer.CheckStack(context.Background(), h.stack) != OutcomeQueued {
+		t.Fatal("check should queue")
+	}
+	// The window opens and applies: no second deploy_queued.
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s", outcome)
+	}
+	wantEvents(t, h.events.types(),
+		notify.DeployQueued, notify.DeployStart, notify.DeploySuccess)
+	// Success clears the queued marker for the next cycle.
+	st, _ := h.store.Get("web")
+	if st.LastQueuedSHA != "" {
+		t.Errorf("LastQueuedSHA not cleared on success: %q", st.LastQueuedSHA)
+	}
+}
+
+func TestCheckStackUpToDateIsSilent(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	if err := h.store.Put("web", state.StackState{LastDeployedSHA: newSHA}); err != nil {
+		t.Fatal(err)
+	}
+	if outcome := h.deployer.CheckStack(context.Background(), h.stack); outcome != OutcomeUpToDate {
+		t.Fatalf("outcome = %s", outcome)
+	}
+	if len(h.events.types()) != 0 {
+		t.Errorf("up-to-date check must not notify, got %v", h.events.types())
+	}
+}
+
 func TestAssess(t *testing.T) {
 	t.Parallel()
 	services := []compose.Service{

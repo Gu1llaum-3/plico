@@ -51,6 +51,13 @@ window = "30m"
 [[stack]]
 name = "dev"
 schedule = "@poll"        # opt-out : déploie à chaque tick, comme sans planning
+
+[[stack]]
+name = "surveillee"
+schedule = "0 22 * * *"
+check = true              # hors fenêtre : fetch + diff à chaque tick, et
+                          # notification « déploiement en attente » (une seule
+                          # fois par révision) — sans rien appliquer
 ```
 
 **La fenêtre fait autorité** : plico ne déploie jamais en dehors, à une

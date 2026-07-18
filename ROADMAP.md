@@ -35,8 +35,11 @@ n'existe dans doco-cd.
       global par stack, opt-out `@poll`, timezone configurable, DST documenté
       (heure sautée = pas de run ; heure répétée = un seul run), `next_run`
       exposé dans /healthz
-- [ ] **Distinction check / apply** (F6) : détecter et notifier « déploiement
-      en attente » en journée, appliquer dans la fenêtre
+- [x] **Distinction check / apply** (F6) : `check = true` par stack (héritage
+      du global) — hors fenêtre, fetch + diff à chaque tick et notification
+      `deploy_queued` une seule fois par révision en attente (dédup persistée
+      `last_queued_sha`, non ré-annoncée par l'apply de la fenêtre, nettoyée
+      au succès) ; outcome `queued` visible dans /healthz
 - [ ] **CLI cliente** via socket unix (F24–F30) : `status`, `check-now`,
       `deploy-now`, `dry-run`, `validate` ; `--skip-pre` interdit sans
       `--force` + notification `pre_hook_skipped`

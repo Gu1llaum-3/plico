@@ -19,6 +19,7 @@ func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, ni
 type countingRunner struct {
 	mu      sync.Mutex
 	calls   map[string]int
+	checks  map[string]int
 	outcome deploy.Outcome
 	block   chan struct{} // when set, RunStack waits on it
 }
@@ -34,6 +35,16 @@ func (c *countingRunner) RunStack(_ context.Context, st config.StackConfig) depl
 		<-c.block
 	}
 	return c.outcome
+}
+
+func (c *countingRunner) CheckStack(_ context.Context, st config.StackConfig) deploy.Outcome {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.checks == nil {
+		c.checks = map[string]int{}
+	}
+	c.checks[st.Name]++
+	return deploy.OutcomeQueued
 }
 
 func testStore(t *testing.T) *state.Store {
@@ -66,7 +77,17 @@ func mustNewAt(t *testing.T, cfg *config.Config, r StackRunner, store *state.Sto
 
 func dueNames(s *Scheduler, now time.Time) []string {
 	var names []string
-	for _, st := range s.due(now) {
+	apply, _ := s.due(now)
+	for _, st := range apply {
+		names = append(names, st.Name)
+	}
+	return names
+}
+
+func checkNames(s *Scheduler, now time.Time) []string {
+	var names []string
+	_, check := s.due(now)
+	for _, st := range check {
 		names = append(names, st.Name)
 	}
 	return names
@@ -177,6 +198,10 @@ func (c *ctxCheckRunner) RunStack(ctx context.Context, _ config.StackConfig) dep
 	return deploy.OutcomeDeployed
 }
 
+func (c *ctxCheckRunner) CheckStack(context.Context, config.StackConfig) deploy.Outcome {
+	return deploy.OutcomeUpToDate
+}
+
 func TestShutdownDrainsWithoutCancellingInFlightRuns(t *testing.T) {
 	t.Parallel()
 	runner := &ctxCheckRunner{started: make(chan struct{}), release: make(chan struct{})}
@@ -234,7 +259,7 @@ func TestDueRespectsScheduleWindow(t *testing.T) {
 		t.Errorf("window opening: due = %v, want both stacks", got)
 	}
 	// A run happens: the firing is accounted and persisted.
-	s.runOne(context.Background(), s.cfg.Stacks[0])
+	s.runOne(context.Background(), s.cfg.Stacks[0], false)
 	if st, _ := store.Get("nightly"); !st.LastFiring.Equal(fire) {
 		t.Errorf("anchor = %v, want %v", st.LastFiring, fire)
 	}
@@ -335,7 +360,7 @@ func TestSkippedRunDoesNotConsumeWindow(t *testing.T) {
 	}
 	// The run is skipped (previous deploy still in flight): the firing must
 	// NOT be accounted — the anchor stays at the boot value written by NewAt.
-	s.runOne(context.Background(), s.cfg.Stacks[0])
+	s.runOne(context.Background(), s.cfg.Stacks[0], false)
 	if st, _ := store.Get("nightly"); !st.LastFiring.Equal(boot) {
 		t.Errorf("skipped run must not advance the anchor, got %v, want boot %v", st.LastFiring, boot)
 	}
@@ -535,7 +560,7 @@ func TestLongRunIsAttributedToItsDispatchWindow(t *testing.T) {
 	}
 	// A run dispatched in window 10:00 blocks past the 10:30 firing.
 	done := make(chan struct{})
-	go func() { s.runOne(context.Background(), cfg.Stacks[0]); close(done) }()
+	go func() { s.runOne(context.Background(), cfg.Stacks[0], false); close(done) }()
 	deadline := time.After(5 * time.Second)
 	for s.Snapshot().Stacks["fast"].RunningSince == nil {
 		select {
@@ -587,7 +612,7 @@ func TestSupersedeReportedDespiteUnrelatedInFlightRun(t *testing.T) {
 	}
 	// The 10:00 run blocks for hours.
 	done := make(chan struct{})
-	go func() { s.runOne(context.Background(), cfg.Stacks[0]); close(done) }()
+	go func() { s.runOne(context.Background(), cfg.Stacks[0], false); close(done) }()
 	deadline := time.After(5 * time.Second)
 	for s.Snapshot().Stacks["fast"].RunningSince == nil {
 		select {
@@ -708,7 +733,7 @@ func TestExpiredWindowCloseIsDeferredWhileRunInFlight(t *testing.T) {
 		t.Fatalf("window should be open, due = %v", got)
 	}
 	done := make(chan struct{})
-	go func() { s.runOne(context.Background(), s.cfg.Stacks[0]); close(done) }()
+	go func() { s.runOne(context.Background(), s.cfg.Stacks[0], false); close(done) }()
 	deadline := time.After(5 * time.Second)
 	for s.Snapshot().Stacks["nightly"].RunningSince == nil {
 		select {
@@ -766,13 +791,58 @@ func TestLastTickKeepsMonotonicReading(t *testing.T) {
 	}
 }
 
+func TestCheckDispatchedOutsideWindowOnly(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	yes := true
+	cfg := nightlyConfig(time.Hour)
+	cfg.Stacks[0].Check = &yes
+	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
+	s := mustNewAt(t, cfg, &countingRunner{}, testStore(t), boot)
+
+	fire := time.Date(2026, 7, 19, 4, 0, 0, 0, loc)
+
+	// Outside the window: the scheduled stack is check-due, not apply-due.
+	if got := checkNames(s, fire.Add(-time.Minute)); len(got) != 1 || got[0] != "nightly" {
+		t.Errorf("outside window: check = %v, want [nightly]", got)
+	}
+	if got := dueNames(s, fire.Add(-30*time.Second)); len(got) != 1 || got[0] != "always" {
+		t.Errorf("outside window: apply = %v, want [always]", got)
+	}
+	// Inside the window: apply, never check.
+	if got := checkNames(s, fire.Add(30*time.Second)); len(got) != 0 {
+		t.Errorf("inside window: check = %v, want none", got)
+	}
+	if got := dueNames(s, fire.Add(time.Minute)); len(got) != 2 {
+		t.Errorf("inside window: apply = %v, want both", got)
+	}
+	// The unscheduled stack is never check-due.
+	for _, names := range [][]string{checkNames(s, fire.Add(2*time.Hour))} {
+		for _, n := range names {
+			if n == "always" {
+				t.Error("unscheduled stack must never be check-due")
+			}
+		}
+	}
+}
+
+func TestCheckDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	s := mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, testStore(t),
+		time.Date(2026, 7, 19, 3, 0, 0, 0, loc))
+	if got := checkNames(s, time.Date(2026, 7, 19, 3, 30, 0, 0, loc)); len(got) != 0 {
+		t.Errorf("check must be opt-in, got %v", got)
+	}
+}
+
 func TestSkippedOutcomeDoesNotOverwriteLast(t *testing.T) {
 	t.Parallel()
 	runner := &countingRunner{outcome: deploy.OutcomeDeployed}
 	s := mustNewAt(t, testConfig(), runner, testStore(t), time.Now())
-	s.runOne(context.Background(), s.cfg.Stacks[0])
+	s.runOne(context.Background(), s.cfg.Stacks[0], false)
 	runner.outcome = deploy.OutcomeSkipped
-	s.runOne(context.Background(), s.cfg.Stacks[0])
+	s.runOne(context.Background(), s.cfg.Stacks[0], false)
 	if got := s.Snapshot().Stacks["web"].LastOutcome; got != "deployed" {
 		t.Errorf("outcome = %q, want deployed (skip must not overwrite)", got)
 	}

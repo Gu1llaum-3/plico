@@ -74,6 +74,16 @@ type StackConfig struct {
 	// schedule firing (F7); during the window every poll tick processes
 	// the stack. 0 = inherit the global window (default 1h).
 	Window Duration `toml:"window"`
+	// Check enables out-of-window checks (F6): fetch + SHA diff at every
+	// poll tick, notifying "deployment queued" once per pending revision,
+	// without deploying. nil = inherit the global default (false). Only
+	// meaningful with a schedule; ignored otherwise.
+	Check *bool `toml:"check"`
+}
+
+// CheckEnabled resolves the *bool (false when unset after defaults).
+func (s StackConfig) CheckEnabled() bool {
+	return s.Check != nil && *s.Check
 }
 
 // ForcePullEnabled resolves the *bool default (true when unset).
@@ -89,6 +99,7 @@ type Config struct {
 	MaxConcurrentDeploys int      `toml:"max_concurrent_deploys"`
 	Schedule             string   `toml:"schedule"` // global default for stacks (F7); empty = every poll tick
 	Window               Duration `toml:"window"`   // global default window, 1h
+	Check                bool     `toml:"check"`    // global default for out-of-window checks (F6)
 
 	Log    LogConfig    `toml:"log"`
 	Health HealthConfig `toml:"health"`
@@ -176,6 +187,10 @@ func (c *Config) applyDefaults() {
 		}
 		if st.Window.Duration == 0 {
 			st.Window = c.Window
+		}
+		if st.Check == nil {
+			v := c.Check
+			st.Check = &v
 		}
 		if st.ComposeFile == "" {
 			st.ComposeFile = "docker-compose.yml"
