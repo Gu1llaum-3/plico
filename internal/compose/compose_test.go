@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"plico/internal/execx"
@@ -25,14 +26,16 @@ func TestArgvConstruction(t *testing.T) {
 			wantArgs: []string{"compose", "-f", "docker-compose.yml", "-p", "web", "up", "-d", "--remove-orphans"},
 		},
 		{
-			name: "pull with sops exec-env prefix",
+			name: "pull with a wrap (sops exec-env single-string form)",
 			opts: Options{
 				Dir: "/opt/docker/web", ComposeFile: "compose.yaml", Project: "web",
-				CmdPrefix: []string{"sops", "exec-env", "a.enc.env", "--"},
+				Wrap: func(argv []string) []string {
+					return []string{"sops", "exec-env", "a.enc.env", strings.Join(argv, " ")}
+				},
 			},
 			call:     func(rt Runtime, o Options) error { return rt.Pull(context.Background(), o) },
 			wantName: "sops",
-			wantArgs: []string{"exec-env", "a.enc.env", "--", "docker", "compose", "-f", "compose.yaml", "-p", "web", "pull"},
+			wantArgs: []string{"exec-env", "a.enc.env", "docker compose -f compose.yaml -p web pull"},
 		},
 		{
 			name: "up with tmpfs env-files",
@@ -74,7 +77,9 @@ func TestPSBypassesComposeFileAndSopsPrefix(t *testing.T) {
 	fake := &execx.FakeRunner{Script: []execx.Response{{}}}
 	opts := Options{
 		Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web",
-		CmdPrefix: []string{"sops", "exec-env", "a.enc.env", "--"},
+		Wrap: func(argv []string) []string {
+			return append([]string{"sops", "exec-env", "a.enc.env"}, strings.Join(argv, " "))
+		},
 		ExtraArgs: []string{"--env-file", "/dev/shm/x.env"},
 	}
 	if _, err := NewDocker(fake).PS(context.Background(), opts); err != nil {

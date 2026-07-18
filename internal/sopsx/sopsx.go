@@ -8,23 +8,45 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"plico/internal/execx"
 )
 
-// Prefix returns the argv prefix chaining `sops exec-env` for each file, to
-// be placed before the compose command:
+// ExecEnvArgv wraps argv so it runs with the decrypted content of files in
+// its environment. `sops exec-env` takes exactly two arguments — the file
+// and the command as ONE string, executed via `sh -c` — so the wrapped
+// command is shell-quoted, and multiple files nest:
 //
-//	sops exec-env a.enc.env -- sops exec-env b.enc.env -- docker compose ...
+//	sops exec-env a.enc.env 'sops exec-env b.enc.env '\''docker compose … up -d'\'''
 //
-// Each level enriches the environment passed to the next; on duplicate keys
-// the LAST file of the list wins. Returns nil when files is empty.
-func Prefix(files []string) []string {
-	var p []string
-	for _, f := range files {
-		p = append(p, "sops", "exec-env", f, "--")
+// Each nesting level enriches the environment of the next; on duplicate
+// keys the LAST file of the list wins (innermost level). Returns argv
+// unchanged when files is empty.
+func ExecEnvArgv(files, argv []string) []string {
+	if len(files) == 0 {
+		return argv
 	}
-	return p
+	cmd := shJoin(argv)
+	// Wrap from the last file (innermost) up to the second one; the first
+	// file becomes the real argv so no shell is involved at the top level.
+	for i := len(files) - 1; i >= 1; i-- {
+		cmd = "sops exec-env " + shQuote(files[i]) + " " + shQuote(cmd)
+	}
+	return []string{"sops", "exec-env", files[0], cmd}
+}
+
+// shQuote single-quotes s for POSIX sh, escaping embedded single quotes.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func shJoin(argv []string) string {
+	quoted := make([]string, len(argv))
+	for i, a := range argv {
+		quoted[i] = shQuote(a)
+	}
+	return strings.Join(quoted, " ")
 }
 
 // EnvFiles is the tmpfs-mode result: --env-file arguments for compose plus a

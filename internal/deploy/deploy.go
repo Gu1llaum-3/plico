@@ -310,7 +310,8 @@ func (d *Deployer) setupSops(ctx context.Context, st config.StackConfig, dir, ru
 		return env.Cleanup, nil
 	}
 	// exec-env: paths stay repo-relative, the command runs with Dir = worktree.
-	opts.CmdPrefix = sopsx.Prefix(st.SopsFiles)
+	files := st.SopsFiles
+	opts.Wrap = func(argv []string) []string { return sopsx.ExecEnvArgv(files, argv) }
 	return func() {}, nil
 }
 

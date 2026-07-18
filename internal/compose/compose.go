@@ -22,11 +22,14 @@ type Service struct {
 
 // Options describes one invocation against a stack.
 type Options struct {
-	Dir         string   // stack worktree
-	ComposeFile string   // relative to Dir
-	Project     string   // compose project name (-p), stable per stack
-	CmdPrefix   []string // argv prefix, e.g. ["sops","exec-env","f.env","--"]; nil = none
-	ExtraArgs   []string // e.g. --env-file /dev/shm/... in tmpfs mode
+	Dir         string // stack worktree
+	ComposeFile string // relative to Dir
+	Project     string // compose project name (-p), stable per stack
+	// Wrap rewrites the final argv, e.g. into a `sops exec-env` chain that
+	// feeds decrypted secrets to the command's environment. nil = no wrap.
+	// Applied to Pull and Up, never to PS (see PS).
+	Wrap      func(argv []string) []string
+	ExtraArgs []string // e.g. --env-file /dev/shm/... in tmpfs mode
 }
 
 type Runtime interface {
@@ -71,13 +74,13 @@ func (d *docker) PS(ctx context.Context, o Options) ([]Service, error) {
 }
 
 // run builds `docker compose -f <file> -p <project> [extra] <verb...>` and
-// prepends Options.CmdPrefix (the sops exec-env chain) when present.
+// applies Options.Wrap (the sops exec-env chain) when present.
 func (d *docker) run(ctx context.Context, o Options, verb ...string) (execx.Result, error) {
 	argv := []string{"docker", "compose", "-f", o.ComposeFile, "-p", o.Project}
 	argv = append(argv, o.ExtraArgs...)
 	argv = append(argv, verb...)
-	if len(o.CmdPrefix) > 0 {
-		argv = append(append([]string{}, o.CmdPrefix...), argv...)
+	if o.Wrap != nil {
+		argv = o.Wrap(argv)
 	}
 	return d.runner.Run(ctx, execx.Cmd{Name: argv[0], Args: argv[1:], Dir: o.Dir})
 }

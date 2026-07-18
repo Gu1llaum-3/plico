@@ -1,7 +1,10 @@
 [tools]
 go = "1.26.5"
-lefthook = "2.1.6"
-golangci-lint = "latest"
+lefthook = "2.1.10"
+golangci-lint = "2.12.2"
+# Needed by the smoke test (and handy for operating plico stacks).
+sops = "3.13.2"
+age = "1.3.1"
 
 [tasks.build]
 description = "Build the plico binary"
@@ -18,3 +21,8 @@ run = "golangci-lint run"
 [tasks.fmt]
 description = "Format sources and run go vet"
 run = ["gofmt -w .", "go vet ./..."]
+
+[tasks.smoke]
+description = "End-to-end smoke test (real git + docker + sops/age)"
+depends = ["build"]
+run = "./test/smoke.sh"

@@ -35,11 +35,17 @@ Un run encore en cours au tick suivant est **sauté**, jamais empilé.
 ## Installation
 
 ```sh
-mise install          # go, lefthook, golangci-lint (versions dans mise.toml)
+mise install          # go, lefthook, golangci-lint, sops, age (versions dans mise.toml)
 mise run build        # → bin/plico
 ```
 
-Tâches disponibles : `mise run build | test | lint | fmt`.
+Tâches disponibles : `mise run build | test | lint | fmt | smoke`.
+
+`mise run smoke` exécute [`test/smoke.sh`](test/smoke.sh) : un environnement
+GitOps complet en local (repo git `file://`, vraie stack Docker, secrets
+chiffrés **age + sops**) qui vérifie le déploiement nominal, l'injection des
+secrets en mémoire (aucun clair sur disque ni dans les logs), puis le blocage
+par le gate de backup. Nécessite un daemon Docker.
 
 ## Configuration
 

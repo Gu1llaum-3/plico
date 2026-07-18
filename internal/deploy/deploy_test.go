@@ -350,10 +350,14 @@ func TestSopsExecEnvPrefixReachesCompose(t *testing.T) {
 	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeDeployed {
 		t.Fatalf("outcome = %s", outcome)
 	}
-	wantPrefix := []string{"sops", "exec-env", ".deploy/secrets.enc.env", "--"}
 	for _, opts := range [][]compose.Options{h.runtime.pulls, h.runtime.ups} {
-		if len(opts) != 1 || !reflect.DeepEqual(opts[0].CmdPrefix, wantPrefix) {
-			t.Errorf("CmdPrefix = %v, want %v", opts[0].CmdPrefix, wantPrefix)
+		if len(opts) != 1 || opts[0].Wrap == nil {
+			t.Fatal("pull and up must receive the sops wrap")
+		}
+		got := opts[0].Wrap([]string{"docker", "compose", "up", "-d"})
+		want := []string{"sops", "exec-env", ".deploy/secrets.enc.env", "'docker' 'compose' 'up' '-d'"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("wrapped argv = %q, want %q", got, want)
 		}
 	}
 }

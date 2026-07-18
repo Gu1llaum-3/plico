@@ -6,20 +6,62 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"plico/internal/execx"
 )
 
-func TestPrefix(t *testing.T) {
+func TestExecEnvArgvNoFiles(t *testing.T) {
 	t.Parallel()
-	if p := Prefix(nil); p != nil {
-		t.Errorf("Prefix(nil) = %v, want nil", p)
+	argv := []string{"docker", "compose", "up", "-d"}
+	if got := ExecEnvArgv(nil, argv); !reflect.DeepEqual(got, argv) {
+		t.Errorf("no files must return argv unchanged, got %v", got)
 	}
-	got := Prefix([]string{"a.enc.env", "b.enc.env"})
-	want := []string{"sops", "exec-env", "a.enc.env", "--", "sops", "exec-env", "b.enc.env", "--"}
+}
+
+// sops exec-env takes exactly two arguments: the file and the command as ONE
+// shell string (run via sh -c). The wrapped command must be a single,
+// correctly quoted argument.
+func TestExecEnvArgvSingleFile(t *testing.T) {
+	t.Parallel()
+	got := ExecEnvArgv([]string{".deploy/secrets.enc.env"},
+		[]string{"docker", "compose", "-f", "docker-compose.yml", "-p", "web", "up", "-d"})
+	want := []string{"sops", "exec-env", ".deploy/secrets.enc.env",
+		"'docker' 'compose' '-f' 'docker-compose.yml' '-p' 'web' 'up' '-d'"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Prefix = %v\nwant   %v", got, want)
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestExecEnvArgvNestedFiles(t *testing.T) {
+	t.Parallel()
+	got := ExecEnvArgv([]string{"a.enc.env", "b.enc.env"}, []string{"docker", "compose", "pull"})
+	if len(got) != 4 || got[0] != "sops" || got[1] != "exec-env" || got[2] != "a.enc.env" {
+		t.Fatalf("outer level wrong: %q", got)
+	}
+	// The inner command is one string: `sops exec-env 'b.enc.env' '<quoted docker cmd>'`.
+	inner := got[3]
+	if !strings.HasPrefix(inner, "sops exec-env 'b.enc.env' ") {
+		t.Errorf("b.enc.env must be the inner (winning) layer: %q", inner)
+	}
+	if !strings.Contains(inner, "docker") || !strings.Contains(inner, "pull") {
+		t.Errorf("wrapped command lost: %q", inner)
+	}
+}
+
+func TestShQuote(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ in, want string }{
+		{"plain", "'plain'"},
+		{"with space", "'with space'"},
+		{"it's", `'it'\''s'`},
+		{"$VAR `cmd` \"q\"", "'$VAR `cmd` \"q\"'"}, // no expansion inside single quotes
+	}
+	for _, tt := range tests {
+		if got := shQuote(tt.in); got != tt.want {
+			t.Errorf("shQuote(%q) = %s, want %s", tt.in, got, tt.want)
+		}
 	}
 }
 
