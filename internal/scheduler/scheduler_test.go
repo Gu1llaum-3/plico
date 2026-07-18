@@ -281,7 +281,10 @@ func TestRestartInsideOpenWindowReopensIt(t *testing.T) {
 	// The daemon deployed yesterday (anchor = yesterday 04:00) and restarts
 	// today at 04:10, inside today's still-open window.
 	yesterday := time.Date(2026, 7, 18, 4, 0, 0, 0, loc)
-	if err := store.Update("nightly", func(st *state.StackState) { st.LastFiring = yesterday }); err != nil {
+	if err := store.Update("nightly", func(st *state.StackState) {
+		st.LastFiring = yesterday
+		st.ScheduleSpec = "0 4 * * *"
+	}); err != nil {
 		t.Fatal(err)
 	}
 	restart := time.Date(2026, 7, 19, 4, 10, 0, 0, loc)
@@ -299,7 +302,10 @@ func TestRestartAfterAttemptDoesNotReplayWindow(t *testing.T) {
 	// Today's firing was already attempted (anchor = today 04:00); the
 	// daemon restarts at 04:10. The window must NOT re-open.
 	today := time.Date(2026, 7, 19, 4, 0, 0, 0, loc)
-	if err := store.Update("nightly", func(st *state.StackState) { st.LastFiring = today }); err != nil {
+	if err := store.Update("nightly", func(st *state.StackState) {
+		st.LastFiring = today
+		st.ScheduleSpec = "0 4 * * *"
+	}); err != nil {
 		t.Fatal(err)
 	}
 	restart := time.Date(2026, 7, 19, 4, 10, 0, 0, loc)
@@ -328,10 +334,10 @@ func TestSkippedRunDoesNotConsumeWindow(t *testing.T) {
 		t.Fatalf("window opening: due = %v", got)
 	}
 	// The run is skipped (previous deploy still in flight): the firing must
-	// NOT be accounted, so the next tick inside the window retries.
+	// NOT be accounted — the anchor stays at the boot value written by NewAt.
 	s.runOne(context.Background(), s.cfg.Stacks[0])
-	if st, _ := store.Get("nightly"); !st.LastFiring.IsZero() {
-		t.Errorf("skipped run must not persist the anchor, got %v", st.LastFiring)
+	if st, _ := store.Get("nightly"); !st.LastFiring.Equal(boot) {
+		t.Errorf("skipped run must not advance the anchor, got %v, want boot %v", st.LastFiring, boot)
 	}
 	if got := dueNames(s, fire.Add(10*time.Minute)); len(got) != 2 {
 		t.Errorf("window must stay open after a skipped run, due = %v", got)
@@ -374,12 +380,226 @@ func TestCollapsedFiringsOpenLatestWindowOnly(t *testing.T) {
 
 func TestNewFailsClosedOnBadSchedule(t *testing.T) {
 	t.Parallel()
-	cfg := &config.Config{
-		PollInterval: config.Duration{Duration: time.Minute},
-		Stacks:       []config.StackConfig{{Name: "web", Schedule: "not a cron"}},
+	for _, spec := range []string{"not a cron", "0 0 30 2 *" /* Feb 30: parses but never fires */} {
+		cfg := &config.Config{
+			PollInterval: config.Duration{Duration: time.Minute},
+			Stacks:       []config.StackConfig{{Name: "web", Schedule: spec}},
+		}
+		if _, err := NewAt(cfg, &countingRunner{}, testStore(t), discard(), time.Now()); err == nil {
+			t.Errorf("schedule %q must be a construction error, not a silent fallback or a wedge", spec)
+		}
 	}
-	if _, err := NewAt(cfg, &countingRunner{}, testStore(t), discard(), time.Now()); err == nil {
-		t.Fatal("an unparsable schedule must be a construction error, not a silent every-tick fallback")
+}
+
+func TestDiscoveryToleratesOneTickOfJitter(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
+	// Tiny window (one-shot per firing): the discovering tick must still
+	// count even when it lands after windowUntil, within one poll interval.
+	s := mustNewAt(t, nightlyConfig(time.Second), &countingRunner{}, store, boot)
+
+	fire := time.Date(2026, 7, 19, 4, 0, 0, 0, loc)
+	if got := dueNames(s, fire.Add(45*time.Second)); len(got) != 2 {
+		t.Errorf("discovery within window+poll_interval must open, due = %v", got)
+	}
+	// Beyond window + one poll interval: genuinely missed.
+	s2 := mustNewAt(t, nightlyConfig(time.Second), &countingRunner{}, testStore(t), boot)
+	if got := dueNames(s2, fire.Add(2*time.Minute)); len(got) != 1 {
+		t.Errorf("discovery beyond the jitter grace must be missed, due = %v", got)
+	}
+}
+
+func TestFreshInstallAnchorIsPersisted(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
+	mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, store, boot)
+
+	// A crash during the first window must find a pre-window anchor on disk
+	// so the window is re-opened, not silently dropped.
+	st, ok := store.Get("nightly")
+	if !ok || st.LastFiring.IsZero() {
+		t.Fatal("fresh-install anchor not persisted")
+	}
+	if st.ScheduleSpec != "0 4 * * *" {
+		t.Errorf("schedule spec not persisted with the anchor: %q", st.ScheduleSpec)
+	}
+	// Simulated restart at 04:10: the window opened at 04:00 must re-open.
+	s2 := mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, store,
+		time.Date(2026, 7, 19, 4, 10, 0, 0, loc))
+	if got := dueNames(s2, time.Date(2026, 7, 19, 4, 11, 0, 0, loc)); len(got) != 2 {
+		t.Errorf("first window after fresh install must survive a crash, due = %v", got)
+	}
+}
+
+func TestScheduleChangeResetsAnchor(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	// Anchor persisted under the old daily-04:00 schedule.
+	if err := store.Update("nightly", func(st *state.StackState) {
+		st.LastFiring = time.Date(2026, 7, 19, 4, 0, 0, 0, loc)
+		st.ScheduleSpec = "0 4 * * *"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The admin switches to every-2-hours and restarts at 10:30: no phantom
+	// firings (06:00, 08:00, 10:00) may be synthesized under the new spec.
+	cfg := nightlyConfig(time.Hour)
+	cfg.Stacks[0].Schedule = "0 */2 * * *"
+	restart := time.Date(2026, 7, 19, 10, 30, 0, 0, loc)
+	s := mustNewAt(t, cfg, &countingRunner{}, store, restart)
+
+	if got := dueNames(s, restart.Add(time.Minute)); len(got) != 1 || got[0] != "always" {
+		t.Errorf("schedule change must not replay phantom firings, due = %v", got)
+	}
+	next := s.Snapshot().Stacks["nightly"].NextRun
+	want := time.Date(2026, 7, 19, 12, 0, 0, 0, loc)
+	if next == nil || !next.Equal(want) {
+		t.Errorf("next_run = %v, want %v (first firing after the restart)", next, want)
+	}
+}
+
+func TestFutureAnchorIsReanchored(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	// Wall clock stepped back: the persisted anchor is 2h in the future.
+	if err := store.Update("nightly", func(st *state.StackState) {
+		st.LastFiring = time.Date(2026, 7, 19, 5, 0, 0, 0, loc)
+		st.ScheduleSpec = "0 4 * * *"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
+	s := mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, store, boot)
+
+	// The schedule must not freeze: today's 04:00 firing still opens.
+	if got := dueNames(s, time.Date(2026, 7, 19, 4, 0, 30, 0, loc)); len(got) != 2 {
+		t.Errorf("future anchor froze the schedule, due = %v", got)
+	}
+}
+
+func TestSupersededUnattemptedWindowIsReportedAndAccounted(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	cfg := &config.Config{
+		Timezone:     "Europe/Paris",
+		PollInterval: config.Duration{Duration: time.Minute},
+		Stacks: []config.StackConfig{
+			// Window (1h) intentionally longer than the cron period (30m).
+			{Name: "fast", Schedule: "*/30 * * * *", Window: config.Duration{Duration: time.Hour}},
+		},
+	}
+	boot := time.Date(2026, 7, 19, 9, 50, 0, 0, loc)
+	s := mustNewAt(t, cfg, &countingRunner{}, store, boot)
+
+	first := time.Date(2026, 7, 19, 10, 0, 0, 0, loc)
+	if got := dueNames(s, first.Add(30*time.Second)); len(got) != 1 {
+		t.Fatalf("first window should open, due = %v", got)
+	}
+	// No run happens (ticks never dispatched here); the 10:30 firing
+	// supersedes the still-open 10:00 window: the old firing must be
+	// accounted so a restart does not rediscover it.
+	if got := dueNames(s, first.Add(31*time.Minute)); len(got) != 1 {
+		t.Fatalf("second window should open, due = %v", got)
+	}
+	st, _ := store.Get("fast")
+	if !st.LastFiring.Equal(first) {
+		t.Errorf("superseded firing not accounted: anchor = %v, want %v", st.LastFiring, first)
+	}
+}
+
+func TestLongRunIsAttributedToItsDispatchWindow(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	cfg := &config.Config{
+		Timezone:     "Europe/Paris",
+		PollInterval: config.Duration{Duration: time.Minute},
+		Stacks: []config.StackConfig{
+			{Name: "fast", Schedule: "*/30 * * * *", Window: config.Duration{Duration: time.Hour}},
+		},
+	}
+	boot := time.Date(2026, 7, 19, 9, 50, 0, 0, loc)
+	runner := &countingRunner{outcome: deploy.OutcomeDeployed, block: make(chan struct{})}
+	s := mustNewAt(t, cfg, runner, store, boot)
+
+	firstFire := time.Date(2026, 7, 19, 10, 0, 0, 0, loc)
+	if got := dueNames(s, firstFire.Add(30*time.Second)); len(got) != 1 {
+		t.Fatalf("first window should open, due = %v", got)
+	}
+	// A run dispatched in window 10:00 blocks past the 10:30 firing.
+	done := make(chan struct{})
+	go func() { s.runOne(context.Background(), cfg.Stacks[0]); close(done) }()
+	deadline := time.After(5 * time.Second)
+	for s.Snapshot().Stacks["fast"].RunningSince == nil {
+		select {
+		case <-deadline:
+			t.Fatal("run never started")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	// The 10:30 firing opens a new window while the old run is in flight;
+	// no "superseded" warning should fire (the old firing will be accounted
+	// at completion) and the new window must not be consumed.
+	if got := dueNames(s, firstFire.Add(31*time.Minute)); len(got) != 1 {
+		t.Fatalf("second window should open, due = %v", got)
+	}
+	close(runner.block)
+	<-done
+
+	// Completion accounts the 10:00 firing (dispatch attribution), NOT the
+	// 10:30 one whose git state this run never observed.
+	st, _ := store.Get("fast")
+	if !st.LastFiring.Equal(firstFire) {
+		t.Errorf("anchor = %v, want the dispatch firing %v", st.LastFiring, firstFire)
+	}
+	// The 10:30 window is still retryable.
+	if got := dueNames(s, firstFire.Add(35*time.Minute)); len(got) != 1 {
+		t.Errorf("second window must stay open after the old run completed, due = %v", got)
+	}
+}
+
+func TestExpiredWindowCloseIsDeferredWhileRunInFlight(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	runner := &countingRunner{outcome: deploy.OutcomeDeployed, block: make(chan struct{})}
+	s := mustNewAt(t, nightlyConfig(time.Hour), runner, store, time.Date(2026, 7, 19, 3, 0, 0, 0, loc))
+
+	fire := time.Date(2026, 7, 19, 4, 0, 0, 0, loc)
+	if got := dueNames(s, fire.Add(59*time.Minute)); len(got) != 2 {
+		t.Fatalf("window should be open, due = %v", got)
+	}
+	done := make(chan struct{})
+	go func() { s.runOne(context.Background(), s.cfg.Stacks[0]); close(done) }()
+	deadline := time.After(5 * time.Second)
+	for s.Snapshot().Stacks["nightly"].RunningSince == nil {
+		select {
+		case <-deadline:
+			t.Fatal("run never started")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	// Window expires while the run (started at 04:59) is still in flight:
+	// the close must be deferred, without a false "no run" warning, and the
+	// anchor must not be written yet.
+	if got := dueNames(s, fire.Add(65*time.Minute)); len(got) != 1 {
+		t.Errorf("expired window must not be due, due = %v", got)
+	}
+	if st, _ := store.Get("nightly"); !st.LastFiring.Equal(time.Date(2026, 7, 19, 3, 0, 0, 0, loc)) {
+		t.Errorf("anchor must still be the boot anchor while the run is in flight, got %v", st.LastFiring)
+	}
+	close(runner.block)
+	<-done
+	// Completion accounts the firing.
+	if st, _ := store.Get("nightly"); !st.LastFiring.Equal(fire) {
+		t.Errorf("anchor after completion = %v, want %v", st.LastFiring, fire)
 	}
 }
 

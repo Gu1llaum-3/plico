@@ -182,11 +182,11 @@ repo = "https://example.com/repo.git"
 		}
 	}
 
-	// The window is authoritative: shorter than poll_interval it could
-	// close before any tick lands inside, so it is a config error.
-	_, err := Load(writeConfig(t, base+"\nschedule = \"0 4 * * *\"\nwindow = \"30s\"\n"))
-	if err == nil || !strings.Contains(err.Error(), "poll_interval") {
-		t.Errorf("window < poll_interval must fail validation, got %v", err)
+	// Syntactically valid but never-firing expressions (Feb 30) would give
+	// the scheduler zero times: rejected at load.
+	_, err := Load(writeConfig(t, base+"\nschedule = \"0 0 30 2 *\"\n"))
+	if err == nil || !strings.Contains(err.Error(), "never fires") {
+		t.Errorf("never-firing schedule must fail validation, got %v", err)
 	}
 
 	// Windows are validated at their own level (the error must blame the

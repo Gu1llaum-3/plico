@@ -30,11 +30,15 @@ type StackState struct {
 	// that already failed at the same stage is logged but not re-notified.
 	LastFailedSHA   string `json:"last_failed_sha,omitempty"`
 	LastFailedStage string `json:"last_failed_stage,omitempty"`
-	// LastFiring is the schedule anchor: the last cron firing that was
-	// fully accounted for (attempted or declared missed). It survives
-	// restarts so a still-open window is re-opened instead of silently
-	// dropped, and a fully missed one is reported instead of replayed.
-	LastFiring time.Time `json:"last_firing,omitzero"`
+	// LastFiring is the schedule anchor: the last cron firing fully
+	// accounted for (attempted or declared missed), or the startup instant
+	// on first install. It survives restarts so a still-open window is
+	// re-opened instead of silently dropped, and a fully missed one is
+	// reported instead of replayed. ScheduleSpec records the cron
+	// expression the anchor was computed under: when the schedule changes,
+	// the anchor is reset instead of synthesizing phantom past firings.
+	LastFiring   time.Time `json:"last_firing,omitzero"`
+	ScheduleSpec string    `json:"schedule_spec,omitempty"`
 }
 
 // Store is a concurrency-safe view of the state file.

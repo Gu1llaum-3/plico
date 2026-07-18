@@ -210,7 +210,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_concurrent_deploys must be >= 1, got %d", c.MaxConcurrentDeploys)
 	}
 	if c.Schedule != "" {
-		if _, err := cron.ParseStandard(c.Schedule); err != nil {
+		if err := validateSchedule(c.Schedule); err != nil {
 			return fmt.Errorf("schedule %q: %w", c.Schedule, err)
 		}
 	}
@@ -251,16 +251,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("stack %q: window must be positive, got %s", st.Name, st.Window.Duration)
 		}
 		if st.Schedule != "" {
-			if _, err := cron.ParseStandard(st.Schedule); err != nil {
+			if err := validateSchedule(st.Schedule); err != nil {
 				return fmt.Errorf("stack %q: schedule %q: %w", st.Name, st.Schedule, err)
-			}
-			// The window is authoritative (a missed one is never replayed
-			// late): shorter than the poll interval, it could close before
-			// the first tick ever lands inside and the stack would never
-			// deploy.
-			if st.Window.Duration < c.PollInterval.Duration {
-				return fmt.Errorf("stack %q: window (%s) must be >= poll_interval (%s)",
-					st.Name, st.Window.Duration, c.PollInterval.Duration)
 			}
 		}
 		for _, f := range st.SopsFiles {
@@ -271,6 +263,20 @@ func (c *Config) Validate() error {
 		if filepath.IsAbs(st.ComposeFile) || escapesRepo(st.ComposeFile) {
 			return fmt.Errorf("stack %q: compose_file %q must not escape the repo", st.Name, st.ComposeFile)
 		}
+	}
+	return nil
+}
+
+// validateSchedule rejects both unparsable expressions and syntactically
+// valid ones that never fire (e.g. "0 0 30 2 *", Feb 30): robfig/cron
+// returns the zero time for those, which downstream code must never see.
+func validateSchedule(expr string) error {
+	sched, err := cron.ParseStandard(expr)
+	if err != nil {
+		return err
+	}
+	if sched.Next(time.Now()).IsZero() {
+		return fmt.Errorf("expression never fires")
 	}
 	return nil
 }

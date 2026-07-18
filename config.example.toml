@@ -13,14 +13,16 @@ poll_interval = "60s"
 
 # Optional deployment schedule (cron, 5 fields or @daily/@every 6h…),
 # evaluated in `timezone`. Each firing opens a deployment window of
-# `window` (must be >= poll_interval); during it, every poll tick may
-# deploy — never outside it: a fully missed window (daemon down, host
-# paused) is logged and skipped, not replayed late. The schedule anchor
-# is persisted in state.json, so a restart inside a still-open window
-# re-opens it. Without a schedule, a stack deploys as soon as a git
-# delta is seen. Overridable per stack; a stack can opt out of a global
-# schedule with schedule = "@poll". DST: a firing in the skipped hour
-# does not run; in the repeated hour it runs once.
+# `window`; during it, every poll tick may deploy — never outside it
+# (tolerance: one poll_interval of ticker jitter at discovery). A fully
+# missed window (daemon down, host paused) is logged and skipped, not
+# replayed late. The schedule anchor is persisted in state.json: a
+# restart inside a still-open window re-opens it, and editing the
+# schedule re-anchors instead of replaying phantom firings. Without a
+# schedule, a stack deploys as soon as a git delta is seen. Overridable
+# per stack; a stack can opt out of a global schedule with
+# schedule = "@poll". DST: a firing in the skipped hour does not run;
+# in the repeated hour it runs once.
 # schedule = "0 22 * * *"
 # window = "2h"
 
