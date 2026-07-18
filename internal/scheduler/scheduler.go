@@ -42,11 +42,12 @@ type StackRunner interface {
 const catchUpLimit = 100_000
 
 type Scheduler struct {
-	cfg      *config.Config
-	deployer StackRunner
-	store    *state.Store
-	log      *slog.Logger
-	loc      *time.Location
+	cfg          *config.Config
+	deployer     StackRunner
+	store        *state.Store
+	log          *slog.Logger
+	loc          *time.Location
+	catchUpLimit int // per-instance so tests can exercise the abort path
 
 	mu       sync.Mutex
 	lastTick time.Time // carries a monotonic reading: /healthz liveness must be immune to wall-clock steps
@@ -57,13 +58,15 @@ type Scheduler struct {
 
 // stackSched tracks one stack's deployment window state.
 type stackSched struct {
-	sched        cron.Schedule
-	spec         string // cron expression, persisted with the anchor
-	window       time.Duration
-	next         time.Time // earliest firing not yet accounted for
-	windowFiring time.Time // firing of the currently open window (zero = none)
-	windowUntil  time.Time
-	attempted    bool // a run of this window completed (set on completion, attributed by dispatch firing)
+	sched         cron.Schedule
+	spec          string // cron expression, persisted with the anchor
+	window        time.Duration
+	next          time.Time // earliest firing not yet accounted for
+	windowFiring  time.Time // firing of the currently open window (zero = none)
+	windowUntil   time.Time
+	attempted     bool      // a run of this window completed (set on completion, attributed by dispatch firing)
+	dispatched    time.Time // firing the currently in-flight run was dispatched for (zero = none)
+	dormantLogged bool      // the "no future firing" error was already emitted
 }
 
 // StackStatus is one stack's live view for /healthz.
@@ -89,14 +92,15 @@ func New(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logger
 // NewAt is New with an explicit construction time, for deterministic tests.
 func NewAt(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logger, now time.Time) (*Scheduler, error) {
 	s := &Scheduler{
-		cfg:      cfg,
-		deployer: d,
-		store:    store,
-		log:      log,
-		loc:      cfg.Location(),
-		running:  map[string]time.Time{},
-		outcomes: map[string]deploy.Outcome{},
-		scheds:   map[string]*stackSched{},
+		cfg:          cfg,
+		deployer:     d,
+		store:        store,
+		log:          log,
+		loc:          cfg.Location(),
+		catchUpLimit: catchUpLimit,
+		running:      map[string]time.Time{},
+		outcomes:     map[string]deploy.Outcome{},
+		scheds:       map[string]*stackSched{},
 	}
 	nowLoc := now.In(s.loc)
 	for _, st := range cfg.Stacks {
@@ -119,12 +123,22 @@ func NewAt(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logg
 		switch {
 		case prev.LastFiring.IsZero():
 			// fresh install
+		case prev.ScheduleSpec == "":
+			// State written before schedule_spec existed: adopt the anchor
+			// (resetting would silently drop a window across the upgrade).
+			log.Info("adopting legacy schedule anchor", "stack", st.Name,
+				"anchor", prev.LastFiring.Format(time.RFC3339))
+			anchor = prev.LastFiring.In(s.loc)
+			s.persistAnchor(st.Name, anchor, st.Schedule)
 		case prev.ScheduleSpec != st.Schedule:
 			log.Info("schedule changed, resetting anchor", "stack", st.Name,
 				"old", prev.ScheduleSpec, "new", st.Schedule)
 		case prev.LastFiring.After(nowLoc):
 			log.Warn("persisted schedule anchor is in the future (wall clock stepped back?), re-anchoring at now",
 				"stack", st.Name, "anchor", prev.LastFiring.Format(time.RFC3339))
+			// Deliberate backward re-anchor: bypass the monotonic guard.
+			s.resetAnchor(st.Name, nowLoc, st.Schedule)
+			anchor = nowLoc
 		default:
 			anchor = prev.LastFiring.In(s.loc)
 		}
@@ -132,6 +146,8 @@ func NewAt(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logg
 			anchor = nowLoc
 			// Persist immediately: a crash during the very first window must
 			// re-open it on restart, which needs a pre-window anchor on disk.
+			// (persistAnchor skips unchanged writes, so a normal restart
+			// performs zero state writes here.)
 			s.persistAnchor(st.Name, anchor, st.Schedule)
 		}
 
@@ -194,7 +210,9 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 			out = append(out, st)
 			continue
 		}
-		_, inFlight := s.running[st.Name]
+		// A run in flight only defers accounting for the window it was
+		// dispatched for; other windows are judged on their own.
+		inFlightForWindow := !ss.dispatched.IsZero() && ss.dispatched.Equal(ss.windowFiring)
 
 		// Catch up on firings that occurred up to now. Only the latest can
 		// open a window; earlier ones (daemon down across several firings,
@@ -202,12 +220,10 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 		// one aggregate warning.
 		var fired, firstSkipped, lastSkipped time.Time
 		skipped := 0
+		aborted := false
 		for i := 0; !ss.next.IsZero() && !now.Before(ss.next); i++ {
-			if i >= catchUpLimit {
-				s.log.Error("schedule catch-up aborted after too many firings, re-anchoring at now",
-					"stack", st.Name, "limit", catchUpLimit)
-				ss.next = ss.sched.Next(now)
-				fired = time.Time{}
+			if i >= s.catchUpLimit {
+				aborted = true
 				break
 			}
 			if !fired.IsZero() {
@@ -218,7 +234,19 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 				skipped++
 			}
 			fired = ss.next
-			ss.next = ss.sched.Next(ss.next)
+			s.advanceNext(ss, st.Name, ss.next)
+		}
+		if aborted {
+			// Pathological gap (huge clock jump): report once, re-anchor at
+			// now AND persist it — a stale on-disk anchor would repeat this
+			// whole walk on every restart.
+			s.log.Error("schedule catch-up aborted after too many firings, re-anchoring at now",
+				"stack", st.Name, "skipped_at_least", s.catchUpLimit,
+				"first", fired.Format(time.RFC3339))
+			s.advanceNext(ss, st.Name, now)
+			s.resetAnchor(st.Name, now, ss.spec)
+			fired = time.Time{}
+			skipped = 0
 		}
 
 		justOpened := false
@@ -230,13 +258,14 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 					"last", lastSkipped.Format(time.RFC3339))
 			}
 			// A still-open window superseded by a new firing before any of
-			// its runs happened is a missed deployment — unless a run is in
-			// flight right now, in which case its completion will account
-			// for the old firing (attribution is captured at dispatch).
-			if !ss.windowFiring.IsZero() && !ss.attempted && !inFlight {
+			// its runs happened is a missed deployment. Deferred only when
+			// the in-flight run belongs to THAT window (its completion will
+			// account for it); a run from an older window must not shield
+			// the superseded one from being reported.
+			if !ss.windowFiring.IsZero() && !ss.attempted && !inFlightForWindow {
 				s.log.Warn("deployment window superseded before any run",
 					"stack", st.Name, "firing", ss.windowFiring.Format(time.RFC3339))
-				s.persistAnchorLocked(st.Name, ss.windowFiring, ss.spec)
+				s.persistAnchor(st.Name, ss.windowFiring, ss.spec)
 			}
 			if now.After(fired.Add(ss.window).Add(grace)) {
 				// Window fully elapsed before we could discover the firing
@@ -247,7 +276,7 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 					"firing", fired.Format(time.RFC3339),
 					"window_end", fired.Add(ss.window).Format(time.RFC3339),
 					"next_run", ss.next.Format(time.RFC3339))
-				s.persistAnchorLocked(st.Name, fired, ss.spec)
+				s.persistAnchor(st.Name, fired, ss.spec)
 				ss.windowFiring = time.Time{}
 			} else {
 				ss.windowFiring = fired
@@ -260,14 +289,14 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 			}
 		}
 
-		// Close an expired window. Deferred while a run is in flight: a run
-		// dispatched at the end of the window may legitimately finish after
-		// it, and must not be reported as "window without any run".
-		if !justOpened && !ss.windowFiring.IsZero() && !now.Before(ss.windowUntil) && !inFlight {
+		// Close an expired window. Deferred while ITS run is in flight: a
+		// run dispatched at the end of the window may legitimately finish
+		// after it, and must not be reported as "window without any run".
+		if !justOpened && !ss.windowFiring.IsZero() && !now.Before(ss.windowUntil) && !inFlightForWindow {
 			if !ss.attempted {
 				s.log.Warn("deployment window elapsed without any run (previous deploy overlapped the whole window?)",
 					"stack", st.Name, "firing", ss.windowFiring.Format(time.RFC3339))
-				s.persistAnchorLocked(st.Name, ss.windowFiring, ss.spec)
+				s.persistAnchor(st.Name, ss.windowFiring, ss.spec)
 			}
 			ss.windowFiring = time.Time{}
 		}
@@ -293,6 +322,7 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
 	var dispatchFiring time.Time
 	if ss, ok := s.scheds[st.Name]; ok {
 		dispatchFiring = ss.windowFiring
+		ss.dispatched = dispatchFiring
 	}
 	s.mu.Unlock()
 
@@ -304,6 +334,9 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
 
 	s.mu.Lock()
 	delete(s.running, st.Name)
+	if ss, ok := s.scheds[st.Name]; ok {
+		ss.dispatched = time.Time{}
+	}
 	if outcome != deploy.OutcomeSkipped {
 		s.outcomes[st.Name] = outcome
 		// A run actually happened: account the firing it was dispatched
@@ -313,20 +346,49 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
 			if ss.windowFiring.Equal(dispatchFiring) {
 				ss.attempted = true
 			}
-			s.persistAnchorLocked(st.Name, dispatchFiring, ss.spec)
+			s.persistAnchor(st.Name, dispatchFiring, ss.spec)
 		}
 	}
 	s.mu.Unlock()
 }
 
-// persistAnchorLocked records the last accounted firing and the expression
-// it was computed under. Callers must hold s.mu (writes are rare: at most
-// one per firing).
-func (s *Scheduler) persistAnchorLocked(stack string, firing time.Time, spec string) {
-	s.persistAnchor(stack, firing, spec)
+// advanceNext moves ss.next to the firing after `from`, loudly flagging a
+// schedule whose next occurrence falls beyond the cron library's lookahead
+// (zero time): that stack will not be scheduled again until restart, and
+// that must never happen silently.
+func (s *Scheduler) advanceNext(ss *stackSched, stack string, from time.Time) {
+	ss.next = ss.sched.Next(from)
+	if ss.next.IsZero() && !ss.dormantLogged {
+		ss.dormantLogged = true
+		s.log.Error("schedule has no future firing within the cron lookahead; stack will not be scheduled again",
+			"stack", stack, "schedule", ss.spec)
+	}
 }
 
+// persistAnchor records the last accounted firing and the expression it was
+// computed under. The anchor is monotonic: writes that would move it
+// backward (a long run completing after newer firings were accounted) or
+// that change nothing (retries within one window) are skipped — the state
+// file is rewritten at most once per firing.
 func (s *Scheduler) persistAnchor(stack string, firing time.Time, spec string) {
+	if prev, ok := s.store.Get(stack); ok && prev.ScheduleSpec == spec && !firing.After(prev.LastFiring) {
+		return
+	}
+	if err := s.store.Update(stack, func(st *state.StackState) {
+		if st.ScheduleSpec != spec {
+			st.ScheduleSpec = spec
+			st.LastFiring = firing
+		} else if firing.After(st.LastFiring) {
+			st.LastFiring = firing
+		}
+	}); err != nil {
+		s.log.Error("persisting schedule anchor failed", "stack", stack, "error", err)
+	}
+}
+
+// resetAnchor deliberately bypasses the monotonic guard (future anchor after
+// a wall-clock step back, catch-up abort re-anchoring at now).
+func (s *Scheduler) resetAnchor(stack string, firing time.Time, spec string) {
 	if err := s.store.Update(stack, func(st *state.StackState) {
 		st.LastFiring = firing
 		st.ScheduleSpec = spec
@@ -348,12 +410,11 @@ func (s *Scheduler) Snapshot() Snapshot {
 		if o, ok := s.outcomes[st.Name]; ok {
 			status.LastOutcome = o.String()
 		}
-		if ss, ok := s.scheds[st.Name]; ok {
-			// While a window is open, the "next run" is effectively now.
+		if ss, ok := s.scheds[st.Name]; ok && !ss.next.IsZero() {
+			// Always the next FUTURE firing: reporting the current window's
+			// firing would show a next_run in the past for as long as a
+			// deferred close keeps the window around.
 			next := ss.next
-			if !ss.windowFiring.IsZero() {
-				next = ss.windowFiring
-			}
 			status.NextRun = &next
 		}
 		snap.Stacks[st.Name] = status

@@ -565,6 +565,117 @@ func TestLongRunIsAttributedToItsDispatchWindow(t *testing.T) {
 	}
 }
 
+func TestSupersedeReportedDespiteUnrelatedInFlightRun(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	cfg := &config.Config{
+		Timezone:     "Europe/Paris",
+		PollInterval: config.Duration{Duration: time.Minute},
+		Stacks: []config.StackConfig{
+			{Name: "fast", Schedule: "*/30 * * * *", Window: config.Duration{Duration: time.Hour}},
+		},
+	}
+	boot := time.Date(2026, 7, 19, 9, 50, 0, 0, loc)
+	runner := &countingRunner{outcome: deploy.OutcomeDeployed, block: make(chan struct{})}
+	s := mustNewAt(t, cfg, runner, store, boot)
+
+	fire1 := time.Date(2026, 7, 19, 10, 0, 0, 0, loc)
+	fire2 := time.Date(2026, 7, 19, 10, 30, 0, 0, loc)
+	if got := dueNames(s, fire1.Add(30*time.Second)); len(got) != 1 {
+		t.Fatalf("first window should open, due = %v", got)
+	}
+	// The 10:00 run blocks for hours.
+	done := make(chan struct{})
+	go func() { s.runOne(context.Background(), cfg.Stacks[0]); close(done) }()
+	deadline := time.After(5 * time.Second)
+	for s.Snapshot().Stacks["fast"].RunningSince == nil {
+		select {
+		case <-deadline:
+			t.Fatal("run never started")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	// 10:30 supersedes 10:00 silently (the in-flight run belongs to 10:00).
+	if got := dueNames(s, fire2.Add(30*time.Second)); len(got) != 1 {
+		t.Fatalf("second window should open, due = %v", got)
+	}
+	// 11:00 supersedes 10:30 — the in-flight run does NOT belong to 10:30,
+	// so the superseded window must be accounted, not silently dropped.
+	if got := dueNames(s, fire2.Add(31*time.Minute)); len(got) != 1 {
+		t.Fatalf("third window should open, due = %v", got)
+	}
+	if st, _ := store.Get("fast"); !st.LastFiring.Equal(fire2) {
+		t.Errorf("superseded 10:30 window not accounted during unrelated run: anchor = %v", st.LastFiring)
+	}
+	// Completion of the old 10:00 run must NOT move the anchor backward.
+	close(runner.block)
+	<-done
+	if st, _ := store.Get("fast"); !st.LastFiring.Equal(fire2) {
+		t.Errorf("anchor regressed on completion: %v, want %v", st.LastFiring, fire2)
+	}
+}
+
+func TestLegacyStateWithoutSpecAdoptsAnchor(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	// State written by a version that predates schedule_spec.
+	yesterday := time.Date(2026, 7, 18, 4, 0, 0, 0, loc)
+	if err := store.Update("nightly", func(st *state.StackState) {
+		st.LastFiring = yesterday // no ScheduleSpec
+	}); err != nil {
+		t.Fatal(err)
+	}
+	restart := time.Date(2026, 7, 19, 4, 10, 0, 0, loc)
+	s := mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, store, restart)
+
+	// The anchor must be adopted, not reset: today's still-open window
+	// re-opens across the upgrade.
+	if got := dueNames(s, restart.Add(30*time.Second)); len(got) != 2 {
+		t.Errorf("legacy anchor must be adopted (window re-opened), due = %v", got)
+	}
+	if st, _ := store.Get("nightly"); st.ScheduleSpec != "0 4 * * *" {
+		t.Errorf("adopted anchor must persist the spec, got %q", st.ScheduleSpec)
+	}
+}
+
+func TestCatchUpAbortReanchorsAndPersists(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	// Anchor far in the past relative to a 1-minute cron.
+	if err := store.Update("fast", func(st *state.StackState) {
+		st.LastFiring = time.Date(2026, 7, 19, 9, 0, 0, 0, loc)
+		st.ScheduleSpec = "* * * * *"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Timezone:     "Europe/Paris",
+		PollInterval: config.Duration{Duration: time.Minute},
+		Stacks: []config.StackConfig{
+			{Name: "fast", Schedule: "* * * * *", Window: config.Duration{Duration: time.Minute}},
+		},
+	}
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, loc) // 180 firings behind
+	s := mustNewAt(t, cfg, &countingRunner{}, store, now)
+	s.catchUpLimit = 10
+
+	if got := dueNames(s, now); len(got) != 0 {
+		t.Errorf("aborted catch-up must not open a window, due = %v", got)
+	}
+	// The re-anchor must be persisted so a restart does not repeat the walk.
+	st, _ := store.Get("fast")
+	if !st.LastFiring.Equal(now) {
+		t.Errorf("abort re-anchor not persisted: %v, want %v", st.LastFiring, now)
+	}
+	// And the schedule keeps living afterwards.
+	if got := dueNames(s, now.Add(90*time.Second)); len(got) != 1 {
+		t.Errorf("schedule must resume after abort, due = %v", got)
+	}
+}
+
 func TestExpiredWindowCloseIsDeferredWhileRunInFlight(t *testing.T) {
 	t.Parallel()
 	loc := paris(t)
@@ -591,6 +702,11 @@ func TestExpiredWindowCloseIsDeferredWhileRunInFlight(t *testing.T) {
 	// anchor must not be written yet.
 	if got := dueNames(s, fire.Add(65*time.Minute)); len(got) != 1 {
 		t.Errorf("expired window must not be due, due = %v", got)
+	}
+	// /healthz must keep reporting a FUTURE next_run during the deferral,
+	// not the stale past firing of the still-open window.
+	if next := s.Snapshot().Stacks["nightly"].NextRun; next == nil || !next.After(fire) {
+		t.Errorf("next_run during deferred close = %v, want a future firing", next)
 	}
 	if st, _ := store.Get("nightly"); !st.LastFiring.Equal(time.Date(2026, 7, 19, 3, 0, 0, 0, loc)) {
 		t.Errorf("anchor must still be the boot anchor while the run is in flight, got %v", st.LastFiring)
