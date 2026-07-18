@@ -25,6 +25,7 @@ type stackHealth struct {
 	UpdatedAt       *time.Time `json:"updated_at,omitempty"`
 	RunningSince    *time.Time `json:"running_since,omitempty"`
 	LastOutcome     string     `json:"last_outcome,omitempty"`
+	NextRun         *time.Time `json:"next_run,omitempty"`
 }
 
 // New builds the HTTP server. Healthy means: the scheduler ticked recently
@@ -47,7 +48,7 @@ func New(listen string, sched *scheduler.Scheduler, store *state.Store,
 		resp := healthResponse{Status: "ok", LastTick: snap.LastTick, Stacks: map[string]stackHealth{}}
 		persisted := store.All()
 		for name, live := range snap.Stacks {
-			h := stackHealth{RunningSince: live.RunningSince, LastOutcome: live.LastOutcome}
+			h := stackHealth{RunningSince: live.RunningSince, LastOutcome: live.LastOutcome, NextRun: live.NextRun}
 			if p, ok := persisted[name]; ok {
 				h.LastDeployedSHA = p.LastDeployedSHA
 				h.LastStatus = p.LastStatus

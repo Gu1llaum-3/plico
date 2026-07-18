@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robfig/cron/v3"
+
 	"github.com/Gu1llaum-3/plico/internal/config"
 	"github.com/Gu1llaum-3/plico/internal/deploy"
 )
@@ -164,6 +166,93 @@ func TestShutdownDrainsWithoutCancellingInFlightRuns(t *testing.T) {
 		if err != nil {
 			t.Errorf("in-flight run saw a cancelled context (%v): docker compose up would be SIGKILLed mid-deploy", err)
 		}
+	}
+}
+
+func mustSchedule(t *testing.T, expr string) cron.Schedule {
+	t.Helper()
+	s, err := cron.ParseStandard(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func dueNames(s *Scheduler, now time.Time) []string {
+	var names []string
+	for _, st := range s.due(now) {
+		names = append(names, st.Name)
+	}
+	return names
+}
+
+func TestDueRespectsScheduleWindow(t *testing.T) {
+	t.Parallel()
+	paris, err := time.LoadLocation("Europe/Paris")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		PollInterval: config.Duration{Duration: time.Minute},
+		Stacks: []config.StackConfig{
+			{Name: "nightly", Schedule: "0 4 * * *", Window: config.Duration{Duration: time.Hour}},
+			{Name: "always"}, // no schedule: due every tick
+		},
+	}
+	s := New(cfg, &countingRunner{}, discard())
+	fire := time.Date(2026, 7, 19, 4, 0, 0, 0, paris)
+	s.mu.Lock()
+	s.scheds["nightly"] = &stackSched{
+		sched: mustSchedule(t, "0 4 * * *"), window: time.Hour, next: fire,
+	}
+	s.mu.Unlock()
+
+	// Before the firing: only the unscheduled stack is due.
+	if got := dueNames(s, fire.Add(-time.Minute)); len(got) != 1 || got[0] != "always" {
+		t.Errorf("before window: due = %v, want [always]", got)
+	}
+	// Tick that opens the window (30s late, as a real poll tick would be).
+	if got := dueNames(s, fire.Add(30*time.Second)); len(got) != 2 {
+		t.Errorf("window opening: due = %v, want both stacks", got)
+	}
+	// Still inside the window.
+	if got := dueNames(s, fire.Add(30*time.Minute)); len(got) != 2 {
+		t.Errorf("inside window: due = %v, want both stacks", got)
+	}
+	// Window closed, next firing is tomorrow.
+	if got := dueNames(s, fire.Add(61*time.Minute)); len(got) != 1 || got[0] != "always" {
+		t.Errorf("after window: due = %v, want [always]", got)
+	}
+	// Snapshot exposes the recomputed next run (tomorrow 04:00).
+	next := s.Snapshot().Stacks["nightly"].NextRun
+	want := time.Date(2026, 7, 20, 4, 0, 0, 0, paris)
+	if next == nil || !next.Equal(want) {
+		t.Errorf("next_run = %v, want %v", next, want)
+	}
+}
+
+func TestDueOpeningTickCountsEvenWithTinyWindow(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{
+		PollInterval: config.Duration{Duration: time.Minute},
+		Stacks:       []config.StackConfig{{Name: "web", Schedule: "0 4 * * *"}},
+	}
+	s := New(cfg, &countingRunner{}, discard())
+	fire := time.Date(2026, 7, 19, 4, 0, 0, 0, time.UTC)
+	s.mu.Lock()
+	s.scheds["web"] = &stackSched{
+		sched: mustSchedule(t, "0 4 * * *"), window: time.Second, next: fire,
+	}
+	s.mu.Unlock()
+
+	// The poll tick arrives 45s after the firing, past the 1s window: the
+	// opening tick must still count — every firing yields at least one run.
+	if got := dueNames(s, fire.Add(45*time.Second)); len(got) != 1 {
+		t.Errorf("opening tick skipped: due = %v", got)
+	}
+	// But the following tick is out of the window.
+	if got := dueNames(s, fire.Add(105*time.Second)); len(got) != 0 {
+		t.Errorf("tiny window should be closed: due = %v", got)
 	}
 }
 

@@ -125,6 +125,64 @@ repo = "https://example.com/repo.git"
 	}
 }
 
+func TestScheduleInheritanceAndOptOut(t *testing.T) {
+	t.Parallel()
+	cfg := `
+base_dir = "/opt/docker"
+schedule = "0 22 * * *"
+window = "2h"
+
+[[stack]]
+name = "inherits"
+repo = "https://example.com/a.git"
+
+[[stack]]
+name = "overrides"
+repo = "https://example.com/b.git"
+schedule = "0 4 * * *"
+window = "30m"
+
+[[stack]]
+name = "optout"
+repo = "https://example.com/c.git"
+schedule = "@poll"
+`
+	c, err := Load(writeConfig(t, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Stacks[0]; got.Schedule != "0 22 * * *" || got.Window.Duration != 2*time.Hour {
+		t.Errorf("inherits: schedule=%q window=%s", got.Schedule, got.Window.Duration)
+	}
+	if got := c.Stacks[1]; got.Schedule != "0 4 * * *" || got.Window.Duration != 30*time.Minute {
+		t.Errorf("overrides: schedule=%q window=%s", got.Schedule, got.Window.Duration)
+	}
+	if got := c.Stacks[2]; got.Schedule != "" {
+		t.Errorf("@poll must opt out of the global schedule, got %q", got.Schedule)
+	}
+}
+
+func TestScheduleValidation(t *testing.T) {
+	t.Parallel()
+	base := `
+base_dir = "/opt/docker"
+[[stack]]
+name = "app"
+repo = "https://example.com/repo.git"
+`
+	if _, err := Load(writeConfig(t, base+"\nschedule = \"not a cron\"\n")); err == nil {
+		t.Error("invalid stack schedule must fail validation")
+	}
+	if _, err := Load(writeConfig(t, "schedule = \"61 4 * * *\"\n"+base)); err == nil {
+		t.Error("invalid global schedule must fail validation")
+	}
+	for _, ok := range []string{"0 4 * * *", "@daily", "@every 6h", "*/15 8-18 * * 1-5"} {
+		if _, err := Load(writeConfig(t, base+"\nschedule = \""+ok+"\"\n")); err != nil {
+			t.Errorf("schedule %q should be valid: %v", ok, err)
+		}
+	}
+}
+
 func TestDoubleDotsInFilenamesAreValid(t *testing.T) {
 	t.Parallel()
 	cfg := `

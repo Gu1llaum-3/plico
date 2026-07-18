@@ -32,6 +32,33 @@ plico **orchestre** des CLIs matures — `git`, `sops`, `docker compose` — via
 
 Un run encore en cours au tick suivant est **sauté**, jamais empilé.
 
+### Planning par stack
+
+Sans `schedule`, une stack est déployée dès qu'un delta git est détecté. Avec
+un `schedule` (cron, évalué dans `timezone`), chaque déclenchement **ouvre une
+fenêtre de déploiement** de durée `window` (défaut 1 h) : pendant la fenêtre,
+chaque tick de polling peut déployer ; en dehors, la stack n'est pas touchée.
+
+```toml
+schedule = "0 22 * * *"   # global : fenêtre à 22h pour toutes les stacks
+window = "2h"
+
+[[stack]]
+name = "critique"
+schedule = "0 4 * * *"    # surcharge : celle-ci à 4h du matin
+window = "30m"
+
+[[stack]]
+name = "dev"
+schedule = "@poll"        # opt-out : déploie à chaque tick, comme sans planning
+```
+
+Le tick qui ouvre la fenêtre compte toujours, même si `window` <
+`poll_interval` : chaque déclenchement garantit au moins un passage.
+`/healthz` expose `next_run` par stack. **DST** : un déclenchement tombant
+dans l'heure sautée ne s'exécute pas ; dans l'heure répétée, il s'exécute une
+seule fois (première occurrence).
+
 ## Installation
 
 ```sh

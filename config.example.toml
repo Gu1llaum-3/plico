@@ -11,6 +11,16 @@ timezone = "Europe/Paris"
 # How often each stack's git ref is checked for changes.
 poll_interval = "60s"
 
+# Optional deployment schedule (cron, 5 fields or @daily/@every 6h…),
+# evaluated in `timezone`. Each firing opens a deployment window of
+# `window`; during it, every poll tick may deploy. Without a schedule,
+# a stack deploys as soon as a git delta is seen. Overridable per stack;
+# a stack can opt out of a global schedule with schedule = "@poll".
+# DST: a firing in the skipped hour does not run; in the repeated hour
+# it runs once.
+# schedule = "0 22 * * *"
+# window = "2h"
+
 # Hard ceiling for one full deployment run (git + hook + pull + up + verify).
 run_timeout = "30m"
 
@@ -59,6 +69,8 @@ sops_files = [".deploy/secrets.enc.env"]
 sops_mode = "exec-env"                # or "tmpfs" (Linux only)
 verify_timeout = "90s"                # post-up healthcheck budget
 # hook_timeout = "20m"                # override [hooks].timeout per stack
+# schedule = "0 4 * * *"              # override the global schedule (or "@poll")
+# window = "30m"                      # override the global window
 
 # [[stack]]
 # name = "internal-tools"

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/robfig/cron/v3"
 )
 
 // Duration wraps time.Duration to accept TOML strings like "30s" or "5m".
@@ -64,6 +65,15 @@ type StackConfig struct {
 	SopsMode      string   `toml:"sops_mode"`    // "exec-env" (default) | "tmpfs"
 	HookTimeout   Duration `toml:"hook_timeout"` // 0 = inherit [hooks].timeout
 	VerifyTimeout Duration `toml:"verify_timeout"`
+	// Schedule is a cron expression (5 fields or @daily/@every …) gating
+	// WHEN this stack is processed (F5). Empty = inherit the global
+	// schedule; "@poll" = opt out of a global schedule and run every poll
+	// tick. Evaluated in the configured timezone (F8).
+	Schedule string `toml:"schedule"`
+	// Window is how long the deployment window stays open after each
+	// schedule firing (F7); during the window every poll tick processes
+	// the stack. 0 = inherit the global window (default 1h).
+	Window Duration `toml:"window"`
 }
 
 // ForcePullEnabled resolves the *bool default (true when unset).
@@ -77,6 +87,8 @@ type Config struct {
 	PollInterval         Duration `toml:"poll_interval"`
 	RunTimeout           Duration `toml:"run_timeout"`
 	MaxConcurrentDeploys int      `toml:"max_concurrent_deploys"`
+	Schedule             string   `toml:"schedule"` // global default for stacks (F7); empty = every poll tick
+	Window               Duration `toml:"window"`   // global default window, 1h
 
 	Log    LogConfig    `toml:"log"`
 	Health HealthConfig `toml:"health"`
@@ -141,10 +153,24 @@ func (c *Config) applyDefaults() {
 	if c.Hooks.Timeout.Duration == 0 {
 		c.Hooks.Timeout.Duration = 10 * time.Minute
 	}
+	if c.Window.Duration == 0 {
+		c.Window.Duration = time.Hour
+	}
 	for i := range c.Stacks {
 		st := &c.Stacks[i]
 		if st.Ref == "" {
 			st.Ref = "main"
+		}
+		// Schedule inheritance (F7): empty = global; "@poll" = explicit
+		// opt-out back to every-poll-tick behavior.
+		if st.Schedule == "" {
+			st.Schedule = c.Schedule
+		}
+		if st.Schedule == "@poll" {
+			st.Schedule = ""
+		}
+		if st.Window.Duration == 0 {
+			st.Window = c.Window
 		}
 		if st.ComposeFile == "" {
 			st.ComposeFile = "docker-compose.yml"
@@ -178,6 +204,11 @@ func (c *Config) Validate() error {
 	if c.MaxConcurrentDeploys < 1 {
 		return fmt.Errorf("max_concurrent_deploys must be >= 1, got %d", c.MaxConcurrentDeploys)
 	}
+	if c.Schedule != "" && c.Schedule != "@poll" {
+		if _, err := cron.ParseStandard(c.Schedule); err != nil {
+			return fmt.Errorf("schedule %q: %w", c.Schedule, err)
+		}
+	}
 	if c.Ntfy.URL != "" {
 		if _, err := url.ParseRequestURI(c.Ntfy.URL); err != nil {
 			return fmt.Errorf("ntfy.url: %w", err)
@@ -204,6 +235,14 @@ func (c *Config) Validate() error {
 		}
 		if st.SopsMode != "exec-env" && st.SopsMode != "tmpfs" {
 			return fmt.Errorf("stack %q: sops_mode must be \"exec-env\" or \"tmpfs\", got %q", st.Name, st.SopsMode)
+		}
+		if st.Schedule != "" {
+			if _, err := cron.ParseStandard(st.Schedule); err != nil {
+				return fmt.Errorf("stack %q: schedule %q: %w", st.Name, st.Schedule, err)
+			}
+			if st.Window.Duration < 0 {
+				return fmt.Errorf("stack %q: window must be positive", st.Name)
+			}
 		}
 		for _, f := range st.SopsFiles {
 			if filepath.IsAbs(f) || escapesRepo(f) {

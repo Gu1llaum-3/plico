@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/robfig/cron/v3"
+
 	"github.com/Gu1llaum-3/plico/internal/config"
 	"github.com/Gu1llaum-3/plico/internal/deploy"
 )
@@ -23,17 +25,34 @@ type Scheduler struct {
 	cfg      *config.Config
 	deployer StackRunner
 	log      *slog.Logger
+	loc      *time.Location
 
 	mu       sync.Mutex
 	lastTick time.Time
 	running  map[string]time.Time // stack -> start of in-flight run
 	outcomes map[string]deploy.Outcome
+	scheds   map[string]*stackSched // only stacks with a cron schedule
+}
+
+// stackSched tracks one stack's deployment window (F5/F7): the cron firing
+// opens a window of `window` duration; during it, every poll tick processes
+// the stack. Cron times are evaluated in the configured timezone (F8).
+//
+// DST behavior (robfig/cron on wall-clock times): a firing scheduled inside
+// the skipped hour does not run; a firing inside the repeated hour runs once
+// (first occurrence).
+type stackSched struct {
+	sched       cron.Schedule
+	window      time.Duration
+	next        time.Time // next window opening
+	windowUntil time.Time // end of the currently/last opened window
 }
 
 // StackStatus is one stack's live view for /healthz.
 type StackStatus struct {
 	RunningSince *time.Time `json:"running_since,omitempty"`
 	LastOutcome  string     `json:"last_outcome,omitempty"`
+	NextRun      *time.Time `json:"next_run,omitempty"` // next window opening (scheduled stacks only)
 }
 
 // Snapshot feeds the semantic healthcheck (F35).
@@ -43,13 +62,32 @@ type Snapshot struct {
 }
 
 func New(cfg *config.Config, d StackRunner, log *slog.Logger) *Scheduler {
-	return &Scheduler{
+	s := &Scheduler{
 		cfg:      cfg,
 		deployer: d,
 		log:      log,
+		loc:      cfg.Location(),
 		running:  map[string]time.Time{},
 		outcomes: map[string]deploy.Outcome{},
+		scheds:   map[string]*stackSched{},
 	}
+	now := time.Now().In(s.loc)
+	for _, st := range cfg.Stacks {
+		if st.Schedule == "" {
+			continue // no schedule: due at every poll tick
+		}
+		sched, err := cron.ParseStandard(st.Schedule)
+		if err != nil {
+			// Validated at config load; defensive fallback to every-tick.
+			log.Error("invalid schedule, stack will run every tick", "stack", st.Name, "error", err)
+			continue
+		}
+		ss := &stackSched{sched: sched, window: st.Window.Duration, next: sched.Next(now)}
+		s.scheds[st.Name] = ss
+		log.Info("stack scheduled", "stack", st.Name, "schedule", st.Schedule,
+			"window", st.Window.String(), "next_run", ss.next.Format(time.RFC3339))
+	}
+	return s
 }
 
 // Run blocks until ctx is cancelled, then waits for in-flight runs to end.
@@ -59,10 +97,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	tick := func() {
+		now := time.Now().In(s.loc)
 		s.mu.Lock()
-		s.lastTick = time.Now()
+		s.lastTick = now
 		s.mu.Unlock()
-		for _, st := range s.due() {
+		for _, st := range s.due(now) {
 			wg.Add(1)
 			go func(st config.StackConfig) {
 				defer wg.Done()
@@ -84,10 +123,34 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// due returns the stacks to check this tick. MVP: all of them; v1 will
-// consult a per-stack cron schedule here.
-func (s *Scheduler) due() []config.StackConfig {
-	return s.cfg.Stacks
+// due returns the stacks to process this tick. A stack without a schedule
+// is always due; a scheduled stack is due while its window is open. The
+// tick that opens a window always counts, even when window < poll_interval,
+// so every firing yields at least one run. (F5/F7)
+func (s *Scheduler) due(now time.Time) []config.StackConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []config.StackConfig
+	for _, st := range s.cfg.Stacks {
+		ss, scheduled := s.scheds[st.Name]
+		if !scheduled {
+			out = append(out, st)
+			continue
+		}
+		opened := false
+		if !now.Before(ss.next) {
+			ss.windowUntil = ss.next.Add(ss.window)
+			ss.next = ss.sched.Next(now)
+			opened = true
+			s.log.Info("deployment window opened", "stack", st.Name,
+				"until", ss.windowUntil.Format(time.RFC3339),
+				"next_run", ss.next.Format(time.RFC3339))
+		}
+		if opened || now.Before(ss.windowUntil) {
+			out = append(out, st)
+		}
+	}
+	return out
 }
 
 func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig) {
@@ -126,6 +189,10 @@ func (s *Scheduler) Snapshot() Snapshot {
 		}
 		if o, ok := s.outcomes[st.Name]; ok {
 			status.LastOutcome = o.String()
+		}
+		if ss, ok := s.scheds[st.Name]; ok {
+			next := ss.next
+			status.NextRun = &next
 		}
 		snap.Stacks[st.Name] = status
 	}
