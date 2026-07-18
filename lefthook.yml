@@ -1,0 +1,16 @@
+# Git hooks run outside the mise-activated shell: go through `mise exec`
+# so the tool versions pinned in mise.toml are used.
+pre-commit:
+  parallel: true
+  jobs:
+    - name: gofmt
+      glob: "*.go"
+      run: files=$(mise exec -- gofmt -l {staged_files}); if [ -n "$files" ]; then echo "gofmt required:"; echo "$files"; exit 1; fi
+    - name: lint
+      glob: "*.go"
+      run: mise exec -- golangci-lint run
+
+pre-push:
+  jobs:
+    - name: test
+      run: mise exec -- go test ./...

@@ -1,0 +1,20 @@
+[tools]
+go = "1.26.5"
+lefthook = "2.1.6"
+golangci-lint = "latest"
+
+[tasks.build]
+description = "Build the plico binary"
+run = "go build -trimpath -o bin/plico ./cmd/plico"
+
+[tasks.test]
+description = "Run all tests"
+run = "go test ./..."
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run"
+
+[tasks.fmt]
+description = "Format sources and run go vet"
+run = ["gofmt -w .", "go vet ./..."]

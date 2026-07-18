@@ -1,0 +1,10 @@
+# Build output
+/bin/
+/plico
+
+# Local (real) config — config.example.toml is the versioned template
+config.toml
+
+# Test artifacts
+*.test
+coverage.out

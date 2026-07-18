@@ -1,0 +1,66 @@
+# plico configuration — copy to /etc/plico/config.toml and adapt.
+# Secrets are referenced with ${ENV_VAR} and interpolated at load time;
+# never write a token literally in this file (F20).
+
+# Where stack clones and state.json live. Readable host-path layout:
+# /opt/docker/<stack>/ — easy to back up with restic.
+base_dir = "/opt/docker"
+
+timezone = "Europe/Paris"
+
+# How often each stack's git ref is checked for changes.
+poll_interval = "60s"
+
+# Hard ceiling for one full deployment run (git + hook + pull + up + verify).
+run_timeout = "30m"
+
+# How many stacks may deploy at the same time.
+max_concurrent_deploys = 2
+
+[log]
+# path = "/var/log/plico/plico.log"   # empty = stderr; rotation via logrotate
+level = "info"                        # debug | info | warn | error
+
+[health]
+# Semantic healthcheck endpoint (GET /healthz). Local by default.
+listen = "127.0.0.1:9444"
+
+[ntfy]
+# Failure-oriented notifications. Leave url empty to disable.
+url = "https://ntfy.example.com/plico"
+token = "${PLICO_NTFY_TOKEN}"
+
+[hooks]
+# Global fallbacks; a hook versioned in the repo (.deploy/pre-deploy.sh)
+# always takes priority. exit != 0 in pre-deploy = deployment aborted.
+# pre_deploy_path = "/opt/plico/hooks/pre-deploy.sh"
+# post_deploy_path = "/opt/plico/hooks/post-deploy.sh"
+timeout = "10m"
+
+# Git HTTPS credentials, one table per host. SSH remotes use the system agent.
+[git.auths."bitbucket.org"]
+username = "deploy-bot"
+password = "${PLICO_BITBUCKET_TOKEN}"
+
+# [git.auths."gitea.example.com"]
+# username = "plico"
+# password = "${PLICO_GITEA_TOKEN}"
+
+# ── Stacks ──────────────────────────────────────────────────────────────
+[[stack]]
+name = "webapp"                       # directory name AND compose project name
+repo = "https://bitbucket.org/acme/webapp-deploy.git"
+ref = "main"                          # branch to follow
+compose_file = "docker-compose.yml"   # relative to the repo root
+force_pull = true                     # run `compose pull` before `up`
+# SOPS-encrypted dotenv files (repo-relative). Decrypted in memory via
+# `sops exec-env`; compose interpolates ${VARS} from them. Never on disk.
+sops_files = [".deploy/secrets.enc.env"]
+sops_mode = "exec-env"                # or "tmpfs" (Linux only)
+verify_timeout = "90s"                # post-up healthcheck budget
+# hook_timeout = "20m"                # override [hooks].timeout per stack
+
+# [[stack]]
+# name = "internal-tools"
+# repo = "https://gitea.example.com/infra/tools-deploy.git"
+# ref = "prod"
