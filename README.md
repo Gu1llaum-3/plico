@@ -63,6 +63,30 @@ bin/plico serve --config /etc/plico/config.toml
 - Notifications ntfy orientées échec : `deploy_queued`, `deploy_start`,
   `pre_hook_failed`, `pre_hook_skipped`, `deploy_failed`, `deploy_success`.
 
+### Secrets SOPS : chiffrement partiel recommandé
+
+plico déchiffre via `sops exec-env` : le `.sops.yaml` du repo ne sert qu'au
+chiffrement, les métadonnées de déchiffrement étant embarquées dans le
+fichier. Le **chiffrement partiel** (seules les valeurs sensibles sont
+chiffrées, le reste lisible en diff git) est donc supporté nativement :
+
+```yaml
+# .sops.yaml à la racine du repo de stack
+creation_rules:
+  - path_regex: \.deploy/.*\.enc\.env$
+    encrypted_regex: "(SECRET|PASSWORD|TOKEN|KEY)"
+    mac_only_encrypted: true
+    age: age1...   # destinataire(s)
+```
+
+```sh
+sops encrypt --in-place .deploy/secrets.enc.env   # ou: sops edit
+```
+
+⚠️ Sans `mac_only_encrypted: true`, le MAC couvre aussi les valeurs en
+clair : une édition à la main (hors `sops edit`/`sops set`) casse le
+déchiffrement — plico échouera au stage `sops` avec « MAC mismatch ».
+
 ### Auth Git
 
 HTTPS par domaine via `[git.auths."<host>"]` : plico se passe lui-même en

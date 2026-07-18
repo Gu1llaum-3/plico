@@ -5,9 +5,10 @@
 #
 # Covers:
 #   - clone/fetch + deploy on git delta, hook context (F11), healthz, state
-#   - SOPS gate (F16): age-encrypted dotenv decrypted in memory via
-#     `sops exec-env`, secret visible in the container env, cleartext never
-#     written under base_dir nor logged
+#   - SOPS gate (F16): PARTIALLY encrypted dotenv (.sops.yaml with
+#     encrypted_regex — the recommended diff-friendly workflow) decrypted in
+#     memory via `sops exec-env`; both clear and secret values reach the
+#     container env, the secret cleartext never touches base_dir nor logs
 #   - backup gate (F12/F14): failing pre-deploy hook blocks the new revision
 set -u
 
@@ -55,16 +56,30 @@ services:
     command: ["sleep", "300"]
     environment:
       SECRET_MESSAGE: ${SECRET_MESSAGE}
+      PUBLIC_MESSAGE: ${PUBLIC_MESSAGE}
+EOF
+
+# Partial encryption, the diff-friendly workflow: .sops.yaml declares which
+# keys must be encrypted (encrypted_regex); everything else stays readable
+# in git diffs. mac_only_encrypted lets cleartext values be edited without
+# going through `sops edit`.
+cat > .sops.yaml <<EOF
+creation_rules:
+  - path_regex: \.deploy/.*\.enc\.env\$
+    encrypted_regex: "(SECRET|PASSWORD|TOKEN|KEY)"
+    mac_only_encrypted: true
+    age: $RECIPIENT
 EOF
 
 mkdir -p .deploy
-# The cleartext dotenv lives OUTSIDE the repo and is deleted right after
-# encryption: only the sops-encrypted version is ever committed.
-printf 'SECRET_MESSAGE=%s\n' "$SECRET" > "$WS/secrets.plain.env"
-sops encrypt --age "$RECIPIENT" --output .deploy/secrets.enc.env "$WS/secrets.plain.env"
-rm -f "$WS/secrets.plain.env"
-grep -q 'ENC\[' .deploy/secrets.enc.env \
-  && ok "committed secrets file is encrypted" || fail "secrets.enc.env does not look encrypted"
+printf 'PUBLIC_MESSAGE=hello-in-clear\nSECRET_MESSAGE=%s\n' "$SECRET" > .deploy/secrets.enc.env
+sops encrypt --in-place .deploy/secrets.enc.env
+grep -q "SECRET_MESSAGE=ENC\[" .deploy/secrets.enc.env \
+  && ok "secret key is encrypted in the committed file" \
+  || fail "SECRET_MESSAGE not encrypted (encrypted_regex not applied?)"
+grep -q "PUBLIC_MESSAGE=hello-in-clear" .deploy/secrets.enc.env \
+  && ok "non-secret key stays readable for git diff" \
+  || fail "PUBLIC_MESSAGE should stay in clear (partial encryption)"
 
 cat > .deploy/pre-deploy.sh <<EOF
 #!/bin/sh
@@ -116,10 +131,13 @@ docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep
 
 # ── 4. SOPS assertions (F16) ───────────────────────────────────────────
 CID=$(docker compose -p smoke ps -q app)
-docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CID" 2>/dev/null \
-  | grep -q "SECRET_MESSAGE=$SECRET" \
+CONTAINER_ENV=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CID" 2>/dev/null)
+echo "$CONTAINER_ENV" | grep -q "SECRET_MESSAGE=$SECRET" \
   && ok "decrypted secret injected into container env via sops exec-env" \
   || fail "SECRET_MESSAGE not present in container env"
+echo "$CONTAINER_ENV" | grep -q "PUBLIC_MESSAGE=hello-in-clear" \
+  && ok "clear value from the same file injected too" \
+  || fail "PUBLIC_MESSAGE not present in container env"
 if grep -R -q "$SECRET" "$BASE" 2>/dev/null; then
   fail "cleartext secret found under base_dir"
 else
