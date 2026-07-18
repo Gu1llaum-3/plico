@@ -30,6 +30,11 @@ type StackState struct {
 	// that already failed at the same stage is logged but not re-notified.
 	LastFailedSHA   string `json:"last_failed_sha,omitempty"`
 	LastFailedStage string `json:"last_failed_stage,omitempty"`
+	// LastFiring is the schedule anchor: the last cron firing that was
+	// fully accounted for (attempted or declared missed). It survives
+	// restarts so a still-open window is re-opened instead of silently
+	// dropped, and a fully missed one is reported instead of replayed.
+	LastFiring time.Time `json:"last_firing,omitzero"`
 }
 
 // Store is a concurrency-safe view of the state file.
@@ -73,13 +78,29 @@ func (s *Store) All() map[string]StackState {
 	return out
 }
 
-// Put updates one stack and rewrites the whole file atomically
-// (temp file in the same directory + fsync + rename).
+// Put replaces one stack's state and rewrites the file atomically.
 func (s *Store) Put(stack string, st StackState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[stack] = st
+	return s.writeLocked()
+}
 
+// Update mutates one stack's state under the store lock. Writers owning
+// different fields (the deployer and the scheduler's schedule anchor) must
+// use it so they never clobber each other's fields with a stale full Put.
+func (s *Store) Update(stack string, mutate func(*StackState)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.data[stack]
+	mutate(&st)
+	s.data[stack] = st
+	return s.writeLocked()
+}
+
+// writeLocked rewrites the whole file atomically (temp file in the same
+// directory + fsync + rename). Callers must hold s.mu.
+func (s *Store) writeLocked() error {
 	raw, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return err

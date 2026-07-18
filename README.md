@@ -53,8 +53,14 @@ name = "dev"
 schedule = "@poll"        # opt-out : déploie à chaque tick, comme sans planning
 ```
 
-Le tick qui ouvre la fenêtre compte toujours, même si `window` <
-`poll_interval` : chaque déclenchement garantit au moins un passage.
+**La fenêtre fait autorité** : plico ne déploie jamais en dehors. Un
+déclenchement dont la fenêtre est entièrement passée (daemon arrêté, hôte en
+pause, run précédent couvrant toute la fenêtre) est **loggé en WARN et jamais
+rattrapé en retard**. L'ancre de planning est persistée dans `state.json` :
+un redémarrage *pendant* une fenêtre encore ouverte la ré-ouvre ; une fenêtre
+déjà honorée n'est pas rejouée. `window >= poll_interval` est imposé à la
+validation ; le nombre de tentatives possibles dans une fenêtre vaut environ
+`window / poll_interval` — dimensionner large si on veut des retries.
 `/healthz` expose `next_run` par stack. **DST** : un déclenchement tombant
 dans l'heure sautée ne s'exécute pas ; dans l'heure répétée, il s'exécute une
 seule fois (première occurrence).

@@ -181,6 +181,23 @@ repo = "https://example.com/repo.git"
 			t.Errorf("schedule %q should be valid: %v", ok, err)
 		}
 	}
+
+	// The window is authoritative: shorter than poll_interval it could
+	// close before any tick lands inside, so it is a config error.
+	_, err := Load(writeConfig(t, base+"\nschedule = \"0 4 * * *\"\nwindow = \"30s\"\n"))
+	if err == nil || !strings.Contains(err.Error(), "poll_interval") {
+		t.Errorf("window < poll_interval must fail validation, got %v", err)
+	}
+
+	// Windows are validated at their own level (the error must blame the
+	// right section) and even without a schedule.
+	_, err = Load(writeConfig(t, "window = \"-30m\"\nschedule = \"0 4 * * *\"\n"+base))
+	if err == nil || strings.Contains(err.Error(), "stack") {
+		t.Errorf("negative global window must blame the global section, got %v", err)
+	}
+	if _, err := Load(writeConfig(t, base+"\nwindow = \"-30m\"\nschedule = \"@poll\"\n")); err == nil {
+		t.Error("negative stack window must fail even with schedule = \"@poll\"")
+	}
 }
 
 func TestDoubleDotsInFilenamesAreValid(t *testing.T) {

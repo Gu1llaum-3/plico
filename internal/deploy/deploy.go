@@ -170,9 +170,13 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 		} else {
 			ev(t, stage, detail)
 		}
-		d.saveState(log, st.Name, state.StackState{
-			LastDeployedSHA: deployedSHA, LastStatus: status, LastRunID: runID,
-			UpdatedAt: time.Now(), LastFailedSHA: newSHA, LastFailedStage: stage,
+		d.saveState(log, st.Name, func(s2 *state.StackState) {
+			s2.LastDeployedSHA = deployedSHA
+			s2.LastStatus = status
+			s2.LastRunID = runID
+			s2.UpdatedAt = time.Now()
+			s2.LastFailedSHA = newSHA
+			s2.LastFailedStage = stage
 		})
 	}
 
@@ -271,9 +275,13 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	}
 
 	// 12. state save — success clears the failure-dedup fields.
-	if err := d.store.Put(st.Name, state.StackState{
-		LastDeployedSHA: newSHA, LastStatus: state.StatusSuccess,
-		LastRunID: runID, UpdatedAt: time.Now(),
+	if err := d.store.Update(st.Name, func(s2 *state.StackState) {
+		s2.LastDeployedSHA = newSHA
+		s2.LastStatus = state.StatusSuccess
+		s2.LastRunID = runID
+		s2.UpdatedAt = time.Now()
+		s2.LastFailedSHA = ""
+		s2.LastFailedStage = ""
 	}); err != nil {
 		log.Error("state save failed", "stage", StageStateSave, "error", err)
 		ev(notify.DeployFailed, StageStateSave, err.Error())
@@ -368,8 +376,8 @@ func assess(services []compose.Service) (bad, pending []string) {
 	return bad, pending
 }
 
-func (d *Deployer) saveState(log *slog.Logger, stack string, st state.StackState) {
-	if err := d.store.Put(stack, st); err != nil {
+func (d *Deployer) saveState(log *slog.Logger, stack string, mutate func(*state.StackState)) {
+	if err := d.store.Update(stack, mutate); err != nil {
 		log.Error("state save failed", "error", err)
 	}
 }

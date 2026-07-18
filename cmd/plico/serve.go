@@ -82,7 +82,10 @@ func serve(configPath string) error {
 	runtime := compose.NewDocker(runner)
 	hookRunner := hooks.New(runner, log)
 	deployer := deploy.New(cfg, git, runtime, hookRunner, notifier, store, runner, log)
-	sched := scheduler.New(cfg, deployer, log)
+	sched, err := scheduler.New(cfg, deployer, store, log)
+	if err != nil {
+		return fmt.Errorf("scheduler: %w", err)
+	}
 	server := api.New(cfg.Health.Listen, sched, store,
 		cfg.PollInterval.Duration, cfg.RunTimeout.Duration)
 

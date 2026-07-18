@@ -156,6 +156,11 @@ func (c *Config) applyDefaults() {
 	if c.Window.Duration == 0 {
 		c.Window.Duration = time.Hour
 	}
+	// "@poll" (no schedule, run every poll tick) is normalized here, once:
+	// after applyDefaults no consumer ever sees the sentinel.
+	if c.Schedule == "@poll" {
+		c.Schedule = ""
+	}
 	for i := range c.Stacks {
 		st := &c.Stacks[i]
 		if st.Ref == "" {
@@ -204,10 +209,16 @@ func (c *Config) Validate() error {
 	if c.MaxConcurrentDeploys < 1 {
 		return fmt.Errorf("max_concurrent_deploys must be >= 1, got %d", c.MaxConcurrentDeploys)
 	}
-	if c.Schedule != "" && c.Schedule != "@poll" {
+	if c.Schedule != "" {
 		if _, err := cron.ParseStandard(c.Schedule); err != nil {
 			return fmt.Errorf("schedule %q: %w", c.Schedule, err)
 		}
+	}
+	// Windows are validated at their own level so the error blames the
+	// right config section, and unconditionally so a bad value cannot lie
+	// dormant on a stack that currently has no schedule.
+	if c.Window.Duration < 0 {
+		return fmt.Errorf("window must be positive, got %s", c.Window.Duration)
 	}
 	if c.Ntfy.URL != "" {
 		if _, err := url.ParseRequestURI(c.Ntfy.URL); err != nil {
@@ -236,12 +247,20 @@ func (c *Config) Validate() error {
 		if st.SopsMode != "exec-env" && st.SopsMode != "tmpfs" {
 			return fmt.Errorf("stack %q: sops_mode must be \"exec-env\" or \"tmpfs\", got %q", st.Name, st.SopsMode)
 		}
+		if st.Window.Duration < 0 {
+			return fmt.Errorf("stack %q: window must be positive, got %s", st.Name, st.Window.Duration)
+		}
 		if st.Schedule != "" {
 			if _, err := cron.ParseStandard(st.Schedule); err != nil {
 				return fmt.Errorf("stack %q: schedule %q: %w", st.Name, st.Schedule, err)
 			}
-			if st.Window.Duration < 0 {
-				return fmt.Errorf("stack %q: window must be positive", st.Name)
+			// The window is authoritative (a missed one is never replayed
+			// late): shorter than the poll interval, it could close before
+			// the first tick ever lands inside and the stack would never
+			// deploy.
+			if st.Window.Duration < c.PollInterval.Duration {
+				return fmt.Errorf("stack %q: window (%s) must be >= poll_interval (%s)",
+					st.Name, st.Window.Duration, c.PollInterval.Duration)
 			}
 		}
 		for _, f := range st.SopsFiles {

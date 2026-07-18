@@ -28,10 +28,13 @@ C'est ce qui transforme le daemon en outil qu'on opère. Rien de tout ceci
 n'existe dans doco-cd.
 
 - [x] **Planning par stack** (F5, F7, F8) : expression cron + fenêtre horaire
-      (chaque déclenchement ouvre une fenêtre de `window` ; le tick d'ouverture
-      compte toujours), surcharge du global par stack, opt-out `@poll`,
-      timezone configurable, DST documenté (robfig/cron : heure sautée = pas
-      de run ; heure répétée = un seul run), `next_run` exposé dans /healthz
+      **stricte** (jamais de déploiement hors fenêtre ; fenêtre manquée =
+      WARN, jamais rattrapée en retard), ancre persistée dans state.json
+      (redémarrage dans une fenêtre ouverte → ré-ouverture ; fenêtre déjà
+      honorée → pas de rejeu), `window >= poll_interval` imposé, surcharge du
+      global par stack, opt-out `@poll`, timezone configurable, DST documenté
+      (heure sautée = pas de run ; heure répétée = un seul run), `next_run`
+      exposé dans /healthz
 - [ ] **Distinction check / apply** (F6) : détecter et notifier « déploiement
       en attente » en journée, appliquer dans la fenêtre
 - [ ] **CLI cliente** via socket unix (F24–F30) : `status`, `check-now`,

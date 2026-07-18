@@ -29,8 +29,11 @@ func setup(t *testing.T) (*scheduler.Scheduler, *state.Store, *http.Server) {
 		PollInterval: config.Duration{Duration: time.Hour},
 		Stacks:       []config.StackConfig{{Name: "web"}},
 	}
-	sched := scheduler.New(cfg, nopRunner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched, err := scheduler.New(cfg, nopRunner{}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
