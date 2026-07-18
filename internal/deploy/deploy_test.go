@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"plico/internal/compose"
-	"plico/internal/config"
-	"plico/internal/execx"
-	"plico/internal/gitrepo"
-	"plico/internal/hooks"
-	"plico/internal/notify"
-	"plico/internal/state"
+	"github.com/Gu1llaum-3/plico/internal/compose"
+	"github.com/Gu1llaum-3/plico/internal/config"
+	"github.com/Gu1llaum-3/plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/gitrepo"
+	"github.com/Gu1llaum-3/plico/internal/hooks"
+	"github.com/Gu1llaum-3/plico/internal/notify"
+	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

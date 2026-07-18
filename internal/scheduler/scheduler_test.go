@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"plico/internal/config"
-	"plico/internal/deploy"
+	"github.com/Gu1llaum-3/plico/internal/config"
+	"github.com/Gu1llaum-3/plico/internal/deploy"
 )
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

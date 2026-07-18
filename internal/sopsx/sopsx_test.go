@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/execx"
 )
 
 func TestExecEnvArgvNoFiles(t *testing.T) {

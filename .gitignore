@@ -1,6 +1,7 @@
 # Build output
 /bin/
 /plico
+/dist/
 
 # Local (real) config — config.example.toml is the versioned template
 config.toml

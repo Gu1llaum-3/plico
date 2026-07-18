@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/execx"
 )
 
 // Service is one service of a compose project as reported by `ps`.

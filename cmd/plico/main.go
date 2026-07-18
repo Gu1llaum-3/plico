@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"plico/internal/gitrepo"
+	"github.com/Gu1llaum-3/plico/internal/gitrepo"
 )
 
 func main() {

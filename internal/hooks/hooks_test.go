@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/execx"
 )
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

@@ -15,8 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"plico/internal/config"
-	"plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/config"
+	"github.com/Gu1llaum-3/plico/internal/execx"
 )
 
 // Environment contract between gitrepo and the askpass mode of main().

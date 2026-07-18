@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/execx"
 )
 
 // Repo-side hook locations (F10).

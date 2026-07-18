@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Installs every tool pinned in mise.toml (go, golangci-lint, sops, age…)
+      - uses: jdx/mise-action@v2
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Unit tests
+        run: mise run test
+
+      # Full end-to-end: local git origin, real docker compose, sops+age
+      # partial encryption, backup gate. Docker is preinstalled on
+      # ubuntu-latest runners.
+      - name: Smoke test
+        run: mise run smoke

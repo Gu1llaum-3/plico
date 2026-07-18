@@ -1,0 +1,47 @@
+version: 2
+
+project_name: plico
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/plico
+    binary: plico
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - freebsd
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - config.example.toml
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  footer: |
+    Binaires statiques (`CGO_ENABLED=0`) — aucun runtime requis sur l'hôte
+    hormis `git`, `sops` et `docker compose`.

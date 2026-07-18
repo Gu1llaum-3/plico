@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"plico/internal/scheduler"
-	"plico/internal/state"
+	"github.com/Gu1llaum-3/plico/internal/scheduler"
+	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
 type healthResponse struct {

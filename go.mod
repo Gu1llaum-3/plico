@@ -1,4 +1,4 @@
-module plico
+module github.com/Gu1llaum-3/plico
 
 go 1.26.5
 

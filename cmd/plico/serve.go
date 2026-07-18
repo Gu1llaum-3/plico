@@ -15,17 +15,17 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"plico/internal/api"
-	"plico/internal/compose"
-	"plico/internal/config"
-	"plico/internal/deploy"
-	"plico/internal/execx"
-	"plico/internal/gitrepo"
-	"plico/internal/hooks"
-	"plico/internal/notify"
-	"plico/internal/scheduler"
-	"plico/internal/sopsx"
-	"plico/internal/state"
+	"github.com/Gu1llaum-3/plico/internal/api"
+	"github.com/Gu1llaum-3/plico/internal/compose"
+	"github.com/Gu1llaum-3/plico/internal/config"
+	"github.com/Gu1llaum-3/plico/internal/deploy"
+	"github.com/Gu1llaum-3/plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/gitrepo"
+	"github.com/Gu1llaum-3/plico/internal/hooks"
+	"github.com/Gu1llaum-3/plico/internal/notify"
+	"github.com/Gu1llaum-3/plico/internal/scheduler"
+	"github.com/Gu1llaum-3/plico/internal/sopsx"
+	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
 var serveConfigPath string

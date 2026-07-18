@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"plico/internal/config"
-	"plico/internal/deploy"
-	"plico/internal/scheduler"
-	"plico/internal/state"
+	"github.com/Gu1llaum-3/plico/internal/config"
+	"github.com/Gu1llaum-3/plico/internal/deploy"
+	"github.com/Gu1llaum-3/plico/internal/scheduler"
+	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
 type nopRunner struct{}

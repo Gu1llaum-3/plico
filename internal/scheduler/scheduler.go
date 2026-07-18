@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"plico/internal/config"
-	"plico/internal/deploy"
+	"github.com/Gu1llaum-3/plico/internal/config"
+	"github.com/Gu1llaum-3/plico/internal/deploy"
 )
 
 // StackRunner is what the scheduler needs from the deployer.

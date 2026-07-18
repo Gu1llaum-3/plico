@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"plico/internal/execx"
+	"github.com/Gu1llaum-3/plico/internal/execx"
 )
 
 // ExecEnvArgv wraps argv so it runs with the decrypted content of files in
