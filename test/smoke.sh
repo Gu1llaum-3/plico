@@ -14,7 +14,11 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PLICO="$REPO_ROOT/bin/plico"
-WS="$(mktemp -d -t plico-smoke)"
+# Portable across GNU and BSD mktemp (GNU requires XXXXXX in the template).
+WS="$(mktemp -d "${TMPDIR:-/tmp}/plico-smoke.XXXXXX")"
+# Everything below builds paths from $WS: refuse to run with an empty one,
+# otherwise the script would operate on / and on the plico checkout itself.
+[ -n "$WS" ] && [ -d "$WS" ] || { echo "mktemp failed"; exit 1; }
 ORIGIN="$WS/origin.git"
 WORK="$WS/work"
 BASE="$WS/base"
@@ -46,7 +50,7 @@ RECIPIENT=$(age-keygen -y "$WS/age.key")
 
 git init -q --bare -b main "$ORIGIN"
 git init -q -b main "$WORK"
-cd "$WORK"
+cd "$WORK" || exit 1
 git config user.email smoke@test && git config user.name smoke
 
 cat > docker-compose.yml <<'EOF'
@@ -150,7 +154,7 @@ else
 fi
 
 # ── 5. gate test: failing pre-deploy hook must block the new revision ──
-cd "$WORK"
+cd "$WORK" || exit 1
 sed -i.bak 's/"300"/"301"/' docker-compose.yml && rm -f docker-compose.yml.bak
 cat > .deploy/pre-deploy.sh <<'EOF'
 #!/bin/sh
