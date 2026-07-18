@@ -123,6 +123,14 @@ func NewAt(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logg
 		switch {
 		case prev.LastFiring.IsZero():
 			// fresh install
+		case prev.LastFiring.After(nowLoc):
+			// Checked before legacy adoption: a future anchor freezes the
+			// schedule until the wall clock catches up, whatever wrote it.
+			log.Warn("persisted schedule anchor is in the future (wall clock stepped back?), re-anchoring at now",
+				"stack", st.Name, "anchor", prev.LastFiring.Format(time.RFC3339))
+			// Deliberate backward re-anchor: bypass the monotonic guard.
+			s.resetAnchor(st.Name, nowLoc, st.Schedule)
+			anchor = nowLoc
 		case prev.ScheduleSpec == "":
 			// State written before schedule_spec existed: adopt the anchor
 			// (resetting would silently drop a window across the upgrade).
@@ -133,12 +141,6 @@ func NewAt(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logg
 		case prev.ScheduleSpec != st.Schedule:
 			log.Info("schedule changed, resetting anchor", "stack", st.Name,
 				"old", prev.ScheduleSpec, "new", st.Schedule)
-		case prev.LastFiring.After(nowLoc):
-			log.Warn("persisted schedule anchor is in the future (wall clock stepped back?), re-anchoring at now",
-				"stack", st.Name, "anchor", prev.LastFiring.Format(time.RFC3339))
-			// Deliberate backward re-anchor: bypass the monotonic guard.
-			s.resetAnchor(st.Name, nowLoc, st.Schedule)
-			anchor = nowLoc
 		default:
 			anchor = prev.LastFiring.In(s.loc)
 		}
@@ -218,10 +220,13 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 		// open a window; earlier ones (daemon down across several firings,
 		// or cron period shorter than the poll interval) are reported in
 		// one aggregate warning.
-		var fired, firstSkipped, lastSkipped time.Time
+		var fired, firstSkipped, lastSkipped, gapStart time.Time
 		skipped := 0
 		aborted := false
 		for i := 0; !ss.next.IsZero() && !now.Before(ss.next); i++ {
+			if i == 0 {
+				gapStart = ss.next // true start of the gap, for diagnostics
+			}
 			if i >= s.catchUpLimit {
 				aborted = true
 				break
@@ -242,7 +247,8 @@ func (s *Scheduler) due(now time.Time) []config.StackConfig {
 			// whole walk on every restart.
 			s.log.Error("schedule catch-up aborted after too many firings, re-anchoring at now",
 				"stack", st.Name, "skipped_at_least", s.catchUpLimit,
-				"first", fired.Format(time.RFC3339))
+				"first", gapStart.Format(time.RFC3339),
+				"last_walked", fired.Format(time.RFC3339))
 			s.advanceNext(ss, st.Name, now)
 			s.resetAnchor(st.Name, now, ss.spec)
 			fired = time.Time{}

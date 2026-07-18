@@ -640,6 +640,26 @@ func TestLegacyStateWithoutSpecAdoptsAnchor(t *testing.T) {
 	}
 }
 
+func TestLegacyFutureAnchorIsReanchored(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	// Legacy state (no schedule_spec) whose anchor is in the future: the
+	// future-anchor guard must win over legacy adoption, or the schedule
+	// would freeze until the wall clock catches up.
+	if err := store.Update("nightly", func(st *state.StackState) {
+		st.LastFiring = time.Date(2026, 7, 19, 6, 0, 0, 0, loc) // 3h ahead
+	}); err != nil {
+		t.Fatal(err)
+	}
+	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
+	s := mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, store, boot)
+
+	if got := dueNames(s, time.Date(2026, 7, 19, 4, 0, 30, 0, loc)); len(got) != 2 {
+		t.Errorf("legacy future anchor froze the schedule, due = %v", got)
+	}
+}
+
 func TestCatchUpAbortReanchorsAndPersists(t *testing.T) {
 	t.Parallel()
 	loc := paris(t)
