@@ -1,243 +1,244 @@
 # plico
 
-> *plicare* « plier » → *plico* « je déplie » — déployer, littéralement.
+> *plicare* "to fold" → *plico* "I unfold" — literally, to deploy.
 
-**plico** est un déployeur GitOps *pull-based* pour stacks Docker Compose, à la
-FluxCD mais pour Compose standalone. Sa raison d'être face à
-[doco-cd](https://github.com/kimdre/doco-cd) : un **gate de sauvegarde
-pré-déploiement bloquant** (si le backup échoue, on ne déploie pas), un layout
-host-path lisible (`/opt/docker/<stack>/`) facile à sauvegarder avec restic, et
-des secrets SOPS **jamais écrits en clair sur disque**.
+**plico** is a *pull-based* GitOps deployer for standalone Docker Compose
+stacks — FluxCD-style, but for Compose. Its reason to exist next to
+[doco-cd](https://github.com/kimdre/doco-cd): a **blocking pre-deployment
+backup gate** (if the backup fails, nothing is deployed), a readable
+host-path layout (`/opt/docker/<stack>/`) that is easy to back up with
+restic, and SOPS secrets that are **never written to disk in cleartext**.
 
-plico **orchestre** des CLIs matures — `git`, `sops`, `docker compose` — via
-`os/exec`. Il ne réimplémente ni Git, ni Compose, ni SOPS.
+plico **orchestrates** mature CLIs — `git`, `sops`, `docker compose` — via
+`os/exec`. It reimplements neither Git, nor Compose, nor SOPS.
 
-## Fonctionnement
+## How it works
 
-À chaque `poll_interval`, pour chaque stack :
+Every `poll_interval`, for each stack:
 
-1. `git fetch` + comparaison du SHA `origin/<ref>` avec le dernier SHA déployé
-   (persisté dans `state.json`). Pas de delta → no-op silencieux.
-2. **Hook pré-déploiement** : `.deploy/pre-deploy.sh` du repo (prioritaire) ou
-   chemin global configuré. Il reçoit `DEPLOY_STACK`, `DEPLOY_DIR`,
-   `DEPLOY_GIT_REF`, `DEPLOY_OLD_SHA`, `DEPLOY_NEW_SHA`.
-   **`exit != 0` → déploiement abandonné**, notification, retry au tick suivant.
-   ⚠️ Le daemon tourne avec `UMask=0022` pour que les fichiers des clones
-   restent lisibles par les conteneurs bind-montés (uid arbitraire) — les
-   hooks en héritent : un hook qui écrit des données sensibles (dump de base
-   avant backup, par exemple) doit poser `umask 077` en tête de script ou
-   écrire dans un répertoire aux permissions restreintes.
-3. Déchiffrement SOPS en mémoire : `sops exec-env secrets.enc.env -- docker
-   compose … up -d`. Mode `tmpfs` (`/dev/shm`) disponible sur Linux.
-4. `docker compose pull` (option `force_pull`) puis `up -d --remove-orphans`.
-   Un pull qui échoue laisse la stack en place.
-5. Vérification post-up : tous les services `running` et `healthy` (ou sans
-   healthcheck) dans `verify_timeout` ; échec immédiat sur `unhealthy`.
-6. Hook post-déploiement optionnel (non bloquant), notification, état persisté.
+1. `git fetch` + compare the `origin/<ref>` SHA with the last deployed SHA
+   (persisted in `state.json`). No delta → silent no-op.
+2. **Pre-deploy hook**: `.deploy/pre-deploy.sh` from the repo (takes
+   precedence) or a configured global path. It receives `DEPLOY_STACK`,
+   `DEPLOY_DIR`, `DEPLOY_GIT_REF`, `DEPLOY_OLD_SHA`, `DEPLOY_NEW_SHA`.
+   **`exit != 0` → deployment aborted**, notification, retried on the next
+   tick.
+   ⚠️ The daemon runs with `UMask=0022` so cloned files stay readable by
+   containers bind-mounting them under an arbitrary uid — hooks inherit it:
+   a hook writing sensitive data (a database dump before backup, say) must
+   set `umask 077` at the top of the script or write to a
+   permission-restricted directory.
+3. SOPS decryption in memory: `sops exec-env secrets.enc.env -- docker
+   compose … up -d`. tmpfs mode (`/dev/shm`) available on Linux.
+4. `docker compose pull` (`force_pull` option) then `up -d --remove-orphans`.
+   A failed pull leaves the running stack untouched.
+5. Post-up verification: every service `running` and `healthy` (or without a
+   healthcheck) within `verify_timeout`; immediate failure on `unhealthy`.
+6. Optional post-deploy hook (non-blocking), notification, state persisted.
 
-Un run encore en cours au tick suivant est **sauté**, jamais empilé.
+A run still in flight at the next tick is **skipped**, never piled up.
 
-### Planning par stack
+### Per-stack scheduling
 
-Sans `schedule`, une stack est déployée dès qu'un delta git est détecté. Avec
-un `schedule` (cron, évalué dans `timezone`), chaque déclenchement **ouvre une
-fenêtre de déploiement** de durée `window` (défaut 1 h) : pendant la fenêtre,
-chaque tick de polling peut déployer ; en dehors, la stack n'est pas touchée.
+Without a `schedule`, a stack is deployed as soon as a git delta is seen.
+With a `schedule` (cron, evaluated in `timezone`), each firing **opens a
+deployment window** of `window` duration (default 1 h): during the window,
+every poll tick may deploy; outside it, the stack is untouched.
 
 ```toml
-schedule = "0 22 * * *"   # global : fenêtre à 22h pour toutes les stacks
+schedule = "0 22 * * *"   # global: a 22:00 window for every stack
 window = "2h"
 
 [[stack]]
-name = "critique"
-schedule = "0 4 * * *"    # surcharge : celle-ci à 4h du matin
+name = "critical"
+schedule = "0 4 * * *"    # override: this one at 4 AM
 window = "30m"
 
 [[stack]]
 name = "dev"
-schedule = "@poll"        # opt-out : déploie à chaque tick, comme sans planning
+schedule = "@poll"        # opt-out: deploy on every tick, as without a schedule
 
 [[stack]]
-name = "surveillee"
+name = "watched"
 schedule = "0 22 * * *"
-check = true              # hors fenêtre : fetch + diff à chaque tick, et
-                          # notification « déploiement en attente » (une seule
-                          # fois par révision) — sans rien appliquer
+check = true              # outside the window: fetch + diff on every tick and
+                          # a "deployment queued" notification (once per
+                          # revision) — without deploying anything
 ```
 
-**La fenêtre fait autorité** : plico ne déploie jamais en dehors, à une
-tolérance près d'un `poll_interval` sur le tick qui découvre le déclenchement
-(le jitter du ticker ne transforme pas un déclenchement sain en fenêtre
-manquée). Un déclenchement dont la fenêtre est entièrement passée (daemon
-arrêté, hôte en pause, run précédent couvrant toute la fenêtre) est **loggé
-en WARN et jamais rattrapé en retard**. L'ancre de planning (dernier
-déclenchement traité + l'expression cron utilisée) est persistée dans
-`state.json` : un redémarrage *pendant* une fenêtre encore ouverte la
-ré-ouvre ; une fenêtre déjà honorée n'est pas rejouée ; **modifier le
-`schedule` ré-ancre au redémarrage** (pas de déclenchements fantômes sous la
-nouvelle expression). Le nombre de tentatives dans une fenêtre vaut environ
-`window / poll_interval` — dimensionner large si on veut des retries ; un run
-lancé en fin de fenêtre peut la déborder, il est attribué à la fenêtre qui
-l'a lancé. `/healthz` expose `next_run` par stack. **DST** : un déclenchement
-tombant dans l'heure sautée ne s'exécute pas ; dans l'heure répétée, il
-s'exécute une seule fois (première occurrence).
+**The window is authoritative**: plico never deploys outside it, give or
+take one `poll_interval` of tolerance on the tick that discovers the firing
+(ticker jitter must not turn a healthy firing into a missed window). A
+firing whose window has entirely passed (daemon down, host paused, previous
+run covering the whole window) is **logged as WARN and never replayed
+late**. The schedule anchor (last accounted firing + the cron expression it
+was computed under) is persisted in `state.json`: a restart *during* a
+still-open window re-opens it; an already-honored window is not replayed;
+**editing the `schedule` re-anchors at restart** (no phantom firings under
+the new expression). The number of attempts within a window is roughly
+`window / poll_interval` — size it generously if you want retries; a run
+dispatched at the end of a window may outlive it and is attributed to the
+window that launched it. `/healthz` exposes `next_run` per stack. **DST**: a
+firing falling in the skipped hour does not run; in the repeated hour it
+runs once (first occurrence).
 
 ## Installation
 
-Dernière version stable :
+On the server (Linux/systemd):
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Gu1llaum-3/plico/main/install.sh
-less install.sh
+less install.sh          # read before running
 sudo sh install.sh
 ```
 
-Version précise ou binaire déjà téléchargé :
+The installer downloads the latest release (checksums verified), creates the
+`plico` user, the directories, the systemd unit and an example
+configuration — it never starts a service without an active configuration.
+To activate:
 
 ```sh
-sudo sh install.sh --version v1.2.3
-sudo sh install.sh --binary ./plico --sha256 <sha256>
+sudo cp /etc/plico/config.toml.example /etc/plico/config.toml
+sudoedit /etc/plico/config.toml
+sudo systemctl enable --now plico
+plico status
 ```
 
-Sous Linux/systemd, l'installateur prépare l'utilisateur de service, les
-répertoires, `/etc/plico/plico.env` et l'unité systemd. Sans configuration
-active il n'active pas le service : copier et adapter
-`/etc/plico/config.toml.example`, puis relancer l'installateur avec
-`--config`. Sur Darwin et FreeBSD, seule l'installation du binaire est faite.
-Voir [le guide d'installation](docs/installation.md) pour les mises à jour,
-le mode hors-ligne, les permissions Docker et la migration des chemins.
-
-Installation depuis les sources pour contribuer :
-
-```sh
-mise install
-mise run build        # → bin/plico
-```
-
-Tâches disponibles : `mise run build | test | lint | fmt | smoke |
-install-test | release-test | shellcheck`.
-
-`mise run smoke` exécute [`test/smoke.sh`](test/smoke.sh) : un environnement
-GitOps complet en local (repo git `file://`, vraie stack Docker, secrets
-chiffrés **age + sops**) qui vérifie le déploiement nominal, l'injection des
-secrets en mémoire (aucun clair sur disque ni dans les logs), puis le blocage
-par le gate de backup. Nécessite un daemon Docker.
+Upgrading: re-run `sudo sh install.sh` (atomic binary replacement, restart
+only when something changed, automatic rollback if the service does not come
+back). Pinning a version, local/offline binaries, `--operator`, `--config`
+for automation, macOS/FreeBSD, migrating from the historical layout and
+diagnostics: see [the installation guide](docs/installation.md).
 
 ## Configuration
 
-Copier [`config.example.toml`](config.example.toml) vers
-`/etc/plico/config.toml`. Les secrets (tokens git, ntfy) passent par
-interpolation `${ENV_VAR}` — une variable absente empêche le démarrage du
-daemon et la commande `validate`.
+The commented reference is [`config.example.toml`](config.example.toml),
+installed on the server as `/etc/plico/config.toml.example`. Secrets (git
+tokens, ntfy) are referenced with `${ENV_VAR}` interpolation and provided
+through `/etc/plico/plico.env` — a missing variable prevents the daemon from
+starting and fails `plico validate`.
 
-```sh
-bin/plico serve --config /etc/plico/config.toml
-```
-
-- `GET /healthz` (127.0.0.1:9444) : healthcheck **sémantique** — 503 si le
-  scheduler ne tick plus ou si un run dépasse `run_timeout`.
-- Logs JSON structurés (slog), un `run_id` de corrélation par déploiement.
-- Notifications ntfy orientées échec : `deploy_queued`, `deploy_start`,
+- `GET /healthz` (127.0.0.1:9444): **semantic** healthcheck — 503 when the
+  scheduler stops ticking or a run exceeds `run_timeout`.
+- Structured JSON logs (slog), one correlation `run_id` per deployment.
+- Failure-oriented ntfy notifications: `deploy_queued`, `deploy_start`,
   `pre_hook_failed`, `pre_hook_skipped`, `deploy_failed`, `deploy_success`.
 
-### Layout système
+### System layout
 
-Les nouvelles installations séparent données persistantes et runtime :
+New installations separate persistent data from runtime:
 
-| Chemin | Contenu | Sauvegarde |
+| Path | Content | Back up |
 |---|---|---|
-| `/opt/docker/<stack>` | worktrees Git, reconstructibles | optionnelle |
-| `/var/lib/plico/state.json` | SHA, échecs, files d'attente, ancres cron | **oui** |
-| `/run/plico/plico.sock*` | socket et verrou volatils | non |
-| `/etc/plico` | configuration, environnement, clé age | **oui** |
+| `/opt/docker/<stack>` | Git worktrees, rebuildable | optional |
+| `/var/lib/plico/state.json` | SHAs, failures, queued revisions, cron anchors | **yes** |
+| `/run/plico/plico.sock*` | volatile socket and lock | no |
+| `/etc/plico` | configuration, environment, age key | **yes** |
 
-Ne jamais placer une base ou des uploads irremplaçables dans un worktree :
-plico peut le supprimer et le recloner pour réparer Git. Les anciennes
-configurations sans `state_file` ni `[api].socket` conservent exactement le
-layout historique sous `base_dir`.
+Never place a database or irreplaceable uploads inside a worktree: plico may
+delete and re-clone it to repair Git. Older configurations without
+`state_file` or `[api].socket` keep the exact historical layout under
+`base_dir`.
 
-### Secrets SOPS : chiffrement partiel recommandé
+### SOPS secrets: partial encryption recommended
 
-plico déchiffre via `sops exec-env` : le `.sops.yaml` du repo ne sert qu'au
-chiffrement, les métadonnées de déchiffrement étant embarquées dans le
-fichier. Le **chiffrement partiel** (seules les valeurs sensibles sont
-chiffrées, le reste lisible en diff git) est donc supporté nativement :
+plico decrypts through `sops exec-env`: the repo's `.sops.yaml` is only used
+for encryption, the decryption metadata being embedded in the file itself.
+**Partial encryption** (only sensitive values encrypted, the rest readable
+in git diffs) is therefore supported natively:
 
 ```yaml
-# .sops.yaml à la racine du repo de stack
+# .sops.yaml at the stack repo root
 creation_rules:
   - path_regex: \.deploy/.*\.enc\.env$
     encrypted_regex: "(SECRET|PASSWORD|TOKEN|KEY)"
     mac_only_encrypted: true
-    age: age1...   # destinataire(s)
+    age: age1...   # recipient(s)
 ```
 
 ```sh
-sops encrypt --in-place .deploy/secrets.enc.env   # ou: sops edit
+sops encrypt --in-place .deploy/secrets.enc.env   # or: sops edit
 ```
 
-⚠️ Sans `mac_only_encrypted: true`, le MAC couvre aussi les valeurs en
-clair : une édition à la main (hors `sops edit`/`sops set`) casse le
-déchiffrement — plico échouera au stage `sops` avec « MAC mismatch ».
+⚠️ Without `mac_only_encrypted: true`, the MAC also covers cleartext values:
+a hand edit (outside `sops edit`/`sops set`) breaks decryption — plico will
+fail at the `sops` stage with "MAC mismatch".
 
-### CLI cliente
+### Client CLI
 
-Le daemon expose une API locale sur un socket unix (`[api] socket`, recommandé
-à `/run/plico/plico.sock`; fallback historique `<base_dir>/plico.sock`). Les commandes passent par les
-verrous du daemon — jamais de déploiement concurrent au scheduler :
+The daemon exposes a local API on a unix socket (`[api] socket`, recommended
+at `/run/plico/plico.sock`; historical fallback `<base_dir>/plico.sock`).
+Commands go through the daemon's locks — never a deployment concurrent with
+the scheduler:
 
 ```sh
-plico status                      # par stack : statut, SHA, en attente, prochaine fenêtre
-plico check-now  --stack X|--all  # fetch + diff immédiat, notifie sans déployer
-plico deploy-now --stack X|--all  # déploiement immédiat, hors fenêtre
-plico deploy-now --stack X --force            # redéploie la révision courante
-plico deploy-now --stack X --force --skip-pre # saute le gate de backup (bruyant, notifié)
-plico dry-run    --stack X        # delta + commits en attente, sans agir
-plico validate                    # vérifie la config sans démarrer
+plico status                      # per stack: status, SHA, pending, next window
+plico check-now  --stack X|--all  # immediate fetch + diff, notifies without deploying
+plico deploy-now --stack X|--all  # immediate deployment, window or not
+plico deploy-now --stack X --force            # redeploy the current revision
+plico deploy-now --stack X --force --skip-pre # skip the backup gate (loud, notified)
+plico dry-run    --stack X        # delta + pending commits, without acting
+plico validate                    # check the configuration without starting
 ```
 
-Les commandes clientes ne chargent que `base_dir` et `[api].socket` : elles
-n'ont pas besoin des tokens Git/ntfy présents uniquement dans l'environnement
-systemd. `--socket` évite entièrement la lecture de la configuration.
+Client commands only load `base_dir` and `[api].socket`: they do not need
+the Git/ntfy tokens that live only in the systemd environment. `--socket`
+skips reading the configuration entirely.
 
-`--skip-pre` est refusé sans `--force` — côté client **et** côté daemon — et
-déclenche une notification `pre_hook_skipped` (F30). Toutes les commandes
-acceptent `-c` (config, pour localiser le socket) ou `--socket`.
+`--skip-pre` is refused without `--force` — on the client **and** the daemon
+side — and fires a `pre_hook_skipped` notification. Every command accepts
+`-c` (config, to locate the socket) or `--socket`.
 
-### Auth Git
+### Git auth
 
-HTTPS par domaine via `[git.auths."<host>"]` : plico se passe lui-même en
-`GIT_ASKPASS` au sous-processus git — le token n'apparaît **ni sur disque, ni
-dans l'argv, ni dans `.git/config`**. Les remotes SSH utilisent l'agent du
-système.
+Per-host HTTPS via `[git.auths."<host>"]`: plico passes itself as
+`GIT_ASKPASS` to the git subprocess — the token appears **neither on disk,
+nor in argv, nor in `.git/config`**. SSH remotes use the system agent.
 
 ### Supervision (systemd)
 
-Le baby-sitting du process est délégué au superviseur ; plico garde le
-scheduling interne.
+Process babysitting is delegated to the supervisor; plico keeps the
+scheduling internal.
 
-L'installateur déploie [`packaging/plico.service`](packaging/plico.service).
-`RuntimeDirectory=plico` crée `/run/plico`, `StateDirectory=plico` prépare
-`/var/lib/plico`, et `EnvironmentFile=-/etc/plico/plico.env` garde les secrets
-hors de l'unité. Le `-` rend le fichier optionnel sur une installation neuve.
+The installer deploys [`packaging/plico.service`](packaging/plico.service).
+`RuntimeDirectory=plico` creates `/run/plico`, `StateDirectory=plico`
+prepares `/var/lib/plico`, and `EnvironmentFile=-/etc/plico/plico.env` keeps
+secrets out of the unit. The `-` makes the file optional on a fresh install.
 
-## Rollback (v1 = manuel, assumé)
+## Rollback (v1 = manual, by design)
 
-- **Code / config compose** : `git revert` dans le repo de la stack ; plico
-  redéploie la révision précédente au tick suivant.
-- **Données** : le backup pris par le hook pré-déploiement (dump + restic) se
-  restaure manuellement. Pas de restore automatique en v1 — c'est un choix.
+- **Code / compose configuration**: `git revert` in the stack repo; plico
+  redeploys the previous revision on the next tick.
+- **Data**: the backup taken by the pre-deploy hook (dump + restic) is
+  restored manually. No automatic restore in v1 — that is a choice.
 
-Après un échec de vérification post-up, plico enregistre quand même le nouveau
-SHA pour ne pas redéployer en boucle une révision cassée : la sortie de panne
-passe par `git revert` (ou `deploy-now --force`, v1).
+After a failed post-up verification, plico still records the new SHA so a
+broken revision is not redeployed in a loop: recovery goes through
+`git revert` (or `plico deploy-now --force`).
 
-## Feuille de route
+## Development
 
-- **v1** : `config.d/<stack>.toml` + rechargement SIGHUP, planning cron et
-  fenêtre par stack, CLI cliente (`status`, `check-now`, `deploy-now`,
-  `dry-run`, `validate`) via socket unix, notifiers webhook + SMTP, heartbeat
-  Uptime Kuma.
-- **Plus tard** : support **Podman** (le runtime est déjà derrière une
-  interface `compose.Runtime`), métriques Prometheus, image conteneur,
-  réception de webhooks.
+To contribute or build from source:
+
+```sh
+mise install          # go, lefthook, golangci-lint, sops, age (pinned in mise.toml)
+mise run build        # → bin/plico
+```
+
+Available tasks: `mise run build | test | lint | fmt | smoke | install-test
+| release-test | shellcheck`.
+
+`mise run smoke` runs [`test/smoke.sh`](test/smoke.sh): a complete local
+GitOps environment (`file://` git repo, real Docker stack, **age + sops**
+encrypted secrets) verifying the nominal deployment, in-memory secret
+injection (no cleartext on disk or in logs), then the backup-gate blocking a
+bad revision. Requires a Docker daemon.
+
+## Roadmap
+
+- **v1**: `config.d/<stack>.toml` + SIGHUP reload, webhook + SMTP notifiers,
+  Uptime Kuma heartbeat. Already shipped: per-stack cron scheduling and
+  windows, check/apply distinction, the client CLI over a unix socket.
+- **Later**: **Podman** support (the runtime already sits behind a
+  `compose.Runtime` interface), Prometheus metrics, container image,
+  webhook ingestion.

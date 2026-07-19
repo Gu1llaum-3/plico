@@ -1,15 +1,15 @@
-# Installation de plico
+# Installing plico
 
-## Prérequis
+## Prerequisites
 
-Le binaire plico est statique, mais orchestre `git`, `docker compose` et, pour
-les stacks concernées, `sops`. Vérifier ces commandes sous l'utilisateur qui
-fera tourner le daemon. L'accès au groupe du socket Docker équivaut
-pratiquement à un accès root.
+The plico binary is static, but it orchestrates `git`, `docker compose` and,
+for the stacks that use them, `sops`. Check those commands under the user
+that will run the daemon. Access to the Docker socket group is practically
+equivalent to root access.
 
-## Installer une release
+## Installing a release
 
-Télécharger et inspecter le script avant de l'exécuter :
+Download and inspect the script before running it:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Gu1llaum-3/plico/main/install.sh
@@ -17,39 +17,53 @@ less install.sh
 sudo sh install.sh
 ```
 
-`latest` désigne la dernière release GitHub stable. Une version précise et un
-binaire local sont supportés :
+`latest` means the latest stable GitHub release. A pinned version and a
+local binary are supported:
 
 ```sh
 sudo sh install.sh --version v1.2.3
 sudo sh install.sh --binary ./plico
-sudo sh install.sh --binary ./plico --sha256 <sha256-du-binaire>
+sudo sh install.sh --binary ./plico --sha256 <binary-sha256>
 ```
 
-Le téléchargement officiel vérifie toujours `checksums.txt`. Avec un binaire
-local, `--sha256` est facultatif car le fichier est déjà dans le périmètre de
-confiance de l'opérateur, mais reste recommandé.
+Official downloads are always verified against `checksums.txt`. With a local
+binary, `--sha256` is optional since the file is already within the
+operator's trust boundary, but it remains recommended.
 
-Plateformes : Linux, Darwin et FreeBSD sur amd64/arm64. La configuration
-complète du service est réservée à Linux/systemd ; ailleurs, ou avec
-`--binary-only`, seul le binaire est installé.
+Platforms: Linux, Darwin and FreeBSD on amd64/arm64. Full service setup is
+Linux/systemd only; elsewhere, or with `--binary-only`, only the binary is
+installed.
 
-## Configuration initiale
+## Initial configuration
 
-Sans `--config`, le script installe `/etc/plico/config.toml.example`, crée un
-`plico.env` vide et ne démarre pas de daemon. Préparer une configuration puis :
+Without `--config`, the script installs `/etc/plico/config.toml.example`,
+creates an empty `plico.env` and does not start any daemon. Two ways to
+activate the service:
+
+**Manually** (the simple path):
+
+```sh
+sudo cp /etc/plico/config.toml.example /etc/plico/config.toml
+sudoedit /etc/plico/config.toml
+sudo systemctl enable --now plico
+plico status
+```
+
+**Through the installer** (automation / provisioning): prepare a
+configuration file, then
 
 ```sh
 sudo sh install.sh --config ./config.toml --env-file ./plico.env
 ```
 
-Ce second passage active et démarre le service. Il sert aussi à reprendre une
-première tentative de démarrage qui aurait échoué.
+This second pass enables and starts the service, waits for the CLI to
+actually reach the socket, and rolls back on failure. It also serves to
+retry a first start attempt that failed.
 
-Un `config.toml` ou `plico.env` existant n'est jamais remplacé. Le template
-`.example` est géré par l'installateur et peut être actualisé aux upgrades.
+An existing `config.toml` or `plico.env` is never replaced. The `.example`
+template is managed by the installer and may be refreshed on upgrades.
 
-Options utiles :
+Useful options:
 
 ```text
 --version VERSION
@@ -62,10 +76,10 @@ Options utiles :
 --no-start
 ```
 
-`--operator USER` ajoute l'utilisateur au groupe `plico` pour accéder au
-socket `0660`. Une reconnexion est nécessaire après un changement de groupe.
+`--operator USER` adds the user to the `plico` group to access the `0660`
+socket. Logging back in is required after a group change.
 
-## Layout et permissions
+## Layout and permissions
 
 ```text
 /usr/local/bin/plico          root:root   0755
@@ -74,43 +88,42 @@ socket `0660`. Une reconnexion est nécessaire après un changement de groupe.
 /etc/plico/plico.env          root:plico  0600
 /var/lib/plico                plico:plico 0750
 /var/lib/plico/state.json     plico:plico 0600
-/run/plico                    plico:plico 0750 (créé par systemd)
+/run/plico                    plico:plico 0750 (created by systemd)
 /run/plico/plico.sock         plico:plico 0660
 /opt/docker                   plico:plico 0750
 ```
 
-Les worktrees `/opt/docker/<stack>` sont reconstructibles depuis Git. Les
-données applicatives doivent vivre dans des volumes nommés ou des chemins
-externes dédiés, jamais dans le worktree susceptible d'être recloné.
+The `/opt/docker/<stack>` worktrees are rebuildable from Git. Application
+data must live in named volumes or dedicated external paths, never inside a
+worktree that may be re-cloned.
 
-## Mise à jour et rollback
+## Upgrade and rollback
 
-Relancer l'installateur avec `latest`, `--version` ou `--binary`. Le remplacement
-du binaire est atomique. Si le service était actif, il n'est redémarré que si
-le binaire ou l'unité a changé. L'installateur attend ensuite que la CLI
-rejoigne réellement la socket ; un simple succès de `systemctl restart` ne
-suffit pas. En cas d'échec, le binaire et l'unité précédents sont restaurés.
+Re-run the installer with `latest`, `--version` or `--binary`. The binary
+replacement is atomic. If the service was active, it is only restarted when
+the binary or the unit changed. The installer then waits for the CLI to
+actually reach the socket; a bare `systemctl restart` success is not enough.
+On failure, the previous binary and unit are restored.
 
-L'état enabled/disabled et les fichiers opérateur sont préservés.
+The enabled/disabled state and operator memberships are preserved.
 
-## Migration depuis le layout historique
+## Migrating from the historical layout
 
-Une mise à jour ne déplace rien automatiquement. Pour migrer :
+An upgrade never moves anything automatically. To migrate:
 
-1. Arrêter plico.
-2. Copier `<base_dir>/state.json` vers `/var/lib/plico/state.json` avec
-   propriétaire `plico:plico` et mode `0600`.
-3. Ajouter `state_file = "/var/lib/plico/state.json"`.
-4. Ajouter `[api] socket = "/run/plico/plico.sock"`.
-5. Vérifier que l'unité contient `RuntimeDirectory=plico` et
+1. Stop plico.
+2. Copy `<base_dir>/state.json` to `/var/lib/plico/state.json`, owner
+   `plico:plico`, mode `0600`.
+3. Add `state_file = "/var/lib/plico/state.json"`.
+4. Add `[api] socket = "/run/plico/plico.sock"`.
+5. Check that the unit contains `RuntimeDirectory=plico` and
    `StateDirectory=plico`.
-6. Redémarrer et vérifier `plico status` avant de supprimer les anciens
-   fichiers runtime.
+6. Restart and check `plico status` before removing the old runtime files.
 
-Ne jamais démarrer sur un état vide pendant la migration : les SHA seraient
-considérés non déployés et les hooks pourraient être rejoués.
+Never start on an empty state during the migration: every SHA would be
+considered undeployed and hooks could be replayed.
 
-## Diagnostic
+## Diagnostics
 
 ```sh
 systemctl status plico --no-pager -l
@@ -120,5 +133,5 @@ sudo -u plico docker compose version
 plico status
 ```
 
-`plico status` ne requiert pas les secrets du daemon : il lit uniquement le
-chemin de socket dans la configuration.
+`plico status` does not require the daemon's secrets: it only reads the
+socket path from the configuration.
