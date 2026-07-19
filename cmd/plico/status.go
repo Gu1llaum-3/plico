@@ -34,20 +34,7 @@ func init() {
 			_, _ = fmt.Fprintln(w, "STACK\tSTATUS\tDEPLOYED\tUPDATED\tNEXT RUN\tPENDING")
 			for _, n := range names {
 				st := resp.Stacks[n]
-				status := st.LastStatus
-				if st.LastOutcome != "" && st.LastOutcomeAt != nil &&
-					(st.UpdatedAt == nil || st.LastOutcomeAt.After(*st.UpdatedAt)) {
-					if st.LastOutcome == "deployed" && st.LastStatus != "" {
-						status = st.LastStatus
-					} else {
-						status = st.LastOutcome
-					}
-				}
-				if st.RunningSince != nil {
-					status = "running"
-				} else if status == "" {
-					status = "-"
-				}
+				status := displayStatus(st)
 				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
 					n, status, short(st.LastDeployedSHA),
 					fmtTime(st.UpdatedAt), fmtTime(st.NextRun), short(st.QueuedSHA))
@@ -57,6 +44,30 @@ func init() {
 	}
 	conn.registerClientFlags(cmd)
 	rootCmd.AddCommand(cmd)
+}
+
+// displayStatus picks the STATUS column value. The persisted last_status is
+// the truth; a more recent live outcome only overrides it when it carries
+// NEW information ("failed", "skipped", "queued") — "deployed" and
+// "up_to_date" are routine confirmations of the persisted state, and a
+// no-op poll tick right before `plico status` must not mask a "success".
+func displayStatus(st api.StackHealth) string {
+	status := st.LastStatus
+	switch st.LastOutcome {
+	case "", "deployed", "up_to_date":
+		// keep the persisted status
+	default:
+		if st.LastOutcomeAt != nil && (st.UpdatedAt == nil || st.LastOutcomeAt.After(*st.UpdatedAt)) {
+			status = st.LastOutcome
+		}
+	}
+	if st.RunningSince != nil {
+		return "running"
+	}
+	if status == "" {
+		return "-"
+	}
+	return status
 }
 
 func short(sha string) string {
