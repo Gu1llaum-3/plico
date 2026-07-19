@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -316,11 +317,26 @@ func TestMissedWindowIsNeverDeployedLate(t *testing.T) {
 		t.Errorf("missed firing not persisted: anchor = %v, want %v", st.LastFiring, fire)
 	}
 	// A missed nightly deployment is exactly what the operator sleeps
-	// through: it must NOTIFY, not just log.
+	// through: it must NOTIFY, not just log. Emission is asynchronous
+	// (the tick loop must never wait on a channel): poll for it.
+	deadline := time.After(5 * time.Second)
+	for {
+		rec.mu.Lock()
+		n := len(rec.events)
+		rec.mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("window_missed notification never emitted")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.events) != 1 || rec.events[0].Type != notify.WindowMissed || rec.events[0].Stack != "nightly" {
-		t.Errorf("window_missed notification missing or wrong: %+v", rec.events)
+	if rec.events[0].Type != notify.WindowMissed || rec.events[0].Stack != "nightly" {
+		t.Errorf("window_missed notification wrong: %+v", rec.events)
 	}
 }
 
@@ -425,6 +441,54 @@ func TestCollapsedFiringsOpenLatestWindowOnly(t *testing.T) {
 	want := time.Date(2026, 7, 19, 12, 4, 0, 0, time.UTC)
 	if !firing.Equal(want) {
 		t.Errorf("window firing = %v, want %v (the latest)", firing, want)
+	}
+}
+
+func TestSkippedFiringsNotifyOncePerStreak(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	cfg := &config.Config{
+		Timezone:     "Europe/Paris",
+		PollInterval: config.Duration{Duration: 5 * time.Minute},
+		Stacks: []config.StackConfig{
+			// Cron period (1m) < poll interval (5m): every tick skips firings.
+			{Name: "fast", Schedule: "* * * * *", Window: config.Duration{Duration: time.Minute}},
+		},
+	}
+	boot := time.Date(2026, 7, 19, 12, 0, 30, 0, loc)
+	rec := &notifyRecorder{}
+	s, err := NewAt(cfg, &countingRunner{}, store, rec, discard(), boot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		_, _ = s.due(boot.Add(time.Duration(i) * 5 * time.Minute))
+	}
+	// Async emission: count only the skipped-firings events (each 1-minute
+	// window legitimately produces its own elapsed-window notification).
+	countSkips := func() int {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		n := 0
+		for _, ev := range rec.events {
+			if strings.Contains(ev.Detail, "skipped") {
+				n++
+			}
+		}
+		return n
+	}
+	deadline := time.After(5 * time.Second)
+	for countSkips() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("skipped-firings notification never emitted")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // would-be extra events land here
+	if got := countSkips(); got != 1 {
+		t.Errorf("per-tick spam: %d skipped-firings events for one continuous streak, want 1", got)
 	}
 }
 

@@ -753,6 +753,30 @@ func TestGitSyncFailedAlertsOncePerOutage(t *testing.T) {
 	if count != 2 {
 		t.Errorf("a new outage after recovery must alert again, got %d alerts", count)
 	}
+
+	// A successful manual dry-run sync also resets the counter: without it,
+	// 4 old failures + 1 new one would fire a premature, wrong alert.
+	gitDown = true
+	for i := 0; i < 4; i++ {
+		_ = d.RunStack(context.Background(), cfg.Stacks[0])
+	}
+	gitDown = false
+	if _, err := d.DryRun(context.Background(), cfg.Stacks[0]); err != nil {
+		t.Fatalf("dry-run should succeed: %v", err)
+	}
+	gitDown = true
+	for i := 0; i < 4; i++ {
+		_ = d.RunStack(context.Background(), cfg.Stacks[0])
+	}
+	count = 0
+	for _, tpe := range events.types() {
+		if tpe == notify.GitSyncFailed {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("dry-run success must reset the counter (no alert at 4 post-reset failures), got %d alerts", count)
+	}
 }
 
 func TestAssess(t *testing.T) {

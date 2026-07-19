@@ -111,7 +111,53 @@ func TestParseEvents(t *testing.T) {
 	if _, err := ParseEvents([]string{"deploy_sucess"}); err == nil {
 		t.Error("typoed event name must be rejected")
 	}
+	// "all" mixed with other names must not be rejected with a message that
+	// lists "all" as valid.
+	if evs, err := ParseEvents([]string{"deploy_success", "all"}); err != nil || len(evs) != len(AllEvents) {
+		t.Errorf("'all' anywhere in the list must select everything, got %v (%v)", evs, err)
+	}
 }
+
+func TestCRLFNormalization(t *testing.T) {
+	t.Parallel()
+	// Mixed endings from hook output (curl/docker progress) must yield
+	// strict CRLF: bare CR bytes get failure mails rejected by strict MTAs.
+	got := crlf("a\r\nb\rc\nd")
+	want := "a\r\nb\r\nc\r\nd"
+	if got != want {
+		t.Errorf("crlf() = %q, want %q", got, want)
+	}
+	if strings.Contains(strings.ReplaceAll(got, "\r\n", ""), "\r") {
+		t.Error("bare CR survived normalization")
+	}
+}
+
+func TestMultiIsConcurrent(t *testing.T) {
+	t.Parallel()
+	// A hung channel must not starve a healthy one out of the shared
+	// per-event deadline.
+	blocker := notifierFunc(func(ctx context.Context, _ Event) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	rec := &recorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_ = Multi(blocker, rec).Notify(ctx, Event{Type: DeployFailed})
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("Multi did not return promptly after ctx expiry")
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.events) != 1 {
+		t.Errorf("healthy channel starved by the hung one: %d events", len(rec.events))
+	}
+}
+
+type notifierFunc func(context.Context, Event) error
+
+func (f notifierFunc) Notify(ctx context.Context, ev Event) error { return f(ctx, ev) }
 
 func TestDefaultEventsAreFailureOriented(t *testing.T) {
 	t.Parallel()

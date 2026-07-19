@@ -225,6 +225,32 @@ repo = "https://example.com/repo.git"
 	}
 }
 
+func TestNotifierValidation(t *testing.T) {
+	t.Parallel()
+	base := `
+base_dir = "/opt/docker"
+[[stack]]
+name = "app"
+repo = "https://example.com/repo.git"
+`
+	// A scheme-less webhook URL would fail on every send, silently.
+	if _, err := Load(writeConfig(t, base+"\n[[webhook]]\nurl = \"/services/T00/B00/xxx\"\n")); err == nil {
+		t.Error("scheme-less webhook url must fail validation")
+	}
+	// SMTP port out of range.
+	if _, err := Load(writeConfig(t, base+"\n[smtp]\nhost = \"mail.example.com\"\nport = 70000\nfrom = \"a@b.c\"\nto = [\"o@b.c\"]\n")); err == nil {
+		t.Error("smtp port out of range must fail validation")
+	}
+	// "all" mixed with names is fine.
+	if _, err := Load(writeConfig(t, base+"\n[ntfy]\nurl = \"https://ntfy.sh/x\"\nevents = [\"all\", \"deploy_start\"]\n")); err != nil {
+		t.Errorf("events with 'all' should be valid: %v", err)
+	}
+	// Unknown event names rejected.
+	if _, err := Load(writeConfig(t, base+"\n[ntfy]\nurl = \"https://ntfy.sh/x\"\nevents = [\"deploy_sucess\"]\n")); err == nil {
+		t.Error("unknown event must fail validation")
+	}
+}
+
 func TestDoubleDotsInFilenamesAreValid(t *testing.T) {
 	t.Parallel()
 	cfg := `

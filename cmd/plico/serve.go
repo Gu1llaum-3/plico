@@ -166,6 +166,13 @@ func buildNotifier(cfg *config.Config, log *slog.Logger) notify.Notifier {
 			log.Error("invalid notifier events, using defaults", "notifier", kind, "error", err)
 			evs = notify.DefaultEvents
 		}
+		// Logged so an operator can SEE what each channel receives — the
+		// default is failure-oriented, success/queued/start are opt-in.
+		names := make([]string, len(evs))
+		for i, e := range evs {
+			names[i] = string(e)
+		}
+		log.Info("notification channel configured", "channel", kind, "events", names)
 		channels = append(channels, notify.FilterEvents(notify.WithLogFallback(n, log), evs))
 	}
 	if cfg.Ntfy.URL != "" {

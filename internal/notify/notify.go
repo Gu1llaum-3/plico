@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,13 +44,15 @@ var DefaultEvents = []EventType{
 }
 
 // ParseEvents validates a config-provided list. Empty means DefaultEvents;
-// the single entry "all" means every event.
+// "all" anywhere in the list means every event.
 func ParseEvents(names []string) ([]EventType, error) {
 	if len(names) == 0 {
 		return DefaultEvents, nil
 	}
-	if len(names) == 1 && names[0] == "all" {
-		return AllEvents, nil
+	for _, n := range names {
+		if n == "all" {
+			return AllEvents, nil
+		}
 	}
 	var out []EventType
 	for _, n := range names {
@@ -92,8 +95,11 @@ type Notifier interface {
 	Notify(ctx context.Context, ev Event) error
 }
 
-// Multi fans out to several notifiers; it returns nil (each backend is
-// expected to be wrapped with WithLogFallback already).
+// Multi fans out to several notifiers CONCURRENTLY and waits for all of
+// them; it returns nil (each backend is expected to be wrapped with
+// WithLogFallback already). Concurrency matters: channels share the
+// caller's per-event deadline, and a hung ntfy endpoint must not consume
+// the whole budget before a healthy SMTP channel even starts.
 func Multi(ns ...Notifier) Notifier {
 	return multi(ns)
 }
@@ -101,9 +107,15 @@ func Multi(ns ...Notifier) Notifier {
 type multi []Notifier
 
 func (m multi) Notify(ctx context.Context, ev Event) error {
+	var wg sync.WaitGroup
 	for _, n := range m {
-		_ = n.Notify(ctx, ev)
+		wg.Add(1)
+		go func(n Notifier) {
+			defer wg.Done()
+			_ = n.Notify(ctx, ev)
+		}(n)
 	}
+	wg.Wait()
 	return nil
 }
 

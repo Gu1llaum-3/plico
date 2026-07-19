@@ -288,7 +288,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("window must be positive, got %s", c.Window.Duration)
 	}
 	if c.Ntfy.URL != "" {
-		if _, err := url.ParseRequestURI(c.Ntfy.URL); err != nil {
+		if err := validateHTTPURL(c.Ntfy.URL); err != nil {
 			return fmt.Errorf("ntfy.url: %w", err)
 		}
 	}
@@ -299,7 +299,7 @@ func (c *Config) Validate() error {
 		if w.URL == "" {
 			return fmt.Errorf("webhook[%d]: url is required", i)
 		}
-		if _, err := url.ParseRequestURI(w.URL); err != nil {
+		if err := validateHTTPURL(w.URL); err != nil {
 			return fmt.Errorf("webhook[%d].url: %w", i, err)
 		}
 		if _, err := notify.ParseEvents(w.Events); err != nil {
@@ -309,6 +309,9 @@ func (c *Config) Validate() error {
 	if c.Smtp.Host != "" {
 		if c.Smtp.From == "" || len(c.Smtp.To) == 0 {
 			return fmt.Errorf("smtp: from and to are required")
+		}
+		if c.Smtp.Port < 1 || c.Smtp.Port > 65535 {
+			return fmt.Errorf("smtp.port must be within 1-65535, got %d", c.Smtp.Port)
 		}
 		if _, err := notify.ParseEvents(c.Smtp.Events); err != nil {
 			return fmt.Errorf("smtp.events: %w", err)
@@ -369,6 +372,21 @@ func validateSchedule(expr string) error {
 	}
 	if sched.Next(time.Now()).IsZero() {
 		return fmt.Errorf("expression never fires")
+	}
+	return nil
+}
+
+// validateHTTPURL rejects notification endpoints that would fail on every
+// send: url.ParseRequestURI alone accepts scheme-less paths like
+// "/services/T00/...", which a log-fallback-wrapped channel would then
+// swallow silently at runtime.
+func validateHTTPURL(raw string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return err
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("must be an absolute http(s) URL, got %q", raw)
 	}
 	return nil
 }

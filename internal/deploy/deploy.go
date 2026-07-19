@@ -413,6 +413,7 @@ func (d *Deployer) DryRun(ctx context.Context, st config.StackConfig) (DryRunRep
 
 	dir := filepath.Join(d.cfg.BaseDir, st.Name)
 	newSHA, err := d.git.SyncAndResolve(ctx, st.Repo, st.Ref, dir)
+	d.noteGitSync(ctx, st, err) // a successful manual sync resets the outage counter
 	if err != nil {
 		return DryRunReport{}, err
 	}

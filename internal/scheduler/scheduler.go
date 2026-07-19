@@ -72,6 +72,7 @@ type stackSched struct {
 	attempted     bool      // a run of this window completed (set on completion, attributed by dispatch firing)
 	dispatched    time.Time // firing the currently in-flight run was dispatched for (zero = none)
 	dormantLogged bool      // the "no future firing" error was already emitted
+	skipNotified  bool      // the skipped-firings condition was already notified this streak
 }
 
 // StackStatus is one stack's live view for /healthz.
@@ -286,8 +287,16 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 					"stack", st.Name, "count", skipped,
 					"first", firstSkipped.Format(time.RFC3339),
 					"last", lastSkipped.Format(time.RFC3339))
-				missed(st, fmt.Sprintf("%d scheduled firing(s) skipped without a run between %s and %s (daemon unavailable, or cron period < poll_interval)",
-					skipped, firstSkipped.Format(time.RFC3339), lastSkipped.Format(time.RFC3339)))
+				// One notification per streak: a cron period shorter than
+				// poll_interval skips firings on EVERY tick, and per-tick
+				// pushes would drown every real alert.
+				if !ss.skipNotified {
+					ss.skipNotified = true
+					missed(st, fmt.Sprintf("%d scheduled firing(s) skipped without a run between %s and %s (daemon unavailable, or cron period < poll_interval); further occurrences are logged only",
+						skipped, firstSkipped.Format(time.RFC3339), lastSkipped.Format(time.RFC3339)))
+				}
+			} else {
+				ss.skipNotified = false
 			}
 			// A still-open window superseded by a new firing before any of
 			// its runs happened is a missed deployment. Deferred only when
@@ -350,12 +359,18 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 	}
 	s.mu.Unlock()
 
-	// Emitted outside the lock: a slow notifier must never stall the
-	// scheduler (Snapshot/healthz block on s.mu).
-	for _, ev := range events {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = s.notifier.Notify(ctx, ev)
-		cancel()
+	// Emitted outside the lock AND asynchronously: a slow channel must
+	// stall neither Snapshot/healthz (the lock) nor the tick loop itself —
+	// a notifier burning its full timeout inside tick() would delay the
+	// dispatch of the runs this very tick selected.
+	if len(events) > 0 {
+		go func(events []notify.Event) {
+			for _, ev := range events {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_ = s.notifier.Notify(ctx, ev)
+				cancel()
+			}
+		}(events)
 	}
 	return apply, check
 }
