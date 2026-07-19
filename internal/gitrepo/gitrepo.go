@@ -81,6 +81,22 @@ func (c *Client) syncOnce(ctx context.Context, repoURL, ref, dir string) (string
 	return strings.TrimSpace(string(res.Stdout)), nil
 }
 
+// LogRange returns the one-line log of commits in (old, new], for dry-run
+// reports.
+func (c *Client) LogRange(ctx context.Context, repoURL, dir, oldSHA, newSHA string) ([]string, error) {
+	res, err := c.git(ctx, dir, repoURL, "log", "--oneline", "--no-decorate", oldSHA+".."+newSHA)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(res.Stdout)), "\n") {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out, nil
+}
+
 // CheckoutDetached puts the worktree at sha (F: versioned hooks and compose
 // files come from the exact revision being deployed).
 func (c *Client) CheckoutDetached(ctx context.Context, repoURL, dir, sha string) error {

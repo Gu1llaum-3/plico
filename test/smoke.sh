@@ -153,6 +153,20 @@ else
   ok "no cleartext secret in plico log"
 fi
 
+# ── 4b. client CLI over the unix socket (F24–F30) ──────────────────────
+"$PLICO" validate --config "$WS/config.toml" >/dev/null 2>&1 \
+  && ok "validate accepts the config" || fail "validate failed"
+"$PLICO" status --config "$WS/config.toml" 2>/dev/null | grep -q "smoke.*success" \
+  && ok "status reports the stack over the socket" || fail "status did not report success"
+"$PLICO" dry-run --stack smoke --config "$WS/config.toml" 2>/dev/null | grep -q "up to date" \
+  && ok "dry-run reports up to date" || fail "dry-run wrong"
+DN=$("$PLICO" deploy-now --stack smoke --force --config "$WS/config.toml" 2>&1)
+echo "$DN" | grep -q "smoke: deployed" \
+  && ok "deploy-now --force redeploys via the socket" || fail "deploy-now: $DN"
+"$PLICO" deploy-now --stack smoke --skip-pre --config "$WS/config.toml" >/dev/null 2>&1 \
+  && fail "--skip-pre without --force must be refused (F30)" \
+  || ok "--skip-pre without --force refused (F30)"
+
 # ── 5. gate test: failing pre-deploy hook must block the new revision ──
 cd "$WORK" || exit 1
 sed -i.bak 's/"300"/"301"/' docker-compose.yml && rm -f docker-compose.yml.bak

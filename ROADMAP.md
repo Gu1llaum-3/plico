@@ -40,9 +40,12 @@ n'existe dans doco-cd.
       `deploy_queued` une seule fois par révision en attente (dédup persistée
       `last_queued_sha`, non ré-annoncée par l'apply de la fenêtre, nettoyée
       au succès) ; outcome `queued` visible dans /healthz
-- [ ] **CLI cliente** via socket unix (F24–F30) : `status`, `check-now`,
-      `deploy-now`, `dry-run`, `validate` ; `--skip-pre` interdit sans
-      `--force` + notification `pre_hook_skipped`
+- [x] **CLI cliente** via socket unix (F24–F30) : `status`, `check-now`,
+      `deploy-now` (`--force` pour redéployer la révision courante — la
+      sortie de panne post-verify), `dry-run` (delta + commits en attente),
+      `validate` ; `--skip-pre` interdit sans `--force` (imposé côté daemon)
+      + notification `pre_hook_skipped` ; socket `<base_dir>/plico.sock`
+      (0660), actions sérialisées par les verrous du deployer
 - [ ] **config.d/<stack>.toml + SIGHUP** (F21–F23) : deep-merge (scalaire
       surchargé, map fusionnée, tableau REMPLACÉ, champs protégés non
       surchargeables), fichier invalide = stack ignorée + alerte

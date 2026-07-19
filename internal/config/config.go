@@ -35,6 +35,12 @@ type HealthConfig struct {
 	Listen string `toml:"listen"` // default 127.0.0.1:9444
 }
 
+type ApiConfig struct {
+	// Socket is the unix socket the client CLI talks to (F24).
+	// Default: <base_dir>/plico.sock.
+	Socket string `toml:"socket"`
+}
+
 type NtfyConfig struct {
 	URL   string `toml:"url"`   // full topic URL, e.g. https://ntfy.sh/plico-prod
 	Token string `toml:"token"` // optional, sent as Authorization: Bearer
@@ -103,6 +109,7 @@ type Config struct {
 
 	Log    LogConfig    `toml:"log"`
 	Health HealthConfig `toml:"health"`
+	Api    ApiConfig    `toml:"api"`
 	Ntfy   NtfyConfig   `toml:"ntfy"`
 	Hooks  HooksConfig  `toml:"hooks"`
 	Git    GitConfig    `toml:"git"`
@@ -157,6 +164,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Health.Listen == "" {
 		c.Health.Listen = "127.0.0.1:9444"
+	}
+	if c.Api.Socket == "" && c.BaseDir != "" {
+		c.Api.Socket = filepath.Join(c.BaseDir, "plico.sock")
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"

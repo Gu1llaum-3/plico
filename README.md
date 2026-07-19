@@ -132,6 +132,26 @@ sops encrypt --in-place .deploy/secrets.enc.env   # ou: sops edit
 clair : une édition à la main (hors `sops edit`/`sops set`) casse le
 déchiffrement — plico échouera au stage `sops` avec « MAC mismatch ».
 
+### CLI cliente
+
+Le daemon expose une API locale sur un socket unix (`<base_dir>/plico.sock`
+par défaut, `[api] socket` pour changer). Les commandes passent par les
+verrous du daemon — jamais de déploiement concurrent au scheduler :
+
+```sh
+plico status                      # par stack : statut, SHA, en attente, prochaine fenêtre
+plico check-now  --stack X|--all  # fetch + diff immédiat, notifie sans déployer
+plico deploy-now --stack X|--all  # déploiement immédiat, hors fenêtre
+plico deploy-now --stack X --force            # redéploie la révision courante
+plico deploy-now --stack X --force --skip-pre # saute le gate de backup (bruyant, notifié)
+plico dry-run    --stack X        # delta + commits en attente, sans agir
+plico validate                    # vérifie la config sans démarrer
+```
+
+`--skip-pre` est refusé sans `--force` — côté client **et** côté daemon — et
+déclenche une notification `pre_hook_skipped` (F30). Toutes les commandes
+acceptent `-c` (config, pour localiser le socket) ou `--socket`.
+
 ### Auth Git
 
 HTTPS par domaine via `[git.auths."<host>"]` : plico se passe lui-même en

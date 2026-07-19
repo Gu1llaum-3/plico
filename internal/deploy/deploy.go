@@ -114,9 +114,37 @@ func New(cfg *config.Config, git *gitrepo.Client, rt compose.Runtime, hk *hooks.
 	}
 }
 
+// RunOptions alter one manual run (F26/F30). The zero value is the normal
+// scheduled behavior.
+type RunOptions struct {
+	// Force deploys even without a git delta (recovery path after a failed
+	// verify, or redeploy of the current revision).
+	Force bool
+	// SkipPre bypasses the backup gate. The API layer refuses it without an
+	// explicit force acknowledgement; it is always loud (F30).
+	SkipPre bool
+	// SkipPost skips the non-blocking post-deploy hook (low risk).
+	SkipPost bool
+}
+
+// DryRunReport is what a deployment WOULD do (F28), without acting.
+type DryRunReport struct {
+	Stack    string   `json:"stack"`
+	Ref      string   `json:"ref"`
+	OldSHA   string   `json:"old_sha"`
+	NewSHA   string   `json:"new_sha"`
+	UpToDate bool     `json:"up_to_date"`
+	Commits  []string `json:"commits,omitempty"` // git log --oneline old..new
+}
+
 // RunStack executes one full cycle for a stack. It never panics; every error
 // is logged and notified before returning.
 func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome {
+	return d.RunStackWith(ctx, st, RunOptions{})
+}
+
+// RunStackWith is RunStack with manual-run options (F26/F30).
+func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts RunOptions) Outcome {
 	lock := d.stackLock(st.Name)
 	if !lock.TryLock() {
 		d.log.Warn("skip_running: previous run still in progress", "stack", st.Name)
@@ -143,15 +171,16 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	// 2. SHA diff against the persisted state (self-healing, see package doc).
 	prev, _ := d.store.Get(st.Name)
 	oldSHA := prev.LastDeployedSHA
-	if newSHA == oldSHA {
+	if newSHA == oldSHA && !opts.Force {
 		log.Debug("up to date", "sha", newSHA)
 		return OutcomeUpToDate
 	}
-	log.Info("git delta detected", "old_sha", oldSHA, "new_sha", newSHA)
+	log.Info("git delta detected", "old_sha", oldSHA, "new_sha", newSHA, "forced", opts.Force)
 
 	// A failed revision is retried every tick (self-healing), but the same
 	// (revision, stage) failure is only notified once — not every minute.
-	repeat := prev.LastFailedSHA == newSHA
+	// A manual forced run always notifies: the operator is acting NOW.
+	repeat := prev.LastFailedSHA == newSHA && !opts.Force
 
 	// Notifications run on a detached context (see notifyTimeout).
 	ev := func(t notify.EventType, stage, detail string) {
@@ -212,32 +241,39 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 		ev(notify.DeployStart, "", "")
 	}
 
-	// 6. pre-deploy hook — the backup gate (F9–F14).
+	// 6. pre-deploy hook — the backup gate (F9–F14). Manually skippable
+	// only through the API's force acknowledgement, and always loud (F30).
 	hctx := hooks.Context{Stack: st.Name, Dir: dir, GitRef: st.Ref, OldSHA: oldSHA, NewSHA: newSHA}
-	res, err := hooks.Resolve(dir, hooks.RepoPreDeploy, d.cfg.Hooks.PreDeployPath)
-	if err != nil {
-		log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
-		fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
-		return OutcomeFailed
-	}
-	if res.Path == "" {
-		log.Info("no pre-deploy hook found, continuing", "stage", StagePreHook)
-		ev(notify.PreHookSkipped, StagePreHook, "no pre-deploy hook in repo or config")
+	if opts.SkipPre {
+		log.Warn("PRE-DEPLOY HOOK MANUALLY SKIPPED: deploying without the backup gate",
+			"stage", StagePreHook)
+		ev(notify.PreHookSkipped, StagePreHook, "pre-deploy hook manually skipped (--skip-pre --force)")
 	} else {
-		log.Info("running pre-deploy hook", "hook", res.Path, "source", res.Source)
-		hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration)
+		res, err := hooks.Resolve(dir, hooks.RepoPreDeploy, d.cfg.Hooks.PreDeployPath)
 		if err != nil {
-			log.Error("pre-deploy hook failed, deployment aborted", "stage", StagePreHook, "error", err)
-			fail(notify.PreHookFailed, StagePreHook,
-				fmt.Sprintf("%v\n%s", err, execx.Tail(hres.Stderr, 1024)),
-				oldSHA, state.StatusPreHookFailed)
+			log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
+			fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
 			return OutcomeFailed
+		}
+		if res.Path == "" {
+			log.Info("no pre-deploy hook found, continuing", "stage", StagePreHook)
+			ev(notify.PreHookSkipped, StagePreHook, "no pre-deploy hook in repo or config")
+		} else {
+			log.Info("running pre-deploy hook", "hook", res.Path, "source", res.Source)
+			hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration)
+			if err != nil {
+				log.Error("pre-deploy hook failed, deployment aborted", "stage", StagePreHook, "error", err)
+				fail(notify.PreHookFailed, StagePreHook,
+					fmt.Sprintf("%v\n%s", err, execx.Tail(hres.Stderr, 1024)),
+					oldSHA, state.StatusPreHookFailed)
+				return OutcomeFailed
+			}
 		}
 	}
 
 	// 7. sops plumbing (F16).
-	opts := compose.Options{Dir: dir, ComposeFile: st.ComposeFile, Project: st.Name}
-	cleanup, err := d.setupSops(ctx, st, dir, runID, &opts)
+	copts := compose.Options{Dir: dir, ComposeFile: st.ComposeFile, Project: st.Name}
+	cleanup, err := d.setupSops(ctx, st, dir, runID, &copts)
 	if err != nil {
 		log.Error("sops setup failed", "stage", StageSops, "error", err)
 		fail(notify.DeployFailed, StageSops, err.Error(), oldSHA, state.StatusFailed)
@@ -247,7 +283,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 
 	// 8. pull — a failure leaves the running stack untouched (F18).
 	if st.ForcePullEnabled() {
-		if err := d.runtime.Pull(ctx, opts); err != nil {
+		if err := d.runtime.Pull(ctx, copts); err != nil {
 			log.Error("pull failed, running stack untouched", "stage", StagePull, "error", err)
 			fail(notify.DeployFailed, StagePull, err.Error(), oldSHA, state.StatusFailed)
 			return OutcomeFailed
@@ -255,7 +291,7 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 	}
 
 	// 9. up.
-	if err := d.runtime.Up(ctx, opts); err != nil {
+	if err := d.runtime.Up(ctx, copts); err != nil {
 		log.Error("up failed", "stage", StageUp, "error", err)
 		fail(notify.DeployFailed, StageUp, err.Error(), oldSHA, state.StatusFailed)
 		return OutcomeFailed
@@ -263,15 +299,18 @@ func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome 
 
 	// 10. verify (F19). On failure the new SHA is recorded anyway so the
 	// same broken revision is not redeployed in a loop; recovery is a git
-	// revert (or a forced deploy once the v1 CLI lands).
-	if err := d.verify(ctx, opts, st.VerifyTimeout.Duration); err != nil {
+	// revert (or a forced deploy: deploy-now --force).
+	if err := d.verify(ctx, copts, st.VerifyTimeout.Duration); err != nil {
 		log.Error("post-up verification failed", "stage", StageVerify, "error", err)
 		fail(notify.DeployFailed, StageVerify, err.Error(), newSHA, state.StatusFailed)
 		return OutcomeFailed
 	}
 
-	// 11. post-deploy hook, non-blocking (F15).
-	if res, err := hooks.Resolve(dir, hooks.RepoPostDeploy, d.cfg.Hooks.PostDeployPath); err != nil {
+	// 11. post-deploy hook, non-blocking (F15); manually skippable (F30,
+	// low risk).
+	if opts.SkipPost {
+		log.Info("post-deploy hook manually skipped", "stage", StagePostHook)
+	} else if res, err := hooks.Resolve(dir, hooks.RepoPostDeploy, d.cfg.Hooks.PostDeployPath); err != nil {
 		log.Warn("post-deploy hook unusable", "stage", StagePostHook, "error", err)
 	} else if res.Path != "" {
 		if _, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration); err != nil {
@@ -347,6 +386,40 @@ func (d *Deployer) CheckStack(ctx context.Context, st config.StackConfig) Outcom
 		s2.LastQueuedSHA = newSHA
 	})
 	return OutcomeQueued
+}
+
+// DryRun reports what a deployment would do (F28): fetch + diff + the list
+// of pending commits, without touching hooks, sops or compose.
+func (d *Deployer) DryRun(ctx context.Context, st config.StackConfig) (DryRunReport, error) {
+	lock := d.stackLock(st.Name)
+	if !lock.TryLock() {
+		return DryRunReport{}, fmt.Errorf("a run is in progress for stack %q, try again later", st.Name)
+	}
+	defer lock.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, d.cfg.RunTimeout.Duration)
+	defer cancel()
+
+	dir := filepath.Join(d.cfg.BaseDir, st.Name)
+	newSHA, err := d.git.SyncAndResolve(ctx, st.Repo, st.Ref, dir)
+	if err != nil {
+		return DryRunReport{}, err
+	}
+	prev, _ := d.store.Get(st.Name)
+	report := DryRunReport{
+		Stack: st.Name, Ref: st.Ref,
+		OldSHA: prev.LastDeployedSHA, NewSHA: newSHA,
+		UpToDate: newSHA == prev.LastDeployedSHA,
+	}
+	if !report.UpToDate && prev.LastDeployedSHA != "" {
+		commits, err := d.git.LogRange(ctx, st.Repo, dir, prev.LastDeployedSHA, newSHA)
+		if err != nil {
+			d.log.Warn("dry-run: could not list pending commits", "stack", st.Name, "error", err)
+		} else {
+			report.Commits = commits
+		}
+	}
+	return report, nil
 }
 
 // setupSops fills opts with either the exec-env prefix or tmpfs env-files.

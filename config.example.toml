@@ -44,6 +44,11 @@ level = "info"                        # debug | info | warn | error
 # Semantic healthcheck endpoint (GET /healthz). Local by default.
 listen = "127.0.0.1:9444"
 
+[api]
+# Unix socket for the client CLI (plico status / deploy-now / …).
+# Default: <base_dir>/plico.sock
+# socket = "/run/plico/plico.sock"
+
 [ntfy]
 # Failure-oriented notifications. Leave url empty to disable.
 url = "https://ntfy.example.com/plico"

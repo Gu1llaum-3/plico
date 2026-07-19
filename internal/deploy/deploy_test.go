@@ -135,6 +135,8 @@ func newHarness(t *testing.T) *harness {
 			return execx.Result{}, nil
 		case "rev-parse":
 			return execx.Result{Stdout: []byte(newSHA + "\n")}, nil
+		case "log":
+			return execx.Result{Stdout: []byte("2222222 add feature\n")}, nil
 		}
 		return execx.Result{}, errors.New("harness: unexpected git subcommand " + c.Args[0])
 	}}
@@ -570,6 +572,70 @@ func TestCheckStackUpToDateIsSilent(t *testing.T) {
 	}
 	if len(h.events.types()) != 0 {
 		t.Errorf("up-to-date check must not notify, got %v", h.events.types())
+	}
+}
+
+func TestForceRedeploysSameRevision(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "exit 0")
+	if err := h.store.Put("web", state.StackState{LastDeployedSHA: newSHA}); err != nil {
+		t.Fatal(err)
+	}
+	// Without force: no-op. With force: full pipeline on the same SHA.
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date", outcome)
+	}
+	if outcome := h.deployer.RunStackWith(context.Background(), h.stack, RunOptions{Force: true}); outcome != OutcomeDeployed {
+		t.Fatalf("forced outcome = %s, want deployed", outcome)
+	}
+	if len(h.runtime.ups) != 1 {
+		t.Errorf("forced run must deploy, ups = %d", len(h.runtime.ups))
+	}
+}
+
+func TestSkipPreBypassesGateLoudly(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writePreHook(t, "exit 1") // the gate would normally block
+
+	outcome := h.deployer.RunStackWith(context.Background(), h.stack, RunOptions{SkipPre: true})
+	if outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed (gate manually skipped)", outcome)
+	}
+	// F30: the skip must be announced.
+	found := false
+	h.events.mu.Lock()
+	for _, ev := range h.events.events {
+		if ev.Type == notify.PreHookSkipped && strings.Contains(ev.Detail, "manually skipped") {
+			found = true
+		}
+	}
+	h.events.mu.Unlock()
+	if !found {
+		t.Error("pre_hook_skipped notification missing for a manual skip")
+	}
+}
+
+func TestDryRunReportsDeltaWithoutActing(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	report, err := h.deployer.DryRun(context.Background(), h.stack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.UpToDate || report.OldSHA != oldSHA || report.NewSHA != newSHA {
+		t.Errorf("report = %+v", report)
+	}
+	if len(h.runtime.pulls)+len(h.runtime.ups) != 0 {
+		t.Fatal("dry-run must not touch compose")
+	}
+	if len(h.events.types()) != 0 {
+		t.Errorf("dry-run must not notify, got %v", h.events.types())
+	}
+	st, _ := h.store.Get("web")
+	if st.LastDeployedSHA != oldSHA {
+		t.Errorf("dry-run must not move state, got %q", st.LastDeployedSHA)
 	}
 }
 

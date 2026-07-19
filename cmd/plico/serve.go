@@ -89,6 +89,8 @@ func serve(configPath string) error {
 	server := api.New(cfg.Health.Listen, sched, store,
 		cfg.PollInterval.Duration, cfg.RunTimeout.Duration)
 
+	sockSrv := api.NewSocket(cfg, sched, store, deployer, log)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -96,6 +98,11 @@ func serve(configPath string) error {
 		log.Info("healthz listening", "addr", cfg.Health.Listen)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("healthz server failed", "error", err)
+		}
+	}()
+	go func() {
+		if err := sockSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("client API server failed", "error", err)
 		}
 	}()
 
@@ -110,6 +117,7 @@ func serve(configPath string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
+	_ = sockSrv.Shutdown(shutdownCtx)
 	log.Info("plico stopped")
 	return nil
 }
