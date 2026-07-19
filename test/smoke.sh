@@ -33,6 +33,7 @@ ok() { echo "OK: $1"; }
 
 cleanup() {
   [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
+  [ -n "${NTFY_PID:-}" ] && kill "$NTFY_PID" 2>/dev/null
   docker compose -p smoke down --timeout 2 >/dev/null 2>&1
   rm -rf "$WS"
 }
@@ -96,7 +97,25 @@ git remote add origin "$ORIGIN"
 git push -q origin main
 SHA1=$(git rev-parse HEAD)
 
-# ── 2. plico config with sops enabled on the stack ─────────────────────
+# ── 2. local ntfy capture: notifications are validated END TO END ──────
+NTFY_LOG=$WS/ntfy-capture.log
+NTFY_PORT=${PLICO_SMOKE_NTFY_PORT:-19555}
+: >"$NTFY_LOG"
+python3 -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(n).decode(errors="replace")
+        with open(sys.argv[1], "a") as f:
+            f.write(self.headers.get("Title", "") + "|" + body.replace("\n", " ") + "\n")
+        self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
+' "$NTFY_LOG" "$NTFY_PORT" &
+NTFY_PID=$!
+
+# ── 3. plico config with sops and ntfy enabled on the stack ────────────
 cat > "$WS/config.toml" <<EOF
 base_dir = "$BASE"
 poll_interval = "5s"
@@ -105,6 +124,10 @@ run_timeout = "5m"
 [health]
 listen = "127.0.0.1:$PORT"
 
+[ntfy]
+url = "http://127.0.0.1:$NTFY_PORT/plico"
+events = ["all"]
+
 [[stack]]
 name = "smoke"
 repo = "file://$ORIGIN"
@@ -112,7 +135,7 @@ sops_files = [".deploy/secrets.enc.env"]
 verify_timeout = "60s"
 EOF
 
-# ── 3. daemon: the age key reaches sops through plico's environment ────
+# ── 4. daemon: the age key reaches sops through plico's environment ────
 SOPS_AGE_KEY_FILE="$WS/age.key" "$PLICO" serve --config "$WS/config.toml" > "$LOG" 2>&1 &
 DAEMON_PID=$!
 
@@ -133,7 +156,7 @@ grep -q "backup for smoke:  -> $SHA1" "$MARKER" 2>/dev/null \
 docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -q "app running" \
   && ok "container app is running" || fail "container not running"
 
-# ── 4. SOPS assertions (F16) ───────────────────────────────────────────
+# ── 5. SOPS and notification assertions ────────────────────────────────
 CID=$(docker compose -p smoke ps -q app)
 CONTAINER_ENV=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CID" 2>/dev/null)
 echo "$CONTAINER_ENV" | grep -q "SECRET_MESSAGE=$SECRET" \
@@ -152,8 +175,16 @@ if grep -q "$SECRET" "$LOG" 2>/dev/null; then
 else
   ok "no cleartext secret in plico log"
 fi
+grep -q "smoke: deploy_success" "$NTFY_LOG" 2>/dev/null \
+  && ok "deploy_success notification received end to end" \
+  || fail "deploy_success never reached the ntfy capture"
+if grep -q "$SECRET" "$NTFY_LOG" 2>/dev/null; then
+  fail "cleartext secret leaked into a notification"
+else
+  ok "no cleartext secret in notifications"
+fi
 
-# ── 4b. client CLI over the unix socket (F24–F30) ──────────────────────
+# ── 6. client CLI over the unix socket ─────────────────────────────────
 "$PLICO" validate --config "$WS/config.toml" >/dev/null 2>&1 \
   && ok "validate accepts the config" || fail "validate failed"
 "$PLICO" status --config "$WS/config.toml" 2>/dev/null | grep -q "smoke.*success" \
@@ -167,7 +198,7 @@ echo "$DN" | grep -q "smoke: deployed" \
   && fail "--skip-pre without --force must be refused (F30)" \
   || ok "--skip-pre without --force refused (F30)"
 
-# ── 5. gate test: failing pre-deploy hook must block the new revision ──
+# ── 7. gate test: failing pre-deploy hook must block the new revision ──
 cd "$WORK" || exit 1
 sed -i.bak 's/"300"/"301"/' docker-compose.yml && rm -f docker-compose.yml.bak
 cat > .deploy/pre-deploy.sh <<'EOF'
@@ -193,6 +224,10 @@ grep -q "pre-deploy hook failed" "$LOG" \
   && ok "failure logged" || fail "no failure log entry"
 grep -q "pg_dump: connection refused" "$LOG" \
   && ok "hook stderr captured in log (F14)" || fail "hook stderr not in log"
+grep -q "smoke: pre_hook_failed" "$NTFY_LOG" 2>/dev/null \
+  && grep "smoke: pre_hook_failed" "$NTFY_LOG" | grep -q "pg_dump: connection refused" \
+  && ok "pre_hook_failed notification carries the hook stderr end to end" \
+  || fail "pre_hook_failed notification missing or without hook stderr"
 
 # ── verdict ────────────────────────────────────────────────────────────
 if [ -z "$FAILURES" ]; then

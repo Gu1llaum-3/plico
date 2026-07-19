@@ -51,10 +51,36 @@ listen = "127.0.0.1:9444"
 # Volatile Unix socket for the client CLI. systemd creates /run/plico.
 socket = "/run/plico/plico.sock"
 
+# ── Notifications ───────────────────────────────────────────────────────
+# Each channel takes an optional `events` list. Omitted = failure-oriented
+# default: pre_hook_failed, pre_hook_skipped, deploy_failed, window_missed,
+# git_sync_failed. Opt-in extras: deploy_success, deploy_queued,
+# deploy_start. "all" = everything. A failing channel never breaks a
+# deployment: the error is logged locally.
+
 [ntfy]
-# Failure-oriented notifications. Leave url empty to disable.
 # url = "https://ntfy.example.com/plico"
 # token = "${PLICO_NTFY_TOKEN}"
+# events = ["deploy_failed", "pre_hook_failed", "window_missed", "git_sync_failed", "deploy_success"]
+
+# Generic JSON webhook (Google Chat / Teams accept the "text" field as-is);
+# repeatable.
+# [[webhook]]
+# url = "https://chat.googleapis.com/v1/spaces/.../messages?key=..."
+# events = ["all"]
+
+# [smtp]
+# host = "mail.example.com"
+# port = 587
+# from = "plico@example.com"
+# to = ["ops@example.com"]
+# username = "plico@example.com"
+# password = "${PLICO_SMTP_PASSWORD}"
+# events = ["deploy_failed", "window_missed", "git_sync_failed"]
+
+# git_sync_failed fires after N consecutive git fetch failures for a stack
+# (revoked token, moved repo). 0 disables. Default: 5.
+# git_sync_alert_after = 5
 
 [hooks]
 # Global fallbacks; a hook versioned in the repo (.deploy/pre-deploy.sh)

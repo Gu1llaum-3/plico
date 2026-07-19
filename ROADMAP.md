@@ -63,8 +63,14 @@ n'existe dans doco-cd.
         surcharge du global par fichier (l'héritage global→stack existe
         déjà dans `applyDefaults`). À faire seulement si le besoin
         d'automatisation multi-hôtes se matérialise
-- [ ] **Multi-notifiers** (F31–F33) : webhook générique (Teams/Google Chat) +
-      SMTP, filtrage par événement et par canal
+- [x] **Multi-notifiers** (F31–F33) : ntfy + webhook générique (Teams/Google
+      Chat, `[[webhook]]` répétable) + SMTP ; filtrage `events` par canal —
+      défaut orienté échecs, `deploy_success`/`deploy_queued`/`deploy_start`
+      opt-in, `"all"` supporté ; 2 nouveaux événements : `window_missed`
+      (fenêtre planifiée sans run — le scheduler notifie enfin) et
+      `git_sync_failed` (N échecs git consécutifs, `git_sync_alert_after`,
+      une alerte par panne) ; notifications validées de bout en bout dans le
+      smoke test (capteur HTTP local, stderr du hook inclus, zéro secret)
 - [ ] **Heartbeat Uptime Kuma** par stack (F36)
 
 ## 🔭 v1.x — Combler l'écart doco-cd (à la carte, dans cet ordre)

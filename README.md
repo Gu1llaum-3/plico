@@ -121,8 +121,30 @@ starting and fails `plico validate`.
 - `GET /healthz` (127.0.0.1:9444): **semantic** healthcheck — 503 when the
   scheduler stops ticking or a run exceeds `run_timeout`.
 - Structured JSON logs (slog), one correlation `run_id` per deployment.
-- Failure-oriented ntfy notifications: `deploy_queued`, `deploy_start`,
-  `pre_hook_failed`, `pre_hook_skipped`, `deploy_failed`, `deploy_success`.
+
+### Notifications
+
+Three channels — `[ntfy]`, repeatable `[[webhook]]` (generic JSON, works
+as-is with Google Chat and Teams), `[smtp]` — each with its own optional
+`events` list. **The default is failure-oriented**: `pre_hook_failed`,
+`pre_hook_skipped`, `deploy_failed`, `window_missed` (a scheduled window
+produced no run), `git_sync_failed` (git fetch failing repeatedly — revoked
+token, moved repo). `deploy_success`, `deploy_queued` and `deploy_start` are
+opt-in per channel, and `events = ["all"]` selects everything:
+
+```toml
+[ntfy]
+url = "https://ntfy.example.com/plico"
+events = ["deploy_failed", "pre_hook_failed", "window_missed",
+          "git_sync_failed", "deploy_success"]   # + success, for this channel
+
+[[webhook]]
+url = "https://chat.googleapis.com/v1/spaces/.../messages?key=..."
+# no events key = failures only
+```
+
+A failing channel never breaks a deployment (the send error is logged
+locally), and a failure alert survives even a run killed by `run_timeout`.
 
 ### System layout
 

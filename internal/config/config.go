@@ -12,6 +12,8 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/robfig/cron/v3"
+
+	"github.com/Gu1llaum-3/plico/internal/notify"
 )
 
 // Duration wraps time.Duration to accept TOML strings like "30s" or "5m".
@@ -44,6 +46,27 @@ type ApiConfig struct {
 type NtfyConfig struct {
 	URL   string `toml:"url"`   // full topic URL, e.g. https://ntfy.sh/plico-prod
 	Token string `toml:"token"` // optional, sent as Authorization: Bearer
+	// Events this channel receives (F32). Empty = failure-oriented default
+	// (pre_hook_failed, pre_hook_skipped, deploy_failed, window_missed,
+	// git_sync_failed); "all" = everything. deploy_success, deploy_queued
+	// and deploy_start are opt-in.
+	Events []string `toml:"events"`
+}
+
+type WebhookConfig struct {
+	URL    string   `toml:"url"`
+	Token  string   `toml:"token"` // optional, sent as Authorization: Bearer
+	Events []string `toml:"events"`
+}
+
+type SmtpConfig struct {
+	Host     string   `toml:"host"`
+	Port     int      `toml:"port"` // default 587
+	From     string   `toml:"from"`
+	To       []string `toml:"to"`
+	Username string   `toml:"username"`
+	Password string   `toml:"password"` // via ${ENV} interpolation
+	Events   []string `toml:"events"`
 }
 
 type HooksConfig struct {
@@ -108,12 +131,18 @@ type Config struct {
 	Window               Duration `toml:"window"`   // global default window, 1h
 	Check                bool     `toml:"check"`    // global default for out-of-window checks (F6)
 
-	Log    LogConfig    `toml:"log"`
-	Health HealthConfig `toml:"health"`
-	Api    ApiConfig    `toml:"api"`
-	Ntfy   NtfyConfig   `toml:"ntfy"`
-	Hooks  HooksConfig  `toml:"hooks"`
-	Git    GitConfig    `toml:"git"`
+	Log      LogConfig       `toml:"log"`
+	Health   HealthConfig    `toml:"health"`
+	Api      ApiConfig       `toml:"api"`
+	Ntfy     NtfyConfig      `toml:"ntfy"`
+	Webhooks []WebhookConfig `toml:"webhook"` // [[webhook]]
+	Smtp     SmtpConfig      `toml:"smtp"`
+	Hooks    HooksConfig     `toml:"hooks"`
+	Git      GitConfig       `toml:"git"`
+
+	// GitSyncAlertAfter fires git_sync_failed after N consecutive git sync
+	// failures for a stack (0 disables; unset = 5).
+	GitSyncAlertAfter *int `toml:"git_sync_alert_after"`
 
 	Stacks []StackConfig `toml:"stack"`
 }
@@ -177,6 +206,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Hooks.Timeout.Duration == 0 {
 		c.Hooks.Timeout.Duration = 10 * time.Minute
+	}
+	if c.Smtp.Host != "" && c.Smtp.Port == 0 {
+		c.Smtp.Port = 587
 	}
 	if c.Window.Duration == 0 {
 		c.Window.Duration = time.Hour
@@ -260,6 +292,31 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("ntfy.url: %w", err)
 		}
 	}
+	if _, err := notify.ParseEvents(c.Ntfy.Events); err != nil {
+		return fmt.Errorf("ntfy.events: %w", err)
+	}
+	for i, w := range c.Webhooks {
+		if w.URL == "" {
+			return fmt.Errorf("webhook[%d]: url is required", i)
+		}
+		if _, err := url.ParseRequestURI(w.URL); err != nil {
+			return fmt.Errorf("webhook[%d].url: %w", i, err)
+		}
+		if _, err := notify.ParseEvents(w.Events); err != nil {
+			return fmt.Errorf("webhook[%d].events: %w", i, err)
+		}
+	}
+	if c.Smtp.Host != "" {
+		if c.Smtp.From == "" || len(c.Smtp.To) == 0 {
+			return fmt.Errorf("smtp: from and to are required")
+		}
+		if _, err := notify.ParseEvents(c.Smtp.Events); err != nil {
+			return fmt.Errorf("smtp.events: %w", err)
+		}
+	}
+	if c.GitSyncAlertAfter != nil && *c.GitSyncAlertAfter < 0 {
+		return fmt.Errorf("git_sync_alert_after must be >= 0, got %d", *c.GitSyncAlertAfter)
+	}
 	if len(c.Stacks) == 0 {
 		return fmt.Errorf("at least one [[stack]] is required")
 	}
@@ -314,6 +371,14 @@ func validateSchedule(expr string) error {
 		return fmt.Errorf("expression never fires")
 	}
 	return nil
+}
+
+// GitSyncAlertThreshold resolves the *int (5 when unset, 0 = disabled).
+func (c *Config) GitSyncAlertThreshold() int {
+	if c.GitSyncAlertAfter == nil {
+		return 5
+	}
+	return *c.GitSyncAlertAfter
 }
 
 // escapesRepo reports whether a relative path climbs out of the repo. It

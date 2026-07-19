@@ -680,6 +680,81 @@ func TestDryRunFailsWhenPendingCommitsCannotBeListed(t *testing.T) {
 	}
 }
 
+func TestGitSyncFailedAlertsOncePerOutage(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	worktree := filepath.Join(base, "web")
+	if err := os.MkdirAll(filepath.Join(worktree, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		BaseDir:              base,
+		PollInterval:         config.Duration{Duration: time.Minute},
+		RunTimeout:           config.Duration{Duration: time.Minute},
+		MaxConcurrentDeploys: 2, // GitSyncAlertAfter unset -> threshold 5
+	}
+	cfg.Stacks = []config.StackConfig{{Name: "web", Repo: "https://example.com/r.git", Ref: "main"}}
+
+	gitDown := true
+	gitFake := &execx.FakeRunner{Match: func(c execx.Cmd) (execx.Result, error) {
+		if gitDown {
+			return execx.Result{ExitCode: 128}, errors.New("fatal: could not resolve host")
+		}
+		switch c.Args[0] {
+		case "fetch", "checkout":
+			return execx.Result{}, nil
+		case "rev-parse":
+			return execx.Result{Stdout: []byte(oldSHA + "\n")}, nil
+		}
+		return execx.Result{}, errors.New("unexpected " + c.Args[0])
+	}}
+	store, err := state.Open(filepath.Join(base, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put("web", state.StackState{LastDeployedSHA: oldSHA}); err != nil {
+		t.Fatal(err)
+	}
+	events := &eventRecorder{}
+	d := New(cfg, gitrepo.New(gitFake, nil, discard()), &fakeRuntime{},
+		hooks.New(execx.NewRunner(discard()), discard()), events, store, gitFake, discard())
+
+	// 7 consecutive failures: exactly one alert, at the 5th.
+	for i := 0; i < 7; i++ {
+		if outcome := d.RunStack(context.Background(), cfg.Stacks[0]); outcome != OutcomeFailed {
+			t.Fatalf("run %d outcome = %s", i, outcome)
+		}
+	}
+	types := events.types()
+	count := 0
+	for _, tpe := range types {
+		if tpe == notify.GitSyncFailed {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("git_sync_failed sent %d times, want exactly 1: %v", count, types)
+	}
+	// Recovery resets the counter: a new outage alerts again.
+	gitDown = false
+	if outcome := d.RunStack(context.Background(), cfg.Stacks[0]); outcome != OutcomeUpToDate {
+		t.Fatalf("recovery outcome = %s", outcome)
+	}
+	gitDown = true
+	for i := 0; i < 5; i++ {
+		_ = d.RunStack(context.Background(), cfg.Stacks[0])
+	}
+	count = 0
+	for _, tpe := range events.types() {
+		if tpe == notify.GitSyncFailed {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("a new outage after recovery must alert again, got %d alerts", count)
+	}
+}
+
 func TestAssess(t *testing.T) {
 	t.Parallel()
 	services := []compose.Service{

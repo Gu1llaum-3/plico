@@ -72,17 +72,14 @@ func serve(configPath string) error {
 		return err
 	}
 
-	var notifier notify.Notifier = notify.Nop{}
-	if cfg.Ntfy.URL != "" {
-		notifier = notify.WithLogFallback(notify.NewNtfy(cfg.Ntfy.URL, cfg.Ntfy.Token), log)
-	}
+	notifier := buildNotifier(cfg, log)
 
 	runner := execx.NewRunner(log)
 	git := gitrepo.New(runner, cfg.Git.Auths, log)
 	runtime := compose.NewDocker(runner)
 	hookRunner := hooks.New(runner, log)
 	deployer := deploy.New(cfg, git, runtime, hookRunner, notifier, store, runner, log)
-	sched, err := scheduler.New(cfg, deployer, store, log)
+	sched, err := scheduler.New(cfg, deployer, store, notifier, log)
 	if err != nil {
 		return fmt.Errorf("scheduler: %w", err)
 	}
@@ -155,6 +152,36 @@ func serve(configPath string) error {
 	}
 	log.Info("plico stopped")
 	return nil
+}
+
+// buildNotifier assembles the configured channels (F31), each with its own
+// event filter (F32) and a local-log fallback so a failing channel never
+// breaks a deployment (F33).
+func buildNotifier(cfg *config.Config, log *slog.Logger) notify.Notifier {
+	var channels []notify.Notifier
+	add := func(n notify.Notifier, events []string, kind string) {
+		evs, err := notify.ParseEvents(events)
+		if err != nil {
+			// Validated at config load; defensive.
+			log.Error("invalid notifier events, using defaults", "notifier", kind, "error", err)
+			evs = notify.DefaultEvents
+		}
+		channels = append(channels, notify.FilterEvents(notify.WithLogFallback(n, log), evs))
+	}
+	if cfg.Ntfy.URL != "" {
+		add(notify.NewNtfy(cfg.Ntfy.URL, cfg.Ntfy.Token), cfg.Ntfy.Events, "ntfy")
+	}
+	for _, w := range cfg.Webhooks {
+		add(notify.NewWebhook(w.URL, w.Token), w.Events, "webhook")
+	}
+	if cfg.Smtp.Host != "" {
+		add(notify.NewSMTP(cfg.Smtp.Host, cfg.Smtp.Port, cfg.Smtp.From, cfg.Smtp.To,
+			cfg.Smtp.Username, cfg.Smtp.Password), cfg.Smtp.Events, "smtp")
+	}
+	if len(channels) == 0 {
+		return notify.Nop{}
+	}
+	return notify.Multi(channels...)
 }
 
 // runtimeChecks are the startup validations beyond config.Load. `plico

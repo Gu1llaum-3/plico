@@ -5,7 +5,9 @@ package notify
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -18,7 +20,61 @@ const (
 	PreHookSkipped EventType = "pre_hook_skipped"
 	DeployFailed   EventType = "deploy_failed"
 	DeploySuccess  EventType = "deploy_success"
+	// WindowMissed: a scheduled deployment window produced no run (daemon
+	// down across the window, previous run covering it, or a firing
+	// superseded before any run).
+	WindowMissed EventType = "window_missed"
+	// GitSyncFailed: git fetch has been failing for N consecutive runs
+	// (revoked token, moved repo) — the stack is effectively unmanaged.
+	GitSyncFailed EventType = "git_sync_failed"
 )
+
+// AllEvents lists every event type, for config validation.
+var AllEvents = []EventType{
+	DeployQueued, DeployStart, PreHookFailed, PreHookSkipped,
+	DeployFailed, DeploySuccess, WindowMissed, GitSyncFailed,
+}
+
+// DefaultEvents is what a channel receives when it does not configure an
+// `events` list: failure-oriented (F32). deploy_success, deploy_queued and
+// deploy_start are opt-in per channel.
+var DefaultEvents = []EventType{
+	PreHookFailed, PreHookSkipped, DeployFailed, WindowMissed, GitSyncFailed,
+}
+
+// ParseEvents validates a config-provided list. Empty means DefaultEvents;
+// the single entry "all" means every event.
+func ParseEvents(names []string) ([]EventType, error) {
+	if len(names) == 0 {
+		return DefaultEvents, nil
+	}
+	if len(names) == 1 && names[0] == "all" {
+		return AllEvents, nil
+	}
+	var out []EventType
+	for _, n := range names {
+		found := false
+		for _, e := range AllEvents {
+			if string(e) == n {
+				out = append(out, e)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("unknown event %q (valid: all, %s)", n, joinEvents(AllEvents))
+		}
+	}
+	return out, nil
+}
+
+func joinEvents(evs []EventType) string {
+	names := make([]string, len(evs))
+	for i, e := range evs {
+		names[i] = string(e)
+	}
+	return strings.Join(names, ", ")
+}
 
 type Event struct {
 	Type   EventType
@@ -68,6 +124,28 @@ func (l *logged) Notify(ctx context.Context, ev Event) error {
 			"event", string(ev.Type), "stack", ev.Stack, "run_id", ev.RunID, "error", err)
 	}
 	return nil
+}
+
+// FilterEvents decorates n so it only receives the listed event types
+// (per-channel filtering, F32).
+func FilterEvents(n Notifier, events []EventType) Notifier {
+	set := make(map[EventType]bool, len(events))
+	for _, e := range events {
+		set[e] = true
+	}
+	return &filtered{n: n, set: set}
+}
+
+type filtered struct {
+	n   Notifier
+	set map[EventType]bool
+}
+
+func (f *filtered) Notify(ctx context.Context, ev Event) error {
+	if !f.set[ev.Type] {
+		return nil
+	}
+	return f.n.Notify(ctx, ev)
 }
 
 // Nop is used when no notifier is configured.

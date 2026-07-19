@@ -28,6 +28,7 @@ import (
 
 	"github.com/Gu1llaum-3/plico/internal/config"
 	"github.com/Gu1llaum-3/plico/internal/deploy"
+	"github.com/Gu1llaum-3/plico/internal/notify"
 	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
@@ -47,6 +48,7 @@ type Scheduler struct {
 	cfg          *config.Config
 	deployer     StackRunner
 	store        *state.Store
+	notifier     notify.Notifier
 	log          *slog.Logger
 	loc          *time.Location
 	catchUpLimit int // per-instance so tests can exercise the abort path
@@ -89,16 +91,17 @@ type Snapshot struct {
 // New builds the scheduler anchored at the current time. It fails closed: an
 // unparsable or never-firing schedule is an error, never a silent fall-back
 // to every-tick.
-func New(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logger) (*Scheduler, error) {
-	return NewAt(cfg, d, store, log, time.Now())
+func New(cfg *config.Config, d StackRunner, store *state.Store, notifier notify.Notifier, log *slog.Logger) (*Scheduler, error) {
+	return NewAt(cfg, d, store, notifier, log, time.Now())
 }
 
 // NewAt is New with an explicit construction time, for deterministic tests.
-func NewAt(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logger, now time.Time) (*Scheduler, error) {
+func NewAt(cfg *config.Config, d StackRunner, store *state.Store, notifier notify.Notifier, log *slog.Logger, now time.Time) (*Scheduler, error) {
 	s := &Scheduler{
 		cfg:          cfg,
 		deployer:     d,
 		store:        store,
+		notifier:     notifier,
 		log:          log,
 		loc:          cfg.Location(),
 		catchUpLimit: catchUpLimit,
@@ -215,11 +218,18 @@ func (s *Scheduler) Run(ctx context.Context) {
 // due returns the stacks to process this tick: apply gets the full pipeline,
 // check only fetch+diff+queued-notification (F6). A stack without a schedule
 // is always apply-due; a scheduled stack is apply-due while its window is
-// open, and check-due outside it when checks are enabled.
+// open, and check-due outside it when checks are enabled. Missed-window
+// notifications are collected under the lock and emitted after release.
 func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 	grace := s.cfg.PollInterval.Duration // tolerated discovery lateness (ticker jitter)
+	var events []notify.Event
+	missed := func(st config.StackConfig, detail string) {
+		events = append(events, notify.Event{
+			Type: notify.WindowMissed, Stack: st.Name, Ref: st.Ref,
+			Detail: detail, Time: time.Now(),
+		})
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, st := range s.cfg.Stacks {
 		ss, scheduled := s.scheds[st.Name]
 		if !scheduled {
@@ -276,6 +286,8 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 					"stack", st.Name, "count", skipped,
 					"first", firstSkipped.Format(time.RFC3339),
 					"last", lastSkipped.Format(time.RFC3339))
+				missed(st, fmt.Sprintf("%d scheduled firing(s) skipped without a run between %s and %s (daemon unavailable, or cron period < poll_interval)",
+					skipped, firstSkipped.Format(time.RFC3339), lastSkipped.Format(time.RFC3339)))
 			}
 			// A still-open window superseded by a new firing before any of
 			// its runs happened is a missed deployment. Deferred only when
@@ -285,6 +297,8 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 			if !ss.windowFiring.IsZero() && !ss.attempted && !inFlightForWindow {
 				s.log.Warn("deployment window superseded before any run",
 					"stack", st.Name, "firing", ss.windowFiring.Format(time.RFC3339))
+				missed(st, fmt.Sprintf("deployment window of firing %s superseded before any run",
+					ss.windowFiring.Format(time.RFC3339)))
 				s.persistAnchor(st.Name, ss.windowFiring, ss.spec)
 			}
 			if now.After(fired.Add(ss.window).Add(grace)) {
@@ -296,6 +310,10 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 					"firing", fired.Format(time.RFC3339),
 					"window_end", fired.Add(ss.window).Format(time.RFC3339),
 					"next_run", ss.next.Format(time.RFC3339))
+				missed(st, fmt.Sprintf("window of firing %s (ended %s) discovered too late (daemon down? host paused?); not deploying outside the window — next run %s",
+					fired.Format(time.RFC3339),
+					fired.Add(ss.window).Format(time.RFC3339),
+					ss.next.Format(time.RFC3339)))
 				s.persistAnchor(st.Name, fired, ss.spec)
 				ss.windowFiring = time.Time{}
 			} else {
@@ -316,6 +334,8 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 			if !ss.attempted {
 				s.log.Warn("deployment window elapsed without any run (previous deploy overlapped the whole window?)",
 					"stack", st.Name, "firing", ss.windowFiring.Format(time.RFC3339))
+				missed(st, fmt.Sprintf("window of firing %s elapsed without any run (previous deploy overlapping the whole window?)",
+					ss.windowFiring.Format(time.RFC3339)))
 				s.persistAnchor(st.Name, ss.windowFiring, ss.spec)
 			}
 			ss.windowFiring = time.Time{}
@@ -327,6 +347,15 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 		case st.CheckEnabled():
 			check = append(check, st)
 		}
+	}
+	s.mu.Unlock()
+
+	// Emitted outside the lock: a slow notifier must never stall the
+	// scheduler (Snapshot/healthz block on s.mu).
+	for _, ev := range events {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = s.notifier.Notify(ctx, ev)
+		cancel()
 	}
 	return apply, check
 }

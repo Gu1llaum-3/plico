@@ -87,9 +87,10 @@ type Deployer struct {
 	store    *state.Store
 	log      *slog.Logger
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
-	sem   chan struct{} // bounds concurrent deployments across stacks
+	mu       sync.Mutex
+	locks    map[string]*sync.Mutex
+	gitFails map[string]int // consecutive git sync failures per stack
+	sem      chan struct{}  // bounds concurrent deployments across stacks
 
 	// TmpfsRoot is overridable in tests; defaults to /dev/shm on Linux.
 	TmpfsRoot string
@@ -109,6 +110,7 @@ func New(cfg *config.Config, git *gitrepo.Client, rt compose.Runtime, hk *hooks.
 		runner:    r,
 		log:       log,
 		locks:     map[string]*sync.Mutex{},
+		gitFails:  map[string]int{},
 		sem:       make(chan struct{}, cfg.MaxConcurrentDeploys),
 		TmpfsRoot: sopsx.DefaultTmpfsRoot,
 	}
@@ -161,8 +163,10 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	dir := filepath.Join(d.cfg.BaseDir, st.Name)
 
 	// 1. git sync — a fetch failure is not a deploy failure: nothing was
-	// going to be deployed. Logged, visible via the scheduler snapshot.
+	// going to be deployed. Logged and counted: a PERSISTENT failure
+	// (revoked token, moved repo) fires git_sync_failed once per outage.
 	newSHA, err := d.git.SyncAndResolve(ctx, st.Repo, st.Ref, dir)
+	d.noteGitSync(ctx, st, err)
 	if err != nil {
 		log.Error("git sync failed", "stage", StageGitSync, "error", err)
 		return OutcomeFailed
@@ -358,6 +362,7 @@ func (d *Deployer) CheckStack(ctx context.Context, st config.StackConfig) Outcom
 
 	dir := filepath.Join(d.cfg.BaseDir, st.Name)
 	newSHA, err := d.git.SyncAndResolve(ctx, st.Repo, st.Ref, dir)
+	d.noteGitSync(ctx, st, err)
 	if err != nil {
 		log.Error("git sync failed", "stage", StageGitSync, "error", err)
 		return OutcomeFailed
@@ -508,6 +513,39 @@ func assess(services []compose.Service) (bad, pending []string) {
 		}
 	}
 	return bad, pending
+}
+
+// noteGitSync tracks consecutive git sync failures per stack and fires
+// git_sync_failed exactly once per outage when the configured threshold is
+// crossed. A success resets the counter.
+func (d *Deployer) noteGitSync(ctx context.Context, st config.StackConfig, syncErr error) {
+	threshold := d.cfg.GitSyncAlertThreshold()
+	if threshold == 0 {
+		return
+	}
+	d.mu.Lock()
+	if syncErr == nil {
+		if d.gitFails[st.Name] >= threshold {
+			d.log.Info("git sync recovered", "stack", st.Name)
+		}
+		delete(d.gitFails, st.Name)
+		d.mu.Unlock()
+		return
+	}
+	d.gitFails[st.Name]++
+	count := d.gitFails[st.Name]
+	d.mu.Unlock()
+	if count != threshold {
+		return
+	}
+	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
+	defer cancel()
+	_ = d.notifier.Notify(nctx, notify.Event{
+		Type: notify.GitSyncFailed, Stack: st.Name, Ref: st.Ref,
+		Stage:  StageGitSync,
+		Detail: fmt.Sprintf("git sync has failed %d consecutive times, the stack is effectively unmanaged: %v", count, syncErr),
+		Time:   time.Now(),
+	})
 }
 
 func (d *Deployer) saveState(log *slog.Logger, stack string, mutate func(*state.StackState)) {

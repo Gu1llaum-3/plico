@@ -17,6 +17,7 @@ import (
 
 	"github.com/Gu1llaum-3/plico/internal/config"
 	"github.com/Gu1llaum-3/plico/internal/deploy"
+	"github.com/Gu1llaum-3/plico/internal/notify"
 	"github.com/Gu1llaum-3/plico/internal/scheduler"
 	"github.com/Gu1llaum-3/plico/internal/state"
 )
@@ -63,7 +64,7 @@ func socketSetup(t *testing.T) (*SocketServer, *fakeTrigger) {
 		t.Fatal(err)
 	}
 	trigger := &fakeTrigger{}
-	sched, err := scheduler.New(cfg, nopRunner{}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sched, err := scheduler.New(cfg, nopRunner{}, store, notify.Nop{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +223,7 @@ func socketServerAt(t *testing.T, path string) *SocketServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sched, err := scheduler.New(cfg, nopRunner{}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sched, err := scheduler.New(cfg, nopRunner{}, store, notify.Nop{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Gu1llaum-3/plico/internal/config"
 	"github.com/Gu1llaum-3/plico/internal/deploy"
+	"github.com/Gu1llaum-3/plico/internal/notify"
 	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
@@ -68,7 +69,7 @@ func testConfig() *config.Config {
 
 func mustNewAt(t *testing.T, cfg *config.Config, r StackRunner, store *state.Store, now time.Time) *Scheduler {
 	t.Helper()
-	s, err := NewAt(cfg, r, store, discard(), now)
+	s, err := NewAt(cfg, r, store, notify.Nop{}, discard(), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,12 +280,29 @@ func TestDueRespectsScheduleWindow(t *testing.T) {
 	}
 }
 
+// notifyRecorder captures scheduler-emitted events.
+type notifyRecorder struct {
+	mu     sync.Mutex
+	events []notify.Event
+}
+
+func (r *notifyRecorder) Notify(_ context.Context, ev notify.Event) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, ev)
+	return nil
+}
+
 func TestMissedWindowIsNeverDeployedLate(t *testing.T) {
 	t.Parallel()
 	loc := paris(t)
 	store := testStore(t)
 	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
-	s := mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, store, boot)
+	rec := &notifyRecorder{}
+	s, err := NewAt(nightlyConfig(time.Hour), &countingRunner{}, store, rec, discard(), boot)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Host paused from 03:30 to 09:00: the first tick after resume sees the
 	// 04:00 firing but its window (04:00-05:00) is long gone.
@@ -296,6 +314,13 @@ func TestMissedWindowIsNeverDeployedLate(t *testing.T) {
 	fire := time.Date(2026, 7, 19, 4, 0, 0, 0, loc)
 	if st, _ := store.Get("nightly"); !st.LastFiring.Equal(fire) {
 		t.Errorf("missed firing not persisted: anchor = %v, want %v", st.LastFiring, fire)
+	}
+	// A missed nightly deployment is exactly what the operator sleeps
+	// through: it must NOTIFY, not just log.
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.events) != 1 || rec.events[0].Type != notify.WindowMissed || rec.events[0].Stack != "nightly" {
+		t.Errorf("window_missed notification missing or wrong: %+v", rec.events)
 	}
 }
 
@@ -410,7 +435,7 @@ func TestNewFailsClosedOnBadSchedule(t *testing.T) {
 			PollInterval: config.Duration{Duration: time.Minute},
 			Stacks:       []config.StackConfig{{Name: "web", Schedule: spec}},
 		}
-		if _, err := NewAt(cfg, &countingRunner{}, testStore(t), discard(), time.Now()); err == nil {
+		if _, err := NewAt(cfg, &countingRunner{}, testStore(t), notify.Nop{}, discard(), time.Now()); err == nil {
 			t.Errorf("schedule %q must be a construction error, not a silent fallback or a wedge", spec)
 		}
 	}
