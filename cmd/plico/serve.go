@@ -49,15 +49,15 @@ func serve(configPath string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	log, closeLog, err := newLogger(cfg.Log)
+	level, err := runtimeChecks(cfg, true)
+	if err != nil {
+		return err
+	}
+	log, closeLog, err := newLogger(cfg.Log, level)
 	if err != nil {
 		return err
 	}
 	defer closeLog()
-
-	if err := runtimeChecks(cfg); err != nil {
-		return err
-	}
 
 	if err := os.MkdirAll(cfg.BaseDir, 0o755); err != nil {
 		return err
@@ -123,26 +123,29 @@ func serve(configPath string) error {
 	return nil
 }
 
-// runtimeChecks are the startup validations beyond config.Load: `plico
-// validate` (F29) runs the exact same set, so a config it accepts is a
-// config the daemon will start with.
-func runtimeChecks(cfg *config.Config) error {
+// runtimeChecks are the startup validations beyond config.Load. `plico
+// validate` (F29) runs the host-independent set (hostChecks=false): checks
+// that depend on the machine the daemon runs on — tmpfs availability, log
+// file writability — can only be honest at `serve` time on the target host.
+func runtimeChecks(cfg *config.Config, hostChecks bool) (slog.Level, error) {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(cfg.Log.Level)); err != nil {
-		return fmt.Errorf("log.level: %w", err)
+		return level, fmt.Errorf("log.level: %w", err)
 	}
-	// tmpfs mode is validated once at startup, not at deploy time.
-	for _, st := range cfg.Stacks {
-		if st.SopsMode == "tmpfs" && len(st.SopsFiles) > 0 {
-			if err := sopsx.CheckTmpfs(sopsx.DefaultTmpfsRoot); err != nil {
-				return fmt.Errorf("stack %q: %w", st.Name, err)
+	if hostChecks {
+		// tmpfs mode is validated once at startup, not at deploy time.
+		for _, st := range cfg.Stacks {
+			if st.SopsMode == "tmpfs" && len(st.SopsFiles) > 0 {
+				if err := sopsx.CheckTmpfs(sopsx.DefaultTmpfsRoot); err != nil {
+					return level, fmt.Errorf("stack %q: %w", st.Name, err)
+				}
 			}
 		}
 	}
-	return nil
+	return level, nil
 }
 
-func newLogger(lc config.LogConfig) (*slog.Logger, func(), error) {
+func newLogger(lc config.LogConfig, level slog.Level) (*slog.Logger, func(), error) {
 	var w io.Writer = os.Stderr
 	closeFn := func() {}
 	if lc.Path != "" {
@@ -152,10 +155,6 @@ func newLogger(lc config.LogConfig) (*slog.Logger, func(), error) {
 		}
 		w = f
 		closeFn = func() { _ = f.Close() }
-	}
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(lc.Level)); err != nil {
-		return nil, nil, fmt.Errorf("log.level: %w", err)
 	}
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})), closeFn, nil
 }

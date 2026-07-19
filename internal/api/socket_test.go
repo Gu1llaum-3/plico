@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -172,6 +174,100 @@ func TestDeployDetachedFromClientContext(t *testing.T) {
 	}
 	if trigger.ctxErrs[0] != nil {
 		t.Errorf("deploy ran on a cancelled context (%v): a client Ctrl-C would kill compose mid-flight", trigger.ctxErrs[0])
+	}
+}
+
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	// unix socket paths are length-limited (~104 bytes): avoid t.TempDir's
+	// deep hierarchy.
+	dir, err := os.MkdirTemp("", "plico")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func socketServerAt(t *testing.T, path string) *SocketServer {
+	t.Helper()
+	cfg := &config.Config{
+		PollInterval: config.Duration{Duration: time.Minute},
+		RunTimeout:   config.Duration{Duration: time.Minute},
+		Api:          config.ApiConfig{Socket: path},
+		Stacks:       []config.StackConfig{{Name: "web"}},
+	}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched, err := scheduler.New(cfg, nopRunner{}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewSocket(cfg, sched, store, &fakeTrigger{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func TestListenRefusesLiveDaemonSocket(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(shortSocketDir(t), "plico.sock")
+	s1 := socketServerAt(t, path)
+	if err := s1.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s1.Shutdown(context.Background()) }()
+
+	// An accidental second daemon must refuse to start, not steal the socket.
+	s2 := socketServerAt(t, path)
+	if err := s2.Listen(); err == nil {
+		t.Fatal("second Listen on a live socket must fail")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("live socket was removed by the refused second daemon: %v", err)
+	}
+}
+
+func TestListenReplacesStaleSocket(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(shortSocketDir(t), "plico.sock")
+	// Simulate a crash leftover: a bound-then-dead socket file.
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	_ = ln.Close()
+
+	s := socketServerAt(t, path)
+	if err := s.Listen(); err != nil {
+		t.Fatalf("stale socket must be replaced: %v", err)
+	}
+	_ = s.Shutdown(context.Background())
+}
+
+func TestShutdownDoesNotRemoveSuccessorSocket(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(shortSocketDir(t), "plico.sock")
+	s1 := socketServerAt(t, path)
+	if err := s1.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	// A successor replaces the path while s1 is still draining (simulated
+	// by an out-of-band remove + rebind, as after a crash-recover race).
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s2 := socketServerAt(t, path)
+	if err := s2.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Shutdown(context.Background()) }()
+
+	if err := s1.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("dying daemon removed the successor's live socket: %v", err)
 	}
 }
 

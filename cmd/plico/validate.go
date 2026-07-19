@@ -18,9 +18,10 @@ func init() {
 			if err != nil {
 				return err
 			}
-			// Same startup checks as `plico serve`: a validated config is a
-			// config the daemon will actually start with.
-			if err := runtimeChecks(cfg); err != nil {
+			// Host-independent startup checks only: tmpfs availability and
+			// log-path writability depend on the machine the daemon runs
+			// on and are re-checked by `plico serve` there.
+			if _, err := runtimeChecks(cfg, false); err != nil {
 				return err
 			}
 			scheduled := 0

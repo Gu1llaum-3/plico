@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -36,7 +38,26 @@ type SocketServer struct {
 	log     *slog.Logger
 	server  *http.Server
 	ln      net.Listener
+	sockID  fileID         // identity of the socket file WE bound (see Shutdown)
 	actions sync.WaitGroup // in-flight manual runs, drained at shutdown
+}
+
+// fileID identifies a file on disk (device + inode).
+type fileID struct {
+	dev uint64
+	ino uint64
+}
+
+func statID(path string) (fileID, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileID{}, false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileID{}, false
+	}
+	return fileID{dev: uint64(st.Dev), ino: st.Ino}, true //nolint:unconvert // Dev is int32 on darwin, uint64 on linux
 }
 
 func NewSocket(cfg *config.Config, sched *scheduler.Scheduler, store *state.Store,
@@ -58,35 +79,67 @@ func NewSocket(cfg *config.Config, sched *scheduler.Scheduler, store *state.Stor
 	return s
 }
 
-// Listen binds the unix socket. Call it synchronously at startup, before
-// other goroutines create files: the 0660 permissions are applied through
-// the umask AT bind time — a chmod-after-listen would leave a window where
-// the socket is world-connectable (unix sockets check permissions at
-// connect time, so an early connection would survive the chmod).
+// Listen binds the unix socket with 0660 permissions, with no window where
+// it is world-connectable (see the staging-dir + rename below).
 func (s *SocketServer) Listen() error {
 	path := s.cfg.Api.Socket
 
 	// A leftover socket from a crash must be replaced, but never steal the
 	// socket of a live daemon (accidental double start): probe it first.
-	if _, err := os.Stat(path); err == nil {
-		conn, err := net.DialTimeout("unix", path, time.Second)
-		if err == nil {
+	// Lstat, not Stat: a dangling symlink is a removable leftover too.
+	if _, err := os.Lstat(path); err == nil {
+		conn, dialErr := net.DialTimeout("unix", path, time.Second)
+		switch {
+		case dialErr == nil:
 			_ = conn.Close()
 			return fmt.Errorf("another plico daemon is already listening on %s", path)
+		case errors.Is(dialErr, syscall.ECONNREFUSED) || errors.Is(dialErr, fs.ErrNotExist):
+			// Nobody accepts (crash leftover) or the target is gone
+			// (dangling symlink): safe to replace.
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("removing stale socket: %w", err)
+			}
+			s.log.Info("removed stale socket", "socket", path)
+		default:
+			// Timeout or anything ambiguous: a wedged-but-alive daemon may
+			// own it. Never steal a socket we cannot prove dead.
+			return fmt.Errorf("socket %s exists and its owner may still be alive (probe: %v); refusing to replace it", path, dialErr)
 		}
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("removing stale socket: %w", err)
-		}
-		s.log.Info("removed stale socket", "socket", path)
 	}
 
-	old := syscall.Umask(0o117) // 0777 &^ 0117 = 0660
-	ln, err := net.Listen("unix", path)
-	syscall.Umask(old)
+	// Bind in a private 0700 staging dir, chmod, then atomically rename to
+	// the final path: at no point is a world-connectable socket reachable
+	// (unix sockets check permissions at connect time), and no process-wide
+	// umask fiddling is needed.
+	tmpDir := path + ".init"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return err
+	}
+	if err := os.Mkdir(tmpDir, 0o700); err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	tmp := tmpDir + "/s"
+	ln, err := net.Listen("unix", tmp)
 	if err != nil {
 		return err
 	}
+	if err := os.Chmod(tmp, 0o660); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = ln.Close()
+		return err
+	}
 	s.ln = ln
+	// The unix listener would unlink the path on Close even if a successor
+	// daemon already re-bound it; Shutdown does an identity-checked removal
+	// instead.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	s.sockID, _ = statID(path)
 	s.log.Info("client API listening", "socket", path)
 	return nil
 }
@@ -96,13 +149,17 @@ func (s *SocketServer) Serve() error {
 	return s.server.Serve(s.ln)
 }
 
-// Shutdown stops accepting requests, then waits for in-flight manual runs
-// to finish — a socket-triggered deploy gets the same drain guarantee as a
+// Shutdown stops accepting requests, removes the socket (only if it is
+// still OURS: during a long drain a successor daemon may have already bound
+// a fresh one at the same path), then waits for in-flight manual runs to
+// finish — a socket-triggered deploy gets the same drain guarantee as a
 // scheduled one (the runs themselves are bounded by run_timeout).
 func (s *SocketServer) Shutdown(ctx context.Context) error {
 	err := s.server.Shutdown(ctx)
+	if id, ok := statID(s.cfg.Api.Socket); ok && id == s.sockID {
+		_ = os.Remove(s.cfg.Api.Socket)
+	}
 	s.actions.Wait()
-	_ = os.Remove(s.cfg.Api.Socket)
 	return err
 }
 
@@ -170,6 +227,12 @@ func (s *SocketServer) handleDryRun(w http.ResponseWriter, r *http.Request) {
 func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name string,
 	run func(context.Context, config.StackConfig, ActionRequest) string) {
 
+	// Counted from the very first line: a request still reading its body at
+	// shutdown must be covered by the drain, or the deploy it is about to
+	// start would be killed at process exit.
+	s.actions.Add(1)
+	defer s.actions.Done()
+
 	req, ok := s.decodeAction(w, r)
 	if !ok {
 		return
@@ -189,11 +252,7 @@ func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name
 		"stack", req.Stack, "force", req.Force, "skip_pre", req.SkipPre, "skip_post", req.SkipPost)
 
 	// Detached from the request context: an operator's Ctrl-C (client
-	// disconnect) must not SIGKILL a docker compose up mid-flight. Tracked
-	// in the actions WaitGroup so shutdown drains these runs like the
-	// scheduler drains its own.
-	s.actions.Add(1)
-	defer s.actions.Done()
+	// disconnect) must not SIGKILL a docker compose up mid-flight.
 	ctx := context.WithoutCancel(r.Context())
 
 	results := make([]ActionResult, 0, len(stacks))

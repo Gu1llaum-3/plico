@@ -34,17 +34,22 @@ func (s *stackSelection) target() (string, error) {
 }
 
 // printResults prints per-stack outcomes and returns an error when any
-// stack failed or was skipped, so scripts can rely on the exit code.
-func printResults(cmd *cobra.Command, results []api.ActionResult) error {
+// outcome is in badOutcomes, so scripts can rely on the exit code. What
+// counts as bad depends on the command: a "skipped" deploy-now means the
+// requested deployment did not happen, while a "skipped" check-now just
+// means a deploy currently owns the stack — a healthy condition.
+func printResults(cmd *cobra.Command, results []api.ActionResult, verb string, badOutcomes ...string) error {
 	var bad []string
 	for _, r := range results {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", r.Stack, r.Outcome)
-		if r.Outcome == "failed" || r.Outcome == "skipped" {
-			bad = append(bad, fmt.Sprintf("%s (%s)", r.Stack, r.Outcome))
+		for _, b := range badOutcomes {
+			if r.Outcome == b {
+				bad = append(bad, fmt.Sprintf("%s (%s)", r.Stack, r.Outcome))
+			}
 		}
 	}
 	if len(bad) > 0 {
-		return fmt.Errorf("not deployed: %s", strings.Join(bad, ", "))
+		return fmt.Errorf("%s: %s", verb, strings.Join(bad, ", "))
 	}
 	return nil
 }
@@ -65,7 +70,8 @@ func init() {
 				if err := conn.call("POST", "/v1/check", api.ActionRequest{Stack: target}, &results); err != nil {
 					return err
 				}
-				return printResults(cmd, results)
+				return printResults(cmd, results, "check failed",
+					deploy.OutcomeFailed.String())
 			},
 		}
 		conn.registerClientFlags(cmd)
@@ -93,7 +99,8 @@ func init() {
 				if err := conn.call("POST", "/v1/deploy", req, &results); err != nil {
 					return err
 				}
-				return printResults(cmd, results)
+				return printResults(cmd, results, "not deployed",
+					deploy.OutcomeFailed.String(), deploy.OutcomeSkipped.String())
 			},
 		}
 		conn.registerClientFlags(cmd)
