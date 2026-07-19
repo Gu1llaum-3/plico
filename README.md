@@ -205,6 +205,11 @@ The installer deploys [`packaging/plico.service`](packaging/plico.service).
 prepares `/var/lib/plico`, and `EnvironmentFile=-/etc/plico/plico.env` keeps
 secrets out of the unit. The `-` makes the file optional on a fresh install.
 
+Applying a configuration change is `plico validate` then
+`sudo systemctl restart plico`: the restart drains in-flight runs and the
+persisted schedule anchors re-open a still-open deployment window — a
+restart **is** the reload mechanism, there is no SIGHUP.
+
 ## Rollback (v1 = manual, by design)
 
 - **Code / compose configuration**: `git revert` in the stack repo; plico
@@ -236,9 +241,13 @@ bad revision. Requires a Docker daemon.
 
 ## Roadmap
 
-- **v1**: `config.d/<stack>.toml` + SIGHUP reload, webhook + SMTP notifiers,
-  Uptime Kuma heartbeat. Already shipped: per-stack cron scheduling and
-  windows, check/apply distinction, the client CLI over a unix socket.
+- **v1**: webhook + SMTP notifiers, Uptime Kuma heartbeat. Already shipped:
+  per-stack cron scheduling and windows, check/apply distinction, the client
+  CLI over a unix socket. Config changes are applied with
+  `systemctl restart plico` — a graceful drain with persisted schedule
+  anchors, so a restart is the official reload mechanism (SIGHUP and
+  config.d deep-merge were considered and rejected, see
+  [ROADMAP](ROADMAP.md)).
 - **Later**: **Podman** support (the runtime already sits behind a
   `compose.Runtime` interface), Prometheus metrics, container image,
   webhook ingestion.

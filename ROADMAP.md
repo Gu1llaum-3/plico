@@ -50,9 +50,19 @@ n'existe dans doco-cd.
 - [x] **Installateur de release** : détection OS/architecture, latest ou
       version épinglée, binaire local, checksums, installation atomique,
       configuration systemd idempotente et rollback d'upgrade
-- [ ] **config.d/<stack>.toml + SIGHUP** (F21–F23) : deep-merge (scalaire
-      surchargé, map fusionnée, tableau REMPLACÉ, champs protégés non
-      surchargeables), fichier invalide = stack ignorée + alerte
+- [ ] ~~config.d + deep-merge + SIGHUP (F21–F23)~~ **abandonné tel que
+      spécifié** (juillet 2026 — raisonnement dans « Hors périmètre »).
+      Ce qui remplace le besoin :
+      - documenter « `systemctl restart` = reload » comme mécanisme officiel
+        d'application d'un changement de config (déjà vrai et testé : drain
+        des runs en vol, ancres de planning persistées, fenêtre encore
+        ouverte ré-ouverte au redémarrage)
+      - option future `stacks_dir = "/etc/plico/stacks.d"` : un fichier par
+        stack contenant uniquement des blocs `[[stack]]` complets,
+        concaténés puis validés globalement **fail-closed** — PAS de
+        surcharge du global par fichier (l'héritage global→stack existe
+        déjà dans `applyDefaults`). À faire seulement si le besoin
+        d'automatisation multi-hôtes se matérialise
 - [ ] **Multi-notifiers** (F31–F33) : webhook générique (Teams/Google Chat) +
       SMTP, filtrage par événement et par canal
 - [ ] **Heartbeat Uptime Kuma** par stack (F36)
@@ -95,6 +105,9 @@ n'existe dans doco-cd.
 | **Build d'images** | C'est le travail d'une CI, pas d'un déployeur |
 | **Sources OCI, providers de secrets externes** (Vault, 1Password…) | sops + age suffisent ; chaque provider est une surface de maintenance |
 | **Zéro-downtime dans plico** | Si nécessaire un jour : blue-green derrière Traefik/Caddy, orchestré par les hooks pre/post-deploy existants — hors du binaire |
+| **SIGHUP (reload à chaud, F22)** | `systemctl restart` fait déjà tout, correctement : drain des runs en vol, ancres persistées, fenêtre ouverte ré-ouverte — durement acquis (3 rounds de revue). Rejouer cette logique en process vivant (stacks retirées pendant un run, schedule modifié fenêtre ouverte…) = la partie la plus délicate du code, pour un gain nul avec un poller à 60 s |
+| **Deep-merge config.d (F21)** | L'héritage global→stack existe nativement (`applyDefaults` : schedule, window, check, hook_timeout) ; la sémantique de fusion scalaire/map/tableau + champs protégés est le point de complexité documenté de doco-cd. À l'échelle de quelques stacks, un seul fichier reste lisible ; si besoin un jour : `stacks_dir` concaténé sans merge (cf. v1) |
+| **Stack invalide ignorée + alerte (F23)** | Contraire à « échouer bruyamment » : une stack silencieusement non gérée (alerte ratée = fenêtres manquées, ancre qui dérive) est pire qu'un daemon qui **refuse de démarrer** avec un message précis. Le filet est `plico validate` avant restart |
 
 ## Mémo sécurité (contexte, pas une tâche)
 
