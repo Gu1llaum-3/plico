@@ -25,6 +25,7 @@ type StackHealth struct {
 	UpdatedAt       *time.Time `json:"updated_at,omitempty"`
 	RunningSince    *time.Time `json:"running_since,omitempty"`
 	LastOutcome     string     `json:"last_outcome,omitempty"`
+	LastOutcomeAt   *time.Time `json:"last_outcome_at,omitempty"`
 	NextRun         *time.Time `json:"next_run,omitempty"`
 	QueuedSHA       string     `json:"queued_sha,omitempty"` // pending revision announced by a check (F6)
 }
@@ -51,7 +52,11 @@ func buildStatus(sched *scheduler.Scheduler, store *state.Store,
 	}
 	persisted := store.All()
 	for name, live := range snap.Stacks {
-		h := StackHealth{RunningSince: live.RunningSince, LastOutcome: live.LastOutcome, NextRun: live.NextRun}
+		h := StackHealth{
+			RunningSince: live.RunningSince,
+			LastOutcome:  live.LastOutcome, LastOutcomeAt: live.LastOutcomeAt,
+			NextRun: live.NextRun,
+		}
 		if p, ok := persisted[name]; ok {
 			h.LastDeployedSHA = p.LastDeployedSHA
 			h.LastStatus = p.LastStatus

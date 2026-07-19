@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ var serveConfigPath string
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Run the plico daemon (polling loop + /healthz)",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return serve(serveConfigPath)
 	},
@@ -62,7 +64,10 @@ func serve(configPath string) error {
 	if err := os.MkdirAll(cfg.BaseDir, 0o755); err != nil {
 		return err
 	}
-	store, err := state.Open(filepath.Join(cfg.BaseDir, "state.json"))
+	if err := os.MkdirAll(filepath.Dir(cfg.StateFile), 0o750); err != nil {
+		return err
+	}
+	store, err := state.Open(cfg.StateFile)
 	if err != nil {
 		return err
 	}
@@ -91,19 +96,23 @@ func serve(configPath string) error {
 	if err := sockSrv.Listen(); err != nil {
 		return err
 	}
+	defer sockSrv.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	serveErr := make(chan error, 2)
 	go func() {
 		log.Info("healthz listening", "addr", cfg.Health.Listen)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("healthz server failed", "error", err)
+			serveErr <- fmt.Errorf("healthz server: %w", err)
 		}
 	}()
 	go func() {
-		if err := sockSrv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := sockSrv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			log.Error("client API server failed", "error", err)
+			serveErr <- fmt.Errorf("client API server: %w", err)
 		}
 	}()
 
@@ -113,12 +122,37 @@ func serve(configPath string) error {
 		"poll_interval", cfg.PollInterval.String(),
 		"base_dir", cfg.BaseDir,
 	)
-	sched.Run(ctx) // blocks until SIGINT/SIGTERM, drains in-flight runs
+	schedDone := make(chan struct{})
+	go func() {
+		sched.Run(ctx)
+		close(schedDone)
+	}()
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-serveErr:
+		stop()
+	}
+	// Refuse new manual work immediately instead of leaving the client API
+	// open while scheduler-triggered runs drain.
+	if err := sockSrv.StopAccepting(); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Warn("stopping client API listener", "error", err)
+	}
+	<-schedDone
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.RunTimeout.Duration+5*time.Second)
 	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
-	_ = sockSrv.Shutdown(shutdownCtx)
+	healthErr := server.Shutdown(shutdownCtx)
+	socketErr := sockSrv.Shutdown(shutdownCtx)
+	if runErr != nil {
+		return runErr
+	}
+	if healthErr != nil {
+		return fmt.Errorf("shutting down healthz server: %w", healthErr)
+	}
+	if socketErr != nil {
+		return fmt.Errorf("shutting down client API server: %w", socketErr)
+	}
 	log.Info("plico stopped")
 	return nil
 }

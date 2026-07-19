@@ -79,12 +79,38 @@ s'exécute une seule fois (première occurrence).
 
 ## Installation
 
+Dernière version stable :
+
 ```sh
-mise install          # go, lefthook, golangci-lint, sops, age (versions dans mise.toml)
+curl -fsSLO https://raw.githubusercontent.com/Gu1llaum-3/plico/main/install.sh
+less install.sh
+sudo sh install.sh
+```
+
+Version précise ou binaire déjà téléchargé :
+
+```sh
+sudo sh install.sh --version v1.2.3
+sudo sh install.sh --binary ./plico --sha256 <sha256>
+```
+
+Sous Linux/systemd, l'installateur prépare l'utilisateur de service, les
+répertoires, `/etc/plico/plico.env` et l'unité systemd. Sans configuration
+active il n'active pas le service : copier et adapter
+`/etc/plico/config.toml.example`, puis relancer l'installateur avec
+`--config`. Sur Darwin et FreeBSD, seule l'installation du binaire est faite.
+Voir [le guide d'installation](docs/installation.md) pour les mises à jour,
+le mode hors-ligne, les permissions Docker et la migration des chemins.
+
+Installation depuis les sources pour contribuer :
+
+```sh
+mise install
 mise run build        # → bin/plico
 ```
 
-Tâches disponibles : `mise run build | test | lint | fmt | smoke`.
+Tâches disponibles : `mise run build | test | lint | fmt | smoke |
+install-test | release-test | shellcheck`.
 
 `mise run smoke` exécute [`test/smoke.sh`](test/smoke.sh) : un environnement
 GitOps complet en local (repo git `file://`, vraie stack Docker, secrets
@@ -96,7 +122,8 @@ par le gate de backup. Nécessite un daemon Docker.
 
 Copier [`config.example.toml`](config.example.toml) vers
 `/etc/plico/config.toml`. Les secrets (tokens git, ntfy) passent par
-interpolation `${ENV_VAR}` — une variable absente empêche le démarrage.
+interpolation `${ENV_VAR}` — une variable absente empêche le démarrage du
+daemon et la commande `validate`.
 
 ```sh
 bin/plico serve --config /etc/plico/config.toml
@@ -107,6 +134,22 @@ bin/plico serve --config /etc/plico/config.toml
 - Logs JSON structurés (slog), un `run_id` de corrélation par déploiement.
 - Notifications ntfy orientées échec : `deploy_queued`, `deploy_start`,
   `pre_hook_failed`, `pre_hook_skipped`, `deploy_failed`, `deploy_success`.
+
+### Layout système
+
+Les nouvelles installations séparent données persistantes et runtime :
+
+| Chemin | Contenu | Sauvegarde |
+|---|---|---|
+| `/opt/docker/<stack>` | worktrees Git, reconstructibles | optionnelle |
+| `/var/lib/plico/state.json` | SHA, échecs, files d'attente, ancres cron | **oui** |
+| `/run/plico/plico.sock*` | socket et verrou volatils | non |
+| `/etc/plico` | configuration, environnement, clé age | **oui** |
+
+Ne jamais placer une base ou des uploads irremplaçables dans un worktree :
+plico peut le supprimer et le recloner pour réparer Git. Les anciennes
+configurations sans `state_file` ni `[api].socket` conservent exactement le
+layout historique sous `base_dir`.
 
 ### Secrets SOPS : chiffrement partiel recommandé
 
@@ -134,8 +177,8 @@ déchiffrement — plico échouera au stage `sops` avec « MAC mismatch ».
 
 ### CLI cliente
 
-Le daemon expose une API locale sur un socket unix (`<base_dir>/plico.sock`
-par défaut, `[api] socket` pour changer). Les commandes passent par les
+Le daemon expose une API locale sur un socket unix (`[api] socket`, recommandé
+à `/run/plico/plico.sock`; fallback historique `<base_dir>/plico.sock`). Les commandes passent par les
 verrous du daemon — jamais de déploiement concurrent au scheduler :
 
 ```sh
@@ -147,6 +190,10 @@ plico deploy-now --stack X --force --skip-pre # saute le gate de backup (bruyant
 plico dry-run    --stack X        # delta + commits en attente, sans agir
 plico validate                    # vérifie la config sans démarrer
 ```
+
+Les commandes clientes ne chargent que `base_dir` et `[api].socket` : elles
+n'ont pas besoin des tokens Git/ntfy présents uniquement dans l'environnement
+systemd. `--socket` évite entièrement la lecture de la configuration.
 
 `--skip-pre` est refusé sans `--force` — côté client **et** côté daemon — et
 déclenche une notification `pre_hook_skipped` (F30). Toutes les commandes
@@ -164,22 +211,10 @@ système.
 Le baby-sitting du process est délégué au superviseur ; plico garde le
 scheduling interne.
 
-```ini
-[Unit]
-Description=plico GitOps deployer
-After=network-online.target docker.service
-
-[Service]
-ExecStart=/usr/local/bin/plico serve --config /etc/plico/config.toml
-Restart=always
-RestartSec=5
-Environment=SOPS_AGE_KEY_FILE=/etc/plico/age.key
-Environment=PLICO_BITBUCKET_TOKEN=…   # ou EnvironmentFile=
-# SIGHUP réservé au rechargement de conf (v1)
-
-[Install]
-WantedBy=multi-user.target
-```
+L'installateur déploie [`packaging/plico.service`](packaging/plico.service).
+`RuntimeDirectory=plico` crée `/run/plico`, `StateDirectory=plico` prépare
+`/var/lib/plico`, et `EnvironmentFile=-/etc/plico/plico.env` garde les secrets
+hors de l'unité. Le `-` rend le fichier optionnel sur une installation neuve.
 
 ## Rollback (v1 = manuel, assumé)
 

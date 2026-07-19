@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -40,6 +43,50 @@ func TestPrintResultsExitSemantics(t *testing.T) {
 	if err == nil {
 		t.Error("check-now must exit non-zero on a failed stack")
 	}
+}
+
+func TestPublicHelpDoesNotExposeFeatureIDs(t *testing.T) {
+	for _, cmd := range rootCmd.Commands() {
+		if strings.Contains(cmd.Short, "(F") {
+			t.Errorf("%s help exposes an internal feature ID: %q", cmd.Name(), cmd.Short)
+		}
+	}
+}
+
+func TestCommandsRejectPositionalArguments(t *testing.T) {
+	commands := make(map[string]*cobra.Command)
+	for _, cmd := range rootCmd.Commands() {
+		commands[cmd.Name()] = cmd
+	}
+	for _, name := range []string{"check-now", "deploy-now", "dry-run", "serve", "status", "validate", "version"} {
+		cmd := commands[name]
+		if cmd == nil {
+			t.Fatalf("command %q is not registered", name)
+		}
+		if err := cmd.Args(cmd, []string{"unexpected"}); err == nil {
+			t.Errorf("%s accepts an unexpected positional argument", name)
+		}
+	}
+}
+
+func TestClientSocketResolutionIgnoresDaemonSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `
+base_dir = "/opt/docker"
+[api]
+socket = "/run/plico/plico.sock"
+[git.auths."example.com"]
+password = "${PLICO_UNAVAILABLE_CLIENT_TOKEN}"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conn := &clientConn{configPath: path}
+	client, err := conn.client()
+	if err != nil {
+		t.Fatalf("client should not require daemon secrets: %v", err)
+	}
+	client.CloseIdleConnections()
 }
 
 type nopWriter struct{}

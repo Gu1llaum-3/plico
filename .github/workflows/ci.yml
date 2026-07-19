@@ -20,8 +20,27 @@ jobs:
       - name: Unit tests
         run: mise run test
 
+      - name: Shell lint
+        run: mise run shellcheck
+
+      - name: Installer tests
+        run: mise run install-test
+
+      - name: Release snapshot contract
+        run: mise run release-test
+
       # Full end-to-end: local git origin, real docker compose, sops+age
       # partial encryption, backup gate. Docker is preinstalled on
       # ubuntu-latest runners.
       - name: Smoke test
         run: mise run smoke
+
+  installer-platforms:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v2
+      - run: mise run install-test

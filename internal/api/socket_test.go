@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -121,6 +122,20 @@ func TestUnknownStackIs404(t *testing.T) {
 	}
 }
 
+func TestActionRequestRequiresExplicitKnownFields(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	for _, body := range []string{`{}`, `{"stak":"web"}`, `{"stack":"web"} {"stack":"db"}`} {
+		rec := do(t, s, http.MethodPost, "/v1/deploy", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, rec.Code)
+		}
+	}
+	if len(trigger.deploys) != 0 {
+		t.Fatalf("invalid requests triggered %d deployments", len(trigger.deploys))
+	}
+}
+
 func TestCheckAndDryRun(t *testing.T) {
 	t.Parallel()
 	s, trigger := socketSetup(t)
@@ -140,6 +155,12 @@ func TestCheckAndDryRun(t *testing.T) {
 	// dry-run refuses fan-out.
 	if rec := do(t, s, http.MethodPost, "/v1/dry-run", `{"stack":"*"}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("dry-run all: status = %d, want 400", rec.Code)
+	}
+	if rec := do(t, s, http.MethodPost, "/v1/check", `{"stack":"web","force":true}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("check with deploy option: status = %d, want 400", rec.Code)
+	}
+	if rec := do(t, s, http.MethodPost, "/v1/dry-run", `{"stack":"web","skip_post":true}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("dry-run with deploy option: status = %d, want 400", rec.Code)
 	}
 }
 
@@ -227,6 +248,57 @@ func TestListenRefusesLiveDaemonSocket(t *testing.T) {
 	}
 }
 
+func TestConcurrentListenHasSingleWinner(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(shortSocketDir(t), "plico.sock")
+	servers := []*SocketServer{socketServerAt(t, path), socketServerAt(t, path)}
+	errs := make(chan error, len(servers))
+	for _, s := range servers {
+		go func() { errs <- s.Listen() }()
+	}
+	winners := 0
+	for range servers {
+		if err := <-errs; err == nil {
+			winners++
+		}
+	}
+	for _, s := range servers {
+		s.Close()
+	}
+	if winners != 1 {
+		t.Fatalf("successful concurrent listeners = %d, want 1", winners)
+	}
+}
+
+func TestShutdownDeadlineBoundsPartialRequest(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(shortSocketDir(t), "plico.sock")
+	s := socketServerAt(t, path)
+	defer s.Close()
+	if err := s.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = s.Serve() }()
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "POST /v1/deploy HTTP/1.1\r\nHost: plico\r\nContent-Length: 100\r\n\r\n{")
+	time.Sleep(20 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if err := s.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("Shutdown ignored its deadline and took %s", elapsed)
+	}
+}
+
 func TestListenReplacesStaleSocket(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(shortSocketDir(t), "plico.sock")
@@ -245,30 +317,30 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 	_ = s.Shutdown(context.Background())
 }
 
-func TestShutdownDoesNotRemoveSuccessorSocket(t *testing.T) {
+func TestShutdownKeepsStartLockUntilDrainCompletes(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(shortSocketDir(t), "plico.sock")
 	s1 := socketServerAt(t, path)
 	if err := s1.Listen(); err != nil {
 		t.Fatal(err)
 	}
-	// A successor replaces the path while s1 is still draining (simulated
-	// by an out-of-band remove + rebind, as after a crash-recover race).
+	// Removing the socket path must not let a successor bypass the
+	// process-lifetime lock while the first daemon is still draining.
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 	s2 := socketServerAt(t, path)
-	if err := s2.Listen(); err != nil {
-		t.Fatal(err)
+	if err := s2.Listen(); err == nil {
+		t.Fatal("successor started before the first daemon completed shutdown")
 	}
-	defer func() { _ = s2.Shutdown(context.Background()) }()
 
 	if err := s1.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("dying daemon removed the successor's live socket: %v", err)
+	if err := s2.Listen(); err != nil {
+		t.Fatalf("successor could not start after shutdown: %v", err)
 	}
+	defer func() { _ = s2.Shutdown(context.Background()) }()
 }
 
 func TestSocketStatusIncludesStacks(t *testing.T) {

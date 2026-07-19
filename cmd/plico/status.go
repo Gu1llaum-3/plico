@@ -15,13 +15,14 @@ func init() {
 	conn := &clientConn{}
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Per-stack status: last run, deployed SHA, pending revision, next window (F27)",
+		Short: "Per-stack status: last run, deployed SHA, pending revision, next window",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var resp api.StatusResponse
-			if err := conn.call("GET", "/v1/status", nil, &resp); err != nil {
+			if err := conn.call(cmd.Context(), "GET", "/v1/status", nil, &resp); err != nil {
 				return err
 			}
-			fmt.Printf("daemon: %s (last tick %s)\n\n", resp.Status, resp.LastTick.Format(time.RFC3339))
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "daemon: %s (last tick %s)\n\n", resp.Status, resp.LastTick.Format(time.RFC3339))
 
 			names := make([]string, 0, len(resp.Stacks))
 			for n := range resp.Stacks {
@@ -34,6 +35,14 @@ func init() {
 			for _, n := range names {
 				st := resp.Stacks[n]
 				status := st.LastStatus
+				if st.LastOutcome != "" && st.LastOutcomeAt != nil &&
+					(st.UpdatedAt == nil || st.LastOutcomeAt.After(*st.UpdatedAt)) {
+					if st.LastOutcome == "deployed" && st.LastStatus != "" {
+						status = st.LastStatus
+					} else {
+						status = st.LastOutcome
+					}
+				}
 				if st.RunningSince != nil {
 					status = "running"
 				} else if status == "" {

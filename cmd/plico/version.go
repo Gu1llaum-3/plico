@@ -14,6 +14,7 @@ var version = "dev"
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the plico version",
+	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		v := version
 		if v == "dev" {

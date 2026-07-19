@@ -17,8 +17,36 @@ jobs:
 
       - uses: jdx/mise-action@v2
 
+      - name: Validate SemVer tag
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          printf '%s\n' "$tag" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [ "${tag#*-}" != "$tag" ]; then
+            while IFS= read -r identifier; do
+              if printf '%s\n' "$identifier" | grep -Eq '^0[0-9]+$'; then exit 1; fi
+            done < <(printf '%s\n' "${tag#*-}" | tr '.' '\n')
+          fi
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Shell lint
+        run: mise run shellcheck
+
       - name: Run tests before releasing
         run: mise run test
+
+      - name: Installer tests
+        run: mise run install-test
+
+      - name: Validate GoReleaser config
+        run: goreleaser check
+
+      - name: Smoke test
+        run: mise run smoke
+
+      - name: Validate release artifacts
+        run: mise run release-test
 
       - name: GoReleaser
         run: goreleaser release --clean

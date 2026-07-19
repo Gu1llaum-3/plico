@@ -51,11 +51,12 @@ type Scheduler struct {
 	loc          *time.Location
 	catchUpLimit int // per-instance so tests can exercise the abort path
 
-	mu       sync.Mutex
-	lastTick time.Time // carries a monotonic reading: /healthz liveness must be immune to wall-clock steps
-	running  map[string]time.Time
-	outcomes map[string]deploy.Outcome
-	scheds   map[string]*stackSched // only stacks with a cron schedule
+	mu        sync.Mutex
+	lastTick  time.Time // carries a monotonic reading: /healthz liveness must be immune to wall-clock steps
+	running   map[string]time.Time
+	outcomes  map[string]deploy.Outcome
+	outcomeAt map[string]time.Time
+	scheds    map[string]*stackSched // only stacks with a cron schedule
 }
 
 // stackSched tracks one stack's deployment window state.
@@ -73,9 +74,10 @@ type stackSched struct {
 
 // StackStatus is one stack's live view for /healthz.
 type StackStatus struct {
-	RunningSince *time.Time `json:"running_since,omitempty"`
-	LastOutcome  string     `json:"last_outcome,omitempty"`
-	NextRun      *time.Time `json:"next_run,omitempty"` // next window opening (scheduled stacks only)
+	RunningSince  *time.Time `json:"running_since,omitempty"`
+	LastOutcome   string     `json:"last_outcome,omitempty"`
+	LastOutcomeAt *time.Time `json:"last_outcome_at,omitempty"`
+	NextRun       *time.Time `json:"next_run,omitempty"` // next window opening (scheduled stacks only)
 }
 
 // Snapshot feeds the semantic healthcheck (F35).
@@ -102,6 +104,7 @@ func NewAt(cfg *config.Config, d StackRunner, store *state.Store, log *slog.Logg
 		catchUpLimit: catchUpLimit,
 		running:      map[string]time.Time{},
 		outcomes:     map[string]deploy.Outcome{},
+		outcomeAt:    map[string]time.Time{},
 		scheds:       map[string]*stackSched{},
 	}
 	nowLoc := now.In(s.loc)
@@ -365,6 +368,7 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig, checkOnly
 	}
 	if outcome != deploy.OutcomeSkipped {
 		s.outcomes[st.Name] = outcome
+		s.outcomeAt[st.Name] = time.Now()
 		// A run actually happened: account the firing it was dispatched
 		// for. A skipped run (F37) must not consume the firing — the window
 		// keeps retrying on later ticks.
@@ -435,6 +439,10 @@ func (s *Scheduler) Snapshot() Snapshot {
 		}
 		if o, ok := s.outcomes[st.Name]; ok {
 			status.LastOutcome = o.String()
+			if t, ok := s.outcomeAt[st.Name]; ok {
+				tt := t
+				status.LastOutcomeAt = &tt
+			}
 		}
 		if ss, ok := s.scheds[st.Name]; ok && !ss.next.IsZero() {
 			// Always the next FUTURE firing: reporting the current window's

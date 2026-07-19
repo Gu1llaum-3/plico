@@ -2,9 +2,12 @@
 # Secrets are referenced with ${ENV_VAR} and interpolated at load time;
 # never write a token literally in this file (F20).
 
-# Where stack clones and state.json live. Readable host-path layout:
-# /opt/docker/<stack>/ — easy to back up with restic.
+# Git worktrees live under /opt/docker/<stack>. They may be removed and
+# recloned after Git corruption: never store irreplaceable mutable data here.
 base_dir = "/opt/docker"
+
+# Persistent deployment and schedule state. Back this file up.
+state_file = "/var/lib/plico/state.json"
 
 timezone = "Europe/Paris"
 
@@ -45,14 +48,13 @@ level = "info"                        # debug | info | warn | error
 listen = "127.0.0.1:9444"
 
 [api]
-# Unix socket for the client CLI (plico status / deploy-now / …).
-# Default: <base_dir>/plico.sock
-# socket = "/run/plico/plico.sock"
+# Volatile Unix socket for the client CLI. systemd creates /run/plico.
+socket = "/run/plico/plico.sock"
 
 [ntfy]
 # Failure-oriented notifications. Leave url empty to disable.
-url = "https://ntfy.example.com/plico"
-token = "${PLICO_NTFY_TOKEN}"
+# url = "https://ntfy.example.com/plico"
+# token = "${PLICO_NTFY_TOKEN}"
 
 [hooks]
 # Global fallbacks; a hook versioned in the repo (.deploy/pre-deploy.sh)
@@ -62,9 +64,9 @@ token = "${PLICO_NTFY_TOKEN}"
 timeout = "10m"
 
 # Git HTTPS credentials, one table per host. SSH remotes use the system agent.
-[git.auths."bitbucket.org"]
-username = "deploy-bot"
-password = "${PLICO_BITBUCKET_TOKEN}"
+# [git.auths."bitbucket.org"]
+# username = "deploy-bot"
+# password = "${PLICO_BITBUCKET_TOKEN}"
 
 # [git.auths."gitea.example.com"]
 # username = "plico"

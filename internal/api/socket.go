@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -38,8 +40,9 @@ type SocketServer struct {
 	log     *slog.Logger
 	server  *http.Server
 	ln      net.Listener
-	sockID  fileID         // identity of the socket file WE bound (see Shutdown)
-	actions sync.WaitGroup // in-flight manual runs, drained at shutdown
+	lock    *os.File // process-lifetime lock preventing concurrent daemons
+	sockID  fileID   // identity of the socket file WE bound (see Shutdown)
+	stop    sync.Once
 }
 
 // fileID identifies a file on disk (device + inode).
@@ -71,10 +74,10 @@ func NewSocket(cfg *config.Config, sched *scheduler.Scheduler, store *state.Stor
 	mux.HandleFunc("POST /v1/dry-run", s.handleDryRun)
 	s.server = &http.Server{
 		Handler: mux,
-		// No Read/WriteTimeout: a synchronous deploy-now legitimately takes
-		// minutes (the run itself is bounded by run_timeout). Header reads
-		// are bounded so an idle connection cannot hold Shutdown hostage.
+		// Responses may legitimately take minutes, but request bodies are tiny.
+		// Bound reads so a partial request cannot hold shutdown hostage.
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
 	}
 	return s
 }
@@ -83,6 +86,21 @@ func NewSocket(cfg *config.Config, sched *scheduler.Scheduler, store *state.Stor
 // it is world-connectable (see the staging-dir + rename below).
 func (s *SocketServer) Listen() error {
 	path := s.cfg.Api.Socket
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening socket lock: %w", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lock.Close()
+		return fmt.Errorf("another plico daemon is starting or running for %s", path)
+	}
+	s.lock = lock
+	success := false
+	defer func() {
+		if !success {
+			s.releaseLock()
+		}
+	}()
 
 	// A leftover socket from a crash must be replaced, but never steal the
 	// socket of a live daemon (accidental double start): probe it first.
@@ -105,21 +123,24 @@ func (s *SocketServer) Listen() error {
 			// own it. Never steal a socket we cannot prove dead.
 			return fmt.Errorf("socket %s exists and its owner may still be alive (probe: %v); refusing to replace it", path, dialErr)
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("inspecting socket: %w", err)
 	}
 
 	// Bind in a private 0700 staging dir, chmod, then atomically rename to
 	// the final path: at no point is a world-connectable socket reachable
 	// (unix sockets check permissions at connect time), and no process-wide
 	// umask fiddling is needed.
-	tmpDir := path + ".init"
-	if err := os.RemoveAll(tmpDir); err != nil {
+	tmpDir, err := os.MkdirTemp(filepath.Dir(path), ".plico-socket-")
+	if err != nil {
 		return err
 	}
-	if err := os.Mkdir(tmpDir, 0o700); err != nil {
+	if err := os.Chmod(tmpDir, 0o700); err != nil {
+		_ = os.RemoveAll(tmpDir)
 		return err
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
-	tmp := tmpDir + "/s"
+	tmp := filepath.Join(tmpDir, "s")
 	ln, err := net.Listen("unix", tmp)
 	if err != nil {
 		return err
@@ -141,6 +162,7 @@ func (s *SocketServer) Listen() error {
 	}
 	s.sockID, _ = statID(path)
 	s.log.Info("client API listening", "socket", path)
+	success = true
 	return nil
 }
 
@@ -149,18 +171,47 @@ func (s *SocketServer) Serve() error {
 	return s.server.Serve(s.ln)
 }
 
-// Shutdown stops accepting requests, removes the socket (only if it is
-// still OURS: during a long drain a successor daemon may have already bound
-// a fresh one at the same path), then waits for in-flight manual runs to
-// finish — a socket-triggered deploy gets the same drain guarantee as a
-// scheduled one (the runs themselves are bounded by run_timeout).
-func (s *SocketServer) Shutdown(ctx context.Context) error {
-	err := s.server.Shutdown(ctx)
-	if id, ok := statID(s.cfg.Api.Socket); ok && id == s.sockID {
-		_ = os.Remove(s.cfg.Api.Socket)
-	}
-	s.actions.Wait()
+// StopAccepting closes the listener and removes its path while preserving
+// active requests. The process lock remains held until Shutdown completes.
+func (s *SocketServer) StopAccepting() error {
+	var err error
+	s.stop.Do(func() {
+		if s.ln != nil {
+			err = s.ln.Close()
+		}
+		if id, ok := statID(s.cfg.Api.Socket); ok && id == s.sockID {
+			if removeErr := os.Remove(s.cfg.Api.Socket); err == nil {
+				err = removeErr
+			}
+		}
+	})
 	return err
+}
+
+// Shutdown stops accepting requests and waits for active handlers. The
+// process lock is released only after a successful drain.
+func (s *SocketServer) Shutdown(ctx context.Context) error {
+	stopErr := s.StopAccepting()
+	shutdownErr := s.server.Shutdown(ctx)
+	if shutdownErr != nil {
+		return shutdownErr
+	}
+	s.releaseLock()
+	return stopErr
+}
+
+// Close releases resources if startup or serving exits before Shutdown.
+func (s *SocketServer) Close() {
+	_ = s.StopAccepting()
+	s.releaseLock()
+}
+
+func (s *SocketServer) releaseLock() {
+	if s.lock != nil {
+		_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+		_ = s.lock.Close()
+		s.lock = nil
+	}
 }
 
 // Handler exposes the mux for tests.
@@ -170,7 +221,7 @@ func (s *SocketServer) Handler() http.Handler { return s.server.Handler }
 
 // ActionRequest is the body of /v1/check, /v1/deploy and /v1/dry-run.
 type ActionRequest struct {
-	Stack    string `json:"stack"` // "" or "*" = all stacks (not for dry-run)
+	Stack    string `json:"stack"` // "*" explicitly targets all stacks (not for dry-run)
 	Force    bool   `json:"force,omitempty"`
 	SkipPre  bool   `json:"skip_pre,omitempty"`
 	SkipPost bool   `json:"skip_post,omitempty"`
@@ -207,6 +258,14 @@ func (s *SocketServer) handleDryRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if req.Force || req.SkipPre || req.SkipPost {
+		httpError(w, http.StatusBadRequest, "dry-run does not accept deployment options")
+		return
+	}
+	if req.Stack == "" {
+		httpError(w, http.StatusBadRequest, "stack is required")
+		return
+	}
 	stacks, err := s.selectStacks(req.Stack)
 	if err != nil {
 		httpError(w, http.StatusNotFound, err.Error())
@@ -227,12 +286,6 @@ func (s *SocketServer) handleDryRun(w http.ResponseWriter, r *http.Request) {
 func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name string,
 	run func(context.Context, config.StackConfig, ActionRequest) string) {
 
-	// Counted from the very first line: a request still reading its body at
-	// shutdown must be covered by the drain, or the deploy it is about to
-	// start would be killed at process exit.
-	s.actions.Add(1)
-	defer s.actions.Done()
-
 	req, ok := s.decodeAction(w, r)
 	if !ok {
 		return
@@ -241,6 +294,14 @@ func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name
 	// enforced server-side so no client can bypass it.
 	if req.SkipPre && !req.Force {
 		httpError(w, http.StatusForbidden, "--skip-pre bypasses the backup gate and requires --force")
+		return
+	}
+	if name == "check" && (req.Force || req.SkipPre || req.SkipPost) {
+		httpError(w, http.StatusBadRequest, "check does not accept deployment options")
+		return
+	}
+	if req.Stack == "" {
+		httpError(w, http.StatusBadRequest, "stack is required; use \"*\" to target every stack")
 		return
 	}
 	stacks, err := s.selectStacks(req.Stack)
@@ -255,27 +316,39 @@ func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name
 	// disconnect) must not SIGKILL a docker compose up mid-flight.
 	ctx := context.WithoutCancel(r.Context())
 
-	results := make([]ActionResult, 0, len(stacks))
-	for _, st := range stacks {
-		results = append(results, ActionResult{
-			Stack:   st.Name,
-			Outcome: run(ctx, st, req),
-		})
+	results := make([]ActionResult, len(stacks))
+	var wg sync.WaitGroup
+	for i, st := range stacks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = ActionResult{Stack: st.Name, Outcome: run(ctx, st, req)}
+		}()
 	}
+	wg.Wait()
 	writeJSON(w, http.StatusOK, results)
 }
 
 func (s *SocketServer) decodeAction(w http.ResponseWriter, r *http.Request) (ActionRequest, bool) {
 	var req ActionRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return req, false
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "request body must contain exactly one JSON object")
 		return req, false
 	}
 	return req, true
 }
 
 func (s *SocketServer) selectStacks(name string) ([]config.StackConfig, error) {
-	if name == "" || name == "*" {
+	if name == "" {
+		return nil, fmt.Errorf("stack is required; use \"*\" to target every stack")
+	}
+	if name == "*" {
 		return s.cfg.Stacks, nil
 	}
 	for _, st := range s.cfg.Stacks {

@@ -366,6 +366,11 @@ func (d *Deployer) CheckStack(ctx context.Context, st config.StackConfig) Outcom
 	prev, _ := d.store.Get(st.Name)
 	switch newSHA {
 	case prev.LastDeployedSHA:
+		if prev.LastQueuedSHA != "" {
+			d.saveState(log, st.Name, func(s2 *state.StackState) {
+				s2.LastQueuedSHA = ""
+			})
+		}
 		return OutcomeUpToDate
 	case prev.LastQueuedSHA:
 		return OutcomeQueued // already announced, stays pending
@@ -415,10 +420,9 @@ func (d *Deployer) DryRun(ctx context.Context, st config.StackConfig) (DryRunRep
 	if !report.UpToDate && prev.LastDeployedSHA != "" {
 		commits, err := d.git.LogRange(ctx, st.Repo, dir, prev.LastDeployedSHA, newSHA)
 		if err != nil {
-			d.log.Warn("dry-run: could not list pending commits", "stack", st.Name, "error", err)
-		} else {
-			report.Commits = commits
+			return DryRunReport{}, fmt.Errorf("listing pending commits: %w", err)
 		}
+		report.Commits = commits
 	}
 	return report, nil
 }

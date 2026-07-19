@@ -32,11 +32,11 @@ func (c *clientConn) registerClientFlags(cmd *cobra.Command) {
 func (c *clientConn) client() (*http.Client, error) {
 	socket := c.socket
 	if socket == "" {
-		cfg, err := config.Load(c.configPath)
+		var err error
+		socket, err = config.ResolveSocket(c.configPath)
 		if err != nil {
 			return nil, fmt.Errorf("cannot locate the daemon socket from %s (%w); use --socket", c.configPath, err)
 		}
-		socket = cfg.Api.Socket
 	}
 	return &http.Client{
 		// No timeout: deploy-now legitimately takes minutes; the daemon
@@ -52,11 +52,12 @@ func (c *clientConn) client() (*http.Client, error) {
 
 // call POSTs (or GETs when body is nil) to the daemon API and decodes the
 // JSON response into out. Non-2xx responses surface the server's error.
-func (c *clientConn) call(method, path string, body, out any) error {
+func (c *clientConn) call(ctx context.Context, method, path string, body, out any) error {
 	client, err := c.client()
 	if err != nil {
 		return err
 	}
+	defer client.CloseIdleConnections()
 	var reqBody bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&reqBody).Encode(body); err != nil {
@@ -64,7 +65,7 @@ func (c *clientConn) call(method, path string, body, out any) error {
 		}
 	}
 	// The host is ignored for unix sockets but required by net/http.
-	req, err := http.NewRequest(method, "http://plico"+path, &reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, "http://plico"+path, &reqBody)
 	if err != nil {
 		return err
 	}

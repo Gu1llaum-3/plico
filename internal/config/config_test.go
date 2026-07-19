@@ -66,6 +66,12 @@ func TestLoadValidConfigWithDefaults(t *testing.T) {
 	if cfg.Health.Listen != "127.0.0.1:9444" {
 		t.Errorf("health.listen default = %q", cfg.Health.Listen)
 	}
+	if cfg.StateFile != "/opt/docker/state.json" {
+		t.Errorf("state_file legacy default = %q", cfg.StateFile)
+	}
+	if cfg.Api.Socket != "/opt/docker/plico.sock" {
+		t.Errorf("api.socket legacy default = %q", cfg.Api.Socket)
+	}
 	web := cfg.Stacks[0]
 	if web.Ref != "main" || web.ComposeFile != "docker-compose.yml" || !web.ForcePullEnabled() {
 		t.Errorf("stack defaults not applied: %+v", web)
@@ -99,6 +105,8 @@ repo = "https://example.com/repo.git"
 		{"unknown key", base + "\nnot_a_key = true\n", "unknown key"},
 		{"missing base_dir", strings.Replace(base, `base_dir = "/opt/docker"`, "", 1), "base_dir"},
 		{"relative base_dir", strings.Replace(base, "/opt/docker", "opt/docker", 1), "absolute"},
+		{"relative api socket", base + "\n[api]\nsocket = \"plico.sock\"\n", "api.socket must be an absolute path"},
+		{"relative state file", "state_file = \"state.json\"\n" + base, "state_file must be an absolute path"},
 		{"no stacks", `base_dir = "/opt/docker"`, "at least one"},
 		{"duplicate names", base + "\n[[stack]]\nname = \"app\"\nrepo = \"https://x/y.git\"\n", "duplicate"},
 		{"bad name", strings.Replace(base, `name = "app"`, `name = "-bad!"`, 1), "invalid name"},
@@ -122,6 +130,23 @@ repo = "https://example.com/repo.git"
 				t.Fatalf("error %q does not contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestExplicitStateFile(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+base_dir = "/opt/docker"
+state_file = "/var/lib/plico/state.json"
+[[stack]]
+name = "app"
+repo = "https://example.com/repo.git"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateFile != "/var/lib/plico/state.json" {
+		t.Errorf("state_file = %q", cfg.StateFile)
 	}
 }
 

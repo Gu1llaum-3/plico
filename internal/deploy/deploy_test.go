@@ -95,6 +95,7 @@ type harness struct {
 	events   *eventRecorder
 	store    *state.Store
 	worktree string
+	gitFake  *execx.FakeRunner
 }
 
 const (
@@ -162,7 +163,7 @@ func newHarness(t *testing.T) *harness {
 		gitFake, // sops tmpfs path unused in these tests
 		discard(),
 	)
-	return &harness{deployer: d, cfg: cfg, stack: cfg.Stacks[0], runtime: rt, events: events, store: store, worktree: worktree}
+	return &harness{deployer: d, cfg: cfg, stack: cfg.Stacks[0], runtime: rt, events: events, store: store, worktree: worktree, gitFake: gitFake}
 }
 
 func (h *harness) writePreHook(t *testing.T, body string) {
@@ -575,6 +576,24 @@ func TestCheckStackUpToDateIsSilent(t *testing.T) {
 	}
 }
 
+func TestCheckStackClearsObsoleteQueuedRevision(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	if err := h.store.Put("web", state.StackState{
+		LastDeployedSHA: newSHA,
+		LastQueuedSHA:   oldSHA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if outcome := h.deployer.CheckStack(context.Background(), h.stack); outcome != OutcomeUpToDate {
+		t.Fatalf("outcome = %s", outcome)
+	}
+	st, _ := h.store.Get("web")
+	if st.LastQueuedSHA != "" {
+		t.Errorf("obsolete queued SHA was not cleared: %q", st.LastQueuedSHA)
+	}
+}
+
 func TestForceRedeploysSameRevision(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -643,6 +662,21 @@ func TestDryRunReportsDeltaWithoutActing(t *testing.T) {
 	st, _ := h.store.Get("web")
 	if st.LastDeployedSHA != oldSHA {
 		t.Errorf("dry-run must not move state, got %q", st.LastDeployedSHA)
+	}
+}
+
+func TestDryRunFailsWhenPendingCommitsCannotBeListed(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	original := h.gitFake.Match
+	h.gitFake.Match = func(c execx.Cmd) (execx.Result, error) {
+		if c.Name == "git" && c.Args[0] == "log" {
+			return execx.Result{}, errors.New("old revision is unavailable")
+		}
+		return original(c)
+	}
+	if _, err := h.deployer.DryRun(context.Background(), h.stack); err == nil || !strings.Contains(err.Error(), "listing pending commits") {
+		t.Fatalf("DryRun error = %v", err)
 	}
 }
 

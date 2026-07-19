@@ -12,7 +12,8 @@ func init() {
 	var configPath string
 	cmd := &cobra.Command{
 		Use:   "validate",
-		Short: "Validate the configuration without starting the daemon (F29)",
+		Short: "Validate the configuration without starting the daemon",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(configPath)
 			if err != nil {

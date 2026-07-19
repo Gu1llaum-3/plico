@@ -60,14 +60,15 @@ func init() {
 		conn, sel := &clientConn{}, &stackSelection{}
 		cmd := &cobra.Command{
 			Use:   "check-now",
-			Short: "Force an immediate check (fetch + diff, no deploy) outside any schedule (F25)",
+			Short: "Force an immediate check (fetch + diff, no deploy) outside any schedule",
+			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				target, err := sel.target()
 				if err != nil {
 					return err
 				}
 				var results []api.ActionResult
-				if err := conn.call("POST", "/v1/check", api.ActionRequest{Stack: target}, &results); err != nil {
+				if err := conn.call(cmd.Context(), "POST", "/v1/check", api.ActionRequest{Stack: target}, &results); err != nil {
 					return err
 				}
 				return printResults(cmd, results, "check failed",
@@ -85,18 +86,19 @@ func init() {
 		var force, skipPre, skipPost bool
 		cmd := &cobra.Command{
 			Use:   "deploy-now",
-			Short: "Force an immediate deployment, bypassing the schedule window (F26)",
+			Short: "Force an immediate deployment, bypassing the schedule window",
+			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				target, err := sel.target()
 				if err != nil {
 					return err
 				}
 				if skipPre && !force {
-					return fmt.Errorf("--skip-pre bypasses the backup gate and requires --force (F30)")
+					return fmt.Errorf("--skip-pre bypasses the backup gate and requires --force")
 				}
 				var results []api.ActionResult
 				req := api.ActionRequest{Stack: target, Force: force, SkipPre: skipPre, SkipPost: skipPost}
-				if err := conn.call("POST", "/v1/deploy", req, &results); err != nil {
+				if err := conn.call(cmd.Context(), "POST", "/v1/deploy", req, &results); err != nil {
 					return err
 				}
 				return printResults(cmd, results, "not deployed",
@@ -117,13 +119,14 @@ func init() {
 		var stack string
 		cmd := &cobra.Command{
 			Use:   "dry-run",
-			Short: "Show what would be deployed (git delta, pending commits) without acting (F28)",
+			Short: "Show what would be deployed (git delta, pending commits) without acting",
+			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				if stack == "" {
 					return fmt.Errorf("--stack is required")
 				}
 				var report deploy.DryRunReport
-				if err := conn.call("POST", "/v1/dry-run", api.ActionRequest{Stack: stack}, &report); err != nil {
+				if err := conn.call(cmd.Context(), "POST", "/v1/dry-run", api.ActionRequest{Stack: stack}, &report); err != nil {
 					return err
 				}
 				out := cmd.OutOrStdout()

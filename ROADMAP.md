@@ -44,8 +44,12 @@ n'existe dans doco-cd.
       `deploy-now` (`--force` pour redéployer la révision courante — la
       sortie de panne post-verify), `dry-run` (delta + commits en attente),
       `validate` ; `--skip-pre` interdit sans `--force` (imposé côté daemon)
-      + notification `pre_hook_skipped` ; socket `<base_dir>/plico.sock`
-      (0660), actions sérialisées par les verrous du deployer
+      + notification `pre_hook_skipped` ; socket `/run/plico/plico.sock`
+      recommandé (`<base_dir>/plico.sock` compatible), actions sérialisées
+      par les verrous du deployer
+- [x] **Installateur de release** : détection OS/architecture, latest ou
+      version épinglée, binaire local, checksums, installation atomique,
+      configuration systemd idempotente et rollback d'upgrade
 - [ ] **config.d/<stack>.toml + SIGHUP** (F21–F23) : deep-merge (scalaire
       surchargé, map fusionnée, tableau REMPLACÉ, champs protégés non
       surchargeables), fichier invalide = stack ignorée + alerte

@@ -99,6 +99,7 @@ func (s StackConfig) ForcePullEnabled() bool {
 
 type Config struct {
 	BaseDir              string   `toml:"base_dir"`
+	StateFile            string   `toml:"state_file"`
 	Timezone             string   `toml:"timezone"`
 	PollInterval         Duration `toml:"poll_interval"`
 	RunTimeout           Duration `toml:"run_timeout"`
@@ -168,6 +169,9 @@ func (c *Config) applyDefaults() {
 	if c.Api.Socket == "" && c.BaseDir != "" {
 		c.Api.Socket = filepath.Join(c.BaseDir, "plico.sock")
 	}
+	if c.StateFile == "" && c.BaseDir != "" {
+		c.StateFile = filepath.Join(c.BaseDir, "state.json")
+	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
@@ -224,6 +228,12 @@ func (c *Config) Validate() error {
 	}
 	if !filepath.IsAbs(c.BaseDir) {
 		return fmt.Errorf("base_dir must be an absolute path, got %q", c.BaseDir)
+	}
+	if !filepath.IsAbs(c.Api.Socket) {
+		return fmt.Errorf("api.socket must be an absolute path, got %q", c.Api.Socket)
+	}
+	if !filepath.IsAbs(c.StateFile) {
+		return fmt.Errorf("state_file must be an absolute path, got %q", c.StateFile)
 	}
 	if _, err := time.LoadLocation(c.Timezone); err != nil {
 		return fmt.Errorf("timezone: %w", err)

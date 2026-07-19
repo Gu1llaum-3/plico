@@ -1,0 +1,25 @@
+[Unit]
+Description=plico GitOps deployer
+Documentation=https://github.com/Gu1llaum-3/plico
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=plico
+Group=plico
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=-/etc/plico/plico.env
+ExecStart=/usr/local/bin/plico serve --config /etc/plico/config.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=infinity
+RuntimeDirectory=plico
+RuntimeDirectoryMode=0750
+StateDirectory=plico
+StateDirectoryMode=0750
+WorkingDirectory=/opt/docker
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target
