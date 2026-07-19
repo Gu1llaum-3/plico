@@ -22,13 +22,15 @@ import (
 type fakeTrigger struct {
 	mu      sync.Mutex
 	deploys []deploy.RunOptions
+	ctxErrs []error
 	checks  int
 }
 
-func (f *fakeTrigger) RunStackWith(_ context.Context, _ config.StackConfig, opts deploy.RunOptions) deploy.Outcome {
+func (f *fakeTrigger) RunStackWith(ctx context.Context, _ config.StackConfig, opts deploy.RunOptions) deploy.Outcome {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deploys = append(f.deploys, opts)
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	return deploy.OutcomeDeployed
 }
 
@@ -136,6 +138,40 @@ func TestCheckAndDryRun(t *testing.T) {
 	// dry-run refuses fan-out.
 	if rec := do(t, s, http.MethodPost, "/v1/dry-run", `{"stack":"*"}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("dry-run all: status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDryRunUnknownStackIs404(t *testing.T) {
+	t.Parallel()
+	s, _ := socketSetup(t)
+	rec := do(t, s, http.MethodPost, "/v1/dry-run", `{"stack":"wbe"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (unknown stack, not a flags error)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "unknown stack") {
+		t.Errorf("body = %s", rec.Body.String())
+	}
+}
+
+func TestDeployDetachedFromClientContext(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	// The client disconnects (Ctrl-C): the request context is cancelled,
+	// but the deploy must run on a live context anyway.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/deploy",
+		strings.NewReader(`{"stack":"web"}`)).WithContext(ctx)
+	s.Handler().ServeHTTP(rec, req)
+
+	trigger.mu.Lock()
+	defer trigger.mu.Unlock()
+	if len(trigger.ctxErrs) != 1 {
+		t.Fatalf("deploys = %d, want 1", len(trigger.ctxErrs))
+	}
+	if trigger.ctxErrs[0] != nil {
+		t.Errorf("deploy ran on a cancelled context (%v): a client Ctrl-C would kill compose mid-flight", trigger.ctxErrs[0])
 	}
 }
 

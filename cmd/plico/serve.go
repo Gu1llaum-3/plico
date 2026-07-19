@@ -55,13 +55,8 @@ func serve(configPath string) error {
 	}
 	defer closeLog()
 
-	// tmpfs mode is validated once at startup, not at deploy time.
-	for _, st := range cfg.Stacks {
-		if st.SopsMode == "tmpfs" && len(st.SopsFiles) > 0 {
-			if err := sopsx.CheckTmpfs(sopsx.DefaultTmpfsRoot); err != nil {
-				return fmt.Errorf("stack %q: %w", st.Name, err)
-			}
-		}
+	if err := runtimeChecks(cfg); err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(cfg.BaseDir, 0o755); err != nil {
@@ -89,7 +84,13 @@ func serve(configPath string) error {
 	server := api.New(cfg.Health.Listen, sched, store,
 		cfg.PollInterval.Duration, cfg.RunTimeout.Duration)
 
+	// Bind the socket synchronously, before other goroutines run: the bind
+	// must happen under the restrictive umask (see SocketServer.Listen),
+	// and a double daemon start must fail here, loudly.
 	sockSrv := api.NewSocket(cfg, sched, store, deployer, log)
+	if err := sockSrv.Listen(); err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -101,7 +102,7 @@ func serve(configPath string) error {
 		}
 	}()
 	go func() {
-		if err := sockSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := sockSrv.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("client API server failed", "error", err)
 		}
 	}()
@@ -119,6 +120,25 @@ func serve(configPath string) error {
 	_ = server.Shutdown(shutdownCtx)
 	_ = sockSrv.Shutdown(shutdownCtx)
 	log.Info("plico stopped")
+	return nil
+}
+
+// runtimeChecks are the startup validations beyond config.Load: `plico
+// validate` (F29) runs the exact same set, so a config it accepts is a
+// config the daemon will start with.
+func runtimeChecks(cfg *config.Config) error {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(cfg.Log.Level)); err != nil {
+		return fmt.Errorf("log.level: %w", err)
+	}
+	// tmpfs mode is validated once at startup, not at deploy time.
+	for _, st := range cfg.Stacks {
+		if st.SopsMode == "tmpfs" && len(st.SopsFiles) > 0 {
+			if err := sopsx.CheckTmpfs(sopsx.DefaultTmpfsRoot); err != nil {
+				return fmt.Errorf("stack %q: %w", st.Name, err)
+			}
+		}
+	}
 	return nil
 }
 

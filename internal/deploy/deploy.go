@@ -224,9 +224,10 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		return OutcomeFailed
 	}
 
-	if !repeat && prev.LastQueuedSHA != newSHA {
+	if !repeat && prev.LastQueuedSHA != newSHA && newSHA != oldSHA {
 		// A pending revision already announced by an out-of-window check
-		// (F6) is not re-announced when its window finally applies it.
+		// (F6) is not re-announced when its window finally applies it, and
+		// a forced redeploy of the CURRENT revision has nothing queued.
 		ev(notify.DeployQueued, "", "")
 	}
 

@@ -12,13 +12,13 @@ import (
 	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
-type healthResponse struct {
+type StatusResponse struct {
 	Status   string                 `json:"status"`
 	LastTick time.Time              `json:"last_tick"`
-	Stacks   map[string]stackHealth `json:"stacks"`
+	Stacks   map[string]StackHealth `json:"stacks"`
 }
 
-type stackHealth struct {
+type StackHealth struct {
 	LastDeployedSHA string     `json:"last_deployed_sha,omitempty"`
 	LastStatus      string     `json:"last_status,omitempty"`
 	LastRunID       string     `json:"last_run_id,omitempty"`
@@ -33,7 +33,7 @@ type stackHealth struct {
 // scheduler ticked recently (< 2× poll interval) and no run has been in
 // flight longer than runTimeout.
 func buildStatus(sched *scheduler.Scheduler, store *state.Store,
-	pollInterval, runTimeout time.Duration) healthResponse {
+	pollInterval, runTimeout time.Duration) StatusResponse {
 
 	snap := sched.Snapshot()
 	now := time.Now()
@@ -45,13 +45,13 @@ func buildStatus(sched *scheduler.Scheduler, store *state.Store,
 		}
 	}
 
-	resp := healthResponse{Status: "ok", LastTick: snap.LastTick, Stacks: map[string]stackHealth{}}
+	resp := StatusResponse{Status: "ok", LastTick: snap.LastTick, Stacks: map[string]StackHealth{}}
 	if !healthy {
 		resp.Status = "degraded"
 	}
 	persisted := store.All()
 	for name, live := range snap.Stacks {
-		h := stackHealth{RunningSince: live.RunningSince, LastOutcome: live.LastOutcome, NextRun: live.NextRun}
+		h := StackHealth{RunningSince: live.RunningSince, LastOutcome: live.LastOutcome, NextRun: live.NextRun}
 		if p, ok := persisted[name]; ok {
 			h.LastDeployedSHA = p.LastDeployedSHA
 			h.LastStatus = p.LastStatus
@@ -89,6 +89,6 @@ func New(listen string, sched *scheduler.Scheduler, store *state.Store,
 }
 
 // statusFromConfig adapts buildStatus for the socket API.
-func statusFromConfig(sched *scheduler.Scheduler, store *state.Store, cfg *config.Config) healthResponse {
+func statusFromConfig(sched *scheduler.Scheduler, store *state.Store, cfg *config.Config) StatusResponse {
 	return buildStatus(sched, store, cfg.PollInterval.Duration, cfg.RunTimeout.Duration)
 }

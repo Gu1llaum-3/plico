@@ -18,6 +18,11 @@ func init() {
 			if err != nil {
 				return err
 			}
+			// Same startup checks as `plico serve`: a validated config is a
+			// config the daemon will actually start with.
+			if err := runtimeChecks(cfg); err != nil {
+				return err
+			}
 			scheduled := 0
 			for _, st := range cfg.Stacks {
 				if st.Schedule != "" {

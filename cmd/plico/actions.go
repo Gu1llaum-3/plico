@@ -2,22 +2,13 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Gu1llaum-3/plico/internal/api"
+	"github.com/Gu1llaum-3/plico/internal/deploy"
 )
-
-// actionRequest mirrors api.ActionRequest.
-type actionRequest struct {
-	Stack    string `json:"stack"`
-	Force    bool   `json:"force,omitempty"`
-	SkipPre  bool   `json:"skip_pre,omitempty"`
-	SkipPost bool   `json:"skip_post,omitempty"`
-}
-
-type actionResult struct {
-	Stack   string `json:"stack"`
-	Outcome string `json:"outcome"`
-}
 
 // stackSelection handles the shared --stack/--all pair (F25/F26).
 type stackSelection struct {
@@ -42,10 +33,20 @@ func (s *stackSelection) target() (string, error) {
 	}
 }
 
-func printResults(cmd *cobra.Command, results []actionResult) {
+// printResults prints per-stack outcomes and returns an error when any
+// stack failed or was skipped, so scripts can rely on the exit code.
+func printResults(cmd *cobra.Command, results []api.ActionResult) error {
+	var bad []string
 	for _, r := range results {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", r.Stack, r.Outcome)
+		if r.Outcome == "failed" || r.Outcome == "skipped" {
+			bad = append(bad, fmt.Sprintf("%s (%s)", r.Stack, r.Outcome))
+		}
 	}
+	if len(bad) > 0 {
+		return fmt.Errorf("not deployed: %s", strings.Join(bad, ", "))
+	}
+	return nil
 }
 
 func init() {
@@ -60,12 +61,11 @@ func init() {
 				if err != nil {
 					return err
 				}
-				var results []actionResult
-				if err := conn.call("POST", "/v1/check", actionRequest{Stack: target}, &results); err != nil {
+				var results []api.ActionResult
+				if err := conn.call("POST", "/v1/check", api.ActionRequest{Stack: target}, &results); err != nil {
 					return err
 				}
-				printResults(cmd, results)
-				return nil
+				return printResults(cmd, results)
 			},
 		}
 		conn.registerClientFlags(cmd)
@@ -88,13 +88,12 @@ func init() {
 				if skipPre && !force {
 					return fmt.Errorf("--skip-pre bypasses the backup gate and requires --force (F30)")
 				}
-				var results []actionResult
-				req := actionRequest{Stack: target, Force: force, SkipPre: skipPre, SkipPost: skipPost}
+				var results []api.ActionResult
+				req := api.ActionRequest{Stack: target, Force: force, SkipPre: skipPre, SkipPost: skipPost}
 				if err := conn.call("POST", "/v1/deploy", req, &results); err != nil {
 					return err
 				}
-				printResults(cmd, results)
-				return nil
+				return printResults(cmd, results)
 			},
 		}
 		conn.registerClientFlags(cmd)
@@ -116,15 +115,8 @@ func init() {
 				if stack == "" {
 					return fmt.Errorf("--stack is required")
 				}
-				var report struct {
-					Stack    string   `json:"stack"`
-					Ref      string   `json:"ref"`
-					OldSHA   string   `json:"old_sha"`
-					NewSHA   string   `json:"new_sha"`
-					UpToDate bool     `json:"up_to_date"`
-					Commits  []string `json:"commits"`
-				}
-				if err := conn.call("POST", "/v1/dry-run", actionRequest{Stack: stack}, &report); err != nil {
+				var report deploy.DryRunReport
+				if err := conn.call("POST", "/v1/dry-run", api.ActionRequest{Stack: stack}, &report); err != nil {
 					return err
 				}
 				out := cmd.OutOrStdout()

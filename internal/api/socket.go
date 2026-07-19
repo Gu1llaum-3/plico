@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/Gu1llaum-3/plico/internal/config"
 	"github.com/Gu1llaum-3/plico/internal/deploy"
@@ -33,6 +35,8 @@ type SocketServer struct {
 	trigger Trigger
 	log     *slog.Logger
 	server  *http.Server
+	ln      net.Listener
+	actions sync.WaitGroup // in-flight manual runs, drained at shutdown
 }
 
 func NewSocket(cfg *config.Config, sched *scheduler.Scheduler, store *state.Store,
@@ -44,34 +48,60 @@ func NewSocket(cfg *config.Config, sched *scheduler.Scheduler, store *state.Stor
 	mux.HandleFunc("POST /v1/check", s.handleCheck)
 	mux.HandleFunc("POST /v1/deploy", s.handleDeploy)
 	mux.HandleFunc("POST /v1/dry-run", s.handleDryRun)
-	// No Read/WriteTimeout: a synchronous deploy-now legitimately takes
-	// minutes; the run itself is bounded by run_timeout.
-	s.server = &http.Server{Handler: mux}
+	s.server = &http.Server{
+		Handler: mux,
+		// No Read/WriteTimeout: a synchronous deploy-now legitimately takes
+		// minutes (the run itself is bounded by run_timeout). Header reads
+		// are bounded so an idle connection cannot hold Shutdown hostage.
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	return s
 }
 
-// ListenAndServe binds the unix socket (replacing a stale one) and serves
-// until Shutdown.
-func (s *SocketServer) ListenAndServe() error {
+// Listen binds the unix socket. Call it synchronously at startup, before
+// other goroutines create files: the 0660 permissions are applied through
+// the umask AT bind time — a chmod-after-listen would leave a window where
+// the socket is world-connectable (unix sockets check permissions at
+// connect time, so an early connection would survive the chmod).
+func (s *SocketServer) Listen() error {
 	path := s.cfg.Api.Socket
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("removing stale socket: %w", err)
+
+	// A leftover socket from a crash must be replaced, but never steal the
+	// socket of a live daemon (accidental double start): probe it first.
+	if _, err := os.Stat(path); err == nil {
+		conn, err := net.DialTimeout("unix", path, time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return fmt.Errorf("another plico daemon is already listening on %s", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("removing stale socket: %w", err)
+		}
+		s.log.Info("removed stale socket", "socket", path)
 	}
+
+	old := syscall.Umask(0o117) // 0777 &^ 0117 = 0660
 	ln, err := net.Listen("unix", path)
+	syscall.Umask(old)
 	if err != nil {
 		return err
 	}
-	// Owner + group only: the socket triggers deployments.
-	if err := os.Chmod(path, 0o660); err != nil {
-		_ = ln.Close()
-		return err
-	}
+	s.ln = ln
 	s.log.Info("client API listening", "socket", path)
-	return s.server.Serve(ln)
+	return nil
 }
 
+// Serve blocks until Shutdown. Listen must have been called first.
+func (s *SocketServer) Serve() error {
+	return s.server.Serve(s.ln)
+}
+
+// Shutdown stops accepting requests, then waits for in-flight manual runs
+// to finish — a socket-triggered deploy gets the same drain guarantee as a
+// scheduled one (the runs themselves are bounded by run_timeout).
 func (s *SocketServer) Shutdown(ctx context.Context) error {
 	err := s.server.Shutdown(ctx)
+	s.actions.Wait()
 	_ = os.Remove(s.cfg.Api.Socket)
 	return err
 }
@@ -121,7 +151,11 @@ func (s *SocketServer) handleDryRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stacks, err := s.selectStacks(req.Stack)
-	if err != nil || len(stacks) != 1 {
+	if err != nil {
+		httpError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if len(stacks) != 1 {
 		httpError(w, http.StatusBadRequest, "dry-run requires exactly one --stack")
 		return
 	}
@@ -154,11 +188,19 @@ func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name
 	s.log.Info("manual action requested via client API", "action", name,
 		"stack", req.Stack, "force", req.Force, "skip_pre", req.SkipPre, "skip_post", req.SkipPost)
 
+	// Detached from the request context: an operator's Ctrl-C (client
+	// disconnect) must not SIGKILL a docker compose up mid-flight. Tracked
+	// in the actions WaitGroup so shutdown drains these runs like the
+	// scheduler drains its own.
+	s.actions.Add(1)
+	defer s.actions.Done()
+	ctx := context.WithoutCancel(r.Context())
+
 	results := make([]ActionResult, 0, len(stacks))
 	for _, st := range stacks {
 		results = append(results, ActionResult{
 			Stack:   st.Name,
-			Outcome: run(r.Context(), st, req),
+			Outcome: run(ctx, st, req),
 		})
 	}
 	writeJSON(w, http.StatusOK, results)

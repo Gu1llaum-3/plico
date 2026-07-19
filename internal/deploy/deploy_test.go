@@ -592,6 +592,13 @@ func TestForceRedeploysSameRevision(t *testing.T) {
 	if len(h.runtime.ups) != 1 {
 		t.Errorf("forced run must deploy, ups = %d", len(h.runtime.ups))
 	}
+	// Redeploying the CURRENT revision has nothing "queued": no misleading
+	// deploy_queued announcement.
+	for _, tpe := range h.events.types() {
+		if tpe == notify.DeployQueued {
+			t.Error("forced same-revision redeploy must not announce deploy_queued")
+		}
+	}
 }
 
 func TestSkipPreBypassesGateLoudly(t *testing.T) {

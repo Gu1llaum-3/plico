@@ -7,24 +7,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Gu1llaum-3/plico/internal/api"
 )
-
-type statusResponse struct {
-	Status   string                     `json:"status"`
-	LastTick time.Time                  `json:"last_tick"`
-	Stacks   map[string]stackStatusView `json:"stacks"`
-}
-
-type stackStatusView struct {
-	LastDeployedSHA string     `json:"last_deployed_sha"`
-	LastStatus      string     `json:"last_status"`
-	LastRunID       string     `json:"last_run_id"`
-	UpdatedAt       *time.Time `json:"updated_at"`
-	RunningSince    *time.Time `json:"running_since"`
-	LastOutcome     string     `json:"last_outcome"`
-	NextRun         *time.Time `json:"next_run"`
-	QueuedSHA       string     `json:"queued_sha"`
-}
 
 func init() {
 	conn := &clientConn{}
@@ -32,7 +17,7 @@ func init() {
 		Use:   "status",
 		Short: "Per-stack status: last run, deployed SHA, pending revision, next window (F27)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var resp statusResponse
+			var resp api.StatusResponse
 			if err := conn.call("GET", "/v1/status", nil, &resp); err != nil {
 				return err
 			}
