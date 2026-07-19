@@ -468,7 +468,7 @@ RuntimeDirectoryMode=0750
 StateDirectory=plico
 StateDirectoryMode=0750
 WorkingDirectory=$DOCKERDIR
-UMask=0007
+UMask=0022
 
 [Install]
 WantedBy=multi-user.target

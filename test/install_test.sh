@@ -130,6 +130,7 @@ assert_contains "$TMP/full/etc/plico/config.toml.example" '# release example 1.2
 assert_contains "$TMP/curl.log" "--proto =https"
 assert_contains "$TMP/curl.log" "--retry 3"
 cmp "$SERVICE" "$TMP/full/etc/systemd/system/plico.service" >/dev/null || fail "generated service differs from packaging/plico.service"
+assert_contains "$TMP/full/etc/systemd/system/plico.service" 'UMask=0022'
 [ -d "$TMP/full/var/lib/plico" ] || fail "state directory not created"
 [ -d "$TMP/full/opt/docker" ] || fail "docker directory not created"
 

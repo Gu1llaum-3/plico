@@ -22,6 +22,11 @@ plico **orchestre** des CLIs matures — `git`, `sops`, `docker compose` — via
    chemin global configuré. Il reçoit `DEPLOY_STACK`, `DEPLOY_DIR`,
    `DEPLOY_GIT_REF`, `DEPLOY_OLD_SHA`, `DEPLOY_NEW_SHA`.
    **`exit != 0` → déploiement abandonné**, notification, retry au tick suivant.
+   ⚠️ Le daemon tourne avec `UMask=0022` pour que les fichiers des clones
+   restent lisibles par les conteneurs bind-montés (uid arbitraire) — les
+   hooks en héritent : un hook qui écrit des données sensibles (dump de base
+   avant backup, par exemple) doit poser `umask 077` en tête de script ou
+   écrire dans un répertoire aux permissions restreintes.
 3. Déchiffrement SOPS en mémoire : `sops exec-env secrets.enc.env -- docker
    compose … up -d`. Mode `tmpfs` (`/dev/shm`) disponible sur Linux.
 4. `docker compose pull` (option `force_pull`) puis `up -d --remove-orphans`.
