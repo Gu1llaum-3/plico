@@ -91,6 +91,43 @@ n'existe dans doco-cd.
 - [ ] **Renovate/Dependabot** sur le repo (deps Go + versions mise épinglées)
 - [ ] Clone shallow (`--depth 1`) en option ; `ref` = tag ou SHA épinglé
 
+## 🔒 Durcissement sécurité (issu de l'analyse concurrentielle, juillet 2026)
+
+Acté, pas encore implémenté. Modèle de menace : hôte Docker mono-opérateur (ou
+petite équipe), opérateur de confiance, le dépôt git suivi est le plan de
+contrôle. Deux faits structurels sont assumés et non « corrigeables » (le
+groupe `docker` ≈ root ; le contenu du dépôt = code de confiance) — les items
+ci-dessous réduisent le rayon de souffle **sans toucher à la thèse
+« orchestrer des CLI matures »**. Ordonnés par levier.
+
+- [ ] **Vérifier la signature du commit/tag avant checkout** — levier le plus
+      haut. Aujourd'hui le SHA résolu prouve *quel* commit, pas *qui* l'a
+      écrit ; un push sur la branche suivie est déployé sans vérification
+      d'auteur. Vérif OpenPGP/SSH via `git verify-commit`/`verify-tag` contre
+      un trousseau de clés autorisées configuré par stack, refus fail-closed
+      si absent/invalide. C'est le seul vrai emprunt Argo/Flux (`spec.verify`)
+      qui a du sens hors Kubernetes, et il coupe la voie d'attaque dominante
+      (repo compromis → hook → clé age + socket Docker).
+- [ ] **Scoper l'environnement des sous-processus (hooks) à une allowlist**
+      au lieu de propager `os.Environ()` en bloc (`execx.go` : `cmd.Env =
+      append(os.Environ(), …)`). Un hook versionné dans le dépôt s'exécute
+      en tant que `plico` et voit aujourd'hui `SOPS_AGE_KEY_FILE`, les tokens
+      de notification, etc. Passer les seules variables `DEPLOY_*` (+ une
+      allowlist configurable) empêche une fuite vers du shell contrôlé par le
+      dépôt. Ne change rien au design des hooks génériques.
+- [ ] **Releases signées** : cosign + provenance SLSA + SBOM signé. Aujourd'hui
+      `checksums.txt` vient de la *même* release GitHub (TOFU sur GitHub+TLS,
+      pin `--sha256` opt-in seulement) — sous la barre supply-chain que plico
+      revendique. Réalisable pour un binaire Go mono-mainteneur.
+- [ ] **Attribution par appelant sur le socket** : lire `SO_PEERCRED` et
+      journaliser l'uid de l'appelant des actions mutantes (`deploy-now`,
+      `check-now`). Trivial ; comble le trou forensique dès qu'il y a des
+      `--operator`.
+- [ ] **Validations de config défensives** : refuser (ou au moins avertir sur)
+      un `health.listen` non-loopback (évite d'exposer sans auth les noms de
+      stacks/SHA/topologie), et refuser un endpoint de notification `http://`
+      porteur d'un token bearer (fuite en clair).
+
 ## 🌅 v2+ — Plus tard, peut-être
 
 - [ ] **Podman** : nouvelle implémentation de l'interface `compose.Runtime`
