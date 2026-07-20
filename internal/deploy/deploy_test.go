@@ -847,6 +847,155 @@ func TestAssess(t *testing.T) {
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
+// --- drift detection (reconciliation-lite) --------------------------------
+
+var unhealthy = []compose.Service{{Name: "api", State: "running", Health: "unhealthy"}}
+
+func TestCheckHealthHealthyIsSilent(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t) // default services: one healthy nginx
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date", got)
+	}
+	if len(h.events.types()) != 0 {
+		t.Errorf("healthy stack must not notify, got %v", h.events.types())
+	}
+}
+
+func TestCheckHealthDetectsDriftOnceThenDedups(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.runtime.services = unhealthy
+
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeDrifted {
+		t.Fatalf("first: outcome = %s, want drifted", got)
+	}
+	wantEvents(t, h.events.types(), notify.DriftDetected)
+	if d := h.events.last().Detail; !contains(d, "api") {
+		t.Errorf("drift detail should name the bad service, got %q", d)
+	}
+	// Still bad on the next tick → no duplicate notification.
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeDrifted {
+		t.Fatalf("second: outcome = %s, want drifted", got)
+	}
+	wantEvents(t, h.events.types(), notify.DriftDetected) // unchanged
+}
+
+func TestCheckHealthNotifiesResolvedOnRecovery(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.runtime.services = unhealthy
+	h.deployer.CheckHealth(context.Background(), h.stack) // drift_detected
+
+	h.runtime.services = []compose.Service{{Name: "api", State: "running", Health: "healthy"}}
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeUpToDate {
+		t.Fatalf("recovery: outcome = %s, want up_to_date", got)
+	}
+	wantEvents(t, h.events.types(), notify.DriftDetected, notify.DriftResolved)
+	// Once resolved, a further healthy check is silent (episode closed).
+	h.deployer.CheckHealth(context.Background(), h.stack)
+	wantEvents(t, h.events.types(), notify.DriftDetected, notify.DriftResolved)
+}
+
+// A crash-looping container reports State=="restarting" (the classic
+// OOM-with-restart-policy regression). assess buckets it as "pending"; the
+// drift lens must treat it as a regression or it is ignored forever.
+func TestCheckHealthDetectsCrashLoop(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.runtime.services = []compose.Service{{Name: "api", State: "restarting", Health: ""}}
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeDrifted {
+		t.Fatalf("outcome = %s, want drifted (crash loop)", got)
+	}
+	wantEvents(t, h.events.types(), notify.DriftDetected)
+	if d := h.events.last().Detail; !contains(d, "restarting") {
+		t.Errorf("detail should mention restarting, got %q", d)
+	}
+}
+
+// A stack torn down (0 services) while a drift episode is open is NOT a
+// recovery — it is gone, not healthy. It must not fire a false drift_resolved;
+// a genuine recovery (services present, none bad) still does.
+func TestCheckHealthTearDownIsNotResolved(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.runtime.services = unhealthy
+	h.deployer.CheckHealth(context.Background(), h.stack) // drift_detected, episode open
+
+	h.runtime.services = nil // operator ran `compose down` to investigate
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeDrifted {
+		t.Fatalf("outcome = %s, want drifted (torn down is not recovered)", got)
+	}
+	wantEvents(t, h.events.types(), notify.DriftDetected) // NO false resolved
+
+	// Now a real recovery closes the episode.
+	h.runtime.services = []compose.Service{{Name: "api", State: "running", Health: "healthy"}}
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date (recovered)", got)
+	}
+	wantEvents(t, h.events.types(), notify.DriftDetected, notify.DriftResolved)
+}
+
+func TestCheckHealthSkipsNonSuccessStack(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.runtime.services = unhealthy // would drift if checked
+	if err := h.store.Put("web", state.StackState{LastDeployedSHA: oldSHA, LastStatus: state.StatusFailed}); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date (no baseline to drift from)", got)
+	}
+	if len(h.events.types()) != 0 {
+		t.Errorf("a non-success stack must not drift-alert, got %v", h.events.types())
+	}
+}
+
+func TestCheckHealthSkipsWhenStackLocked(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	lock := h.deployer.stackLock("web")
+	lock.Lock() // simulate a deploy owning the stack
+	defer lock.Unlock()
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeSkipped {
+		t.Fatalf("outcome = %s, want skipped (deploy in progress)", got)
+	}
+}
+
+func TestCheckHealthQuietOnPSError(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.runtime.psErr = errors.New("docker daemon hiccup")
+	if got := h.deployer.CheckHealth(context.Background(), h.stack); got != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date (ps error is not drift)", got)
+	}
+	if len(h.events.types()) != 0 {
+		t.Errorf("a ps error must not raise a false drift alert, got %v", h.events.types())
+	}
+}
+
+// A successful redeploy re-establishes the baseline and clears any open drift
+// episode, so it does not later emit a phantom drift_resolved.
+func TestSuccessfulDeployClearsDriftEpisode(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.runtime.services = unhealthy
+	h.deployer.CheckHealth(context.Background(), h.stack) // drift_detected, episode open
+
+	// Redeploy successfully (fresh SHA, healthy services, no hook = skipped).
+	h.runtime.services = []compose.Service{{Name: "nginx", State: "running", Health: "healthy"}}
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("redeploy outcome = %s, want deployed", got)
+	}
+	// A subsequent healthy check must be silent — the episode was cleared by
+	// the deploy, not left open to fire a spurious resolved.
+	before := len(h.events.types())
+	h.deployer.CheckHealth(context.Background(), h.stack)
+	if now := len(h.events.types()); now != before {
+		t.Errorf("healthy check after redeploy emitted %d event(s), want 0", now-before)
+	}
+}
+
 // diffCalls counts `git diff` invocations recorded by the fake git runner.
 func (h *harness) diffCalls() int {
 	n := 0

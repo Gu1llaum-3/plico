@@ -28,6 +28,10 @@ func (nopRunner) CheckStack(context.Context, config.StackConfig) deploy.Outcome 
 	return deploy.OutcomeUpToDate
 }
 
+func (nopRunner) CheckHealth(context.Context, config.StackConfig) deploy.Outcome {
+	return deploy.OutcomeUpToDate
+}
+
 func setup(t *testing.T) (*scheduler.Scheduler, *state.Store, *http.Server) {
 	t.Helper()
 	cfg := &config.Config{

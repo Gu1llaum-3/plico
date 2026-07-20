@@ -33,6 +33,14 @@ poll_interval = "60s"
 # Overridable per stack; ignored for stacks without a schedule.
 # check = true
 
+# Drift detection (reconciliation-lite): between deployments, re-read each
+# deployed stack's `docker compose ps` every `drift_interval` and notify on a
+# regression (a service unhealthy/dead/crashed). Detection only — plico NEVER
+# auto-remediates. On by default; disable globally with drift_check = false,
+# or per stack. A manually-stopped or fully-downed stack is out of scope.
+# drift_check = true
+drift_interval = "2m"
+
 # Hard ceiling for one full deployment run (git + hook + pull + up + verify).
 run_timeout = "30m"
 
@@ -137,6 +145,7 @@ verify_timeout = "90s"                # post-up healthcheck budget
 # env_passthrough = ["RESTIC_PASSWORD"]  # extra hook env, only for this stack
 # schedule = "0 4 * * *"              # override the global schedule (or "@poll")
 # window = "30m"                      # override the global window
+# drift_check = false                 # opt this stack out of drift detection
 
 # [[stack]]
 # name = "internal-tools"

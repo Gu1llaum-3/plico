@@ -22,6 +22,7 @@ type countingRunner struct {
 	mu      sync.Mutex
 	calls   map[string]int
 	checks  map[string]int
+	drifts  map[string]int
 	outcome deploy.Outcome
 	block   chan struct{} // when set, RunStack waits on it
 }
@@ -47,6 +48,16 @@ func (c *countingRunner) CheckStack(_ context.Context, st config.StackConfig) de
 	}
 	c.checks[st.Name]++
 	return deploy.OutcomeQueued
+}
+
+func (c *countingRunner) CheckHealth(_ context.Context, st config.StackConfig) deploy.Outcome {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.drifts == nil {
+		c.drifts = map[string]int{}
+	}
+	c.drifts[st.Name]++
+	return deploy.OutcomeUpToDate
 }
 
 func testStore(t *testing.T) *state.Store {
@@ -97,6 +108,16 @@ func checkNames(s *Scheduler, now time.Time) []string {
 	var names []string
 	_, check, _ := s.due(now)
 	for _, st := range check {
+		names = append(names, st.Name)
+	}
+	return names
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func driftNames(s *Scheduler, now time.Time) []string {
+	var names []string
+	for _, st := range s.driftDue(now) {
 		names = append(names, st.Name)
 	}
 	return names
@@ -208,6 +229,10 @@ func (c *ctxCheckRunner) RunStack(ctx context.Context, _ config.StackConfig) dep
 }
 
 func (c *ctxCheckRunner) CheckStack(context.Context, config.StackConfig) deploy.Outcome {
+	return deploy.OutcomeUpToDate
+}
+
+func (c *ctxCheckRunner) CheckHealth(context.Context, config.StackConfig) deploy.Outcome {
 	return deploy.OutcomeUpToDate
 }
 
@@ -936,5 +961,77 @@ func TestSkippedOutcomeDoesNotOverwriteLast(t *testing.T) {
 	s.runOne(context.Background(), s.cfg.Stacks[0], false)
 	if got := s.Snapshot().Stacks["web"].LastOutcome; got != "deployed" {
 		t.Errorf("outcome = %q, want deployed (skip must not overwrite)", got)
+	}
+}
+
+// --- drift detection ------------------------------------------------------
+
+func driftConfig(interval time.Duration, stacks ...config.StackConfig) *config.Config {
+	return &config.Config{
+		PollInterval:  config.Duration{Duration: time.Hour},
+		DriftInterval: config.Duration{Duration: interval},
+		Stacks:        stacks,
+	}
+}
+
+func TestDriftDueRespectsInterval(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	cfg := driftConfig(10*time.Minute,
+		config.StackConfig{Name: "web", DriftCheck: boolPtr(true)},
+		config.StackConfig{Name: "db", DriftCheck: boolPtr(true)},
+	)
+	s := mustNewAt(t, cfg, &countingRunner{}, testStore(t), t0)
+
+	// First evaluation: both due (never checked).
+	if got := driftNames(s, t0); len(got) != 2 {
+		t.Fatalf("first driftDue = %v, want both stacks", got)
+	}
+	// Before the interval elapses: none.
+	if got := driftNames(s, t0.Add(5*time.Minute)); got != nil {
+		t.Errorf("driftDue at +5m = %v, want none (interval not elapsed)", got)
+	}
+	// At the interval boundary: both due again.
+	if got := driftNames(s, t0.Add(10*time.Minute)); len(got) != 2 {
+		t.Errorf("driftDue at +10m = %v, want both", got)
+	}
+}
+
+func TestDriftDueSkipsDisabledStack(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	cfg := driftConfig(time.Minute,
+		config.StackConfig{Name: "watched", DriftCheck: boolPtr(true)},
+		config.StackConfig{Name: "opted-out", DriftCheck: boolPtr(false)},
+	)
+	s := mustNewAt(t, cfg, &countingRunner{}, testStore(t), t0)
+	got := driftNames(s, t0)
+	if len(got) != 1 || got[0] != "watched" {
+		t.Errorf("driftDue = %v, want only [watched]", got)
+	}
+}
+
+// Drift is orthogonal to the deployment window: a scheduled stack that is NOT
+// deploy-due (outside its window) must still be drift-due.
+func TestDriftIndependentOfDeploymentWindow(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{
+		Timezone:      "Europe/Paris",
+		PollInterval:  config.Duration{Duration: time.Minute},
+		DriftInterval: config.Duration{Duration: time.Minute},
+		Stacks: []config.StackConfig{
+			{Name: "nightly", Schedule: "0 4 * * *",
+				Window: config.Duration{Duration: time.Hour}, DriftCheck: boolPtr(true)},
+		},
+	}
+	// 12:00 — far outside the 04:00–05:00 window.
+	noon := time.Date(2026, 7, 20, 12, 0, 0, 0, paris(t))
+	s := mustNewAt(t, cfg, &countingRunner{}, testStore(t), noon)
+
+	if got := dueNames(s, noon); got != nil {
+		t.Fatalf("nightly must NOT be deploy-due at noon, got %v", got)
+	}
+	if got := driftNames(s, noon); len(got) != 1 || got[0] != "nightly" {
+		t.Errorf("nightly must be drift-due at noon regardless of window, got %v", got)
 	}
 }

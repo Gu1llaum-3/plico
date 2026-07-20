@@ -143,6 +143,7 @@ cat > "$WS/config.toml" <<EOF
 base_dir = "$BASE"
 poll_interval = "5s"
 run_timeout = "5m"
+drift_interval = "5s"
 
 [health]
 listen = "127.0.0.1:$PORT"
@@ -226,6 +227,27 @@ while [ $i -lt 12 ] && [ ! -s "$HB_LOG" ]; do i=$((i+1)); sleep 1; done
 [ -s "$HB_LOG" ] \
   && ok "liveness heartbeat pushed while healthy" \
   || fail "no heartbeat reached the capture"
+
+# ── 5b. drift detection: kill a container, expect drift_detected, then ──
+#        restart it and expect drift_resolved. Proves the periodic health
+#        re-check end to end — and that plico does NOT auto-remediate (the
+#        container stays down until WE restart it; no git delta = no redeploy).
+docker kill "$CID" >/dev/null 2>&1
+i=0
+while [ $i -lt 20 ] && ! grep -q "smoke: drift_detected" "$NTFY_LOG" 2>/dev/null; do i=$((i+1)); sleep 1; done
+grep -q "smoke: drift_detected" "$NTFY_LOG" 2>/dev/null \
+  && ok "drift_detected notification after a container died" \
+  || fail "drift never detected after docker kill"
+# No remediation: the killed container must still be down (plico did not up it).
+docker inspect --format '{{.State.Running}}' "$CID" 2>/dev/null | grep -q false \
+  && ok "no auto-remediation: drifted container left down for the human" \
+  || fail "container was resurrected — plico must not auto-remediate"
+docker start "$CID" >/dev/null 2>&1
+i=0
+while [ $i -lt 20 ] && ! grep -q "smoke: drift_resolved" "$NTFY_LOG" 2>/dev/null; do i=$((i+1)); sleep 1; done
+grep -q "smoke: drift_resolved" "$NTFY_LOG" 2>/dev/null \
+  && ok "drift_resolved notification after the container recovered" \
+  || fail "drift never resolved after docker start"
 
 # ── 6. client CLI over the unix socket ─────────────────────────────────
 "$PLICO" validate --config "$WS/config.toml" >/dev/null 2>&1 \

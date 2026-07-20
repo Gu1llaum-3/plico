@@ -141,6 +141,11 @@ type StackConfig struct {
 	// without deploying. nil = inherit the global default (false). Only
 	// meaningful with a schedule; ignored otherwise.
 	Check *bool `toml:"check"`
+	// DriftCheck enables periodic health re-checks of this stack between
+	// deployments (reconciliation-lite): every drift_interval, `compose ps`
+	// is re-read and a regression (unhealthy/dead/crashed service) is
+	// notified — never remediated. nil = inherit the global default (true).
+	DriftCheck *bool `toml:"drift_check"`
 	// EnvPassthrough is added (union) to [hooks].env_passthrough for this
 	// stack's hooks, so a secret can be exposed only to the hook that needs
 	// it rather than every stack's hooks.
@@ -160,6 +165,12 @@ func (s StackConfig) CheckEnabled() bool {
 	return s.Check != nil && *s.Check
 }
 
+// DriftCheckEnabled resolves the *bool (defaults inherited from the global in
+// applyDefaults, which defaults to true).
+func (s StackConfig) DriftCheckEnabled() bool {
+	return s.DriftCheck != nil && *s.DriftCheck
+}
+
 // ForcePullEnabled resolves the *bool default (true when unset).
 func (s StackConfig) ForcePullEnabled() bool {
 	return s.ForcePull == nil || *s.ForcePull
@@ -175,6 +186,12 @@ type Config struct {
 	Schedule             string   `toml:"schedule"` // global default for stacks (F7); empty = every poll tick
 	Window               Duration `toml:"window"`   // global default window, 1h
 	Check                bool     `toml:"check"`    // global default for out-of-window checks (F6)
+	// DriftCheck is the global default for periodic health re-checks
+	// (reconciliation-lite). nil = default true (on unless disabled).
+	DriftCheck *bool `toml:"drift_check"`
+	// DriftInterval is how often a deployed stack's health is re-checked
+	// between deployments. Default 2m; must be >= 5s.
+	DriftInterval Duration `toml:"drift_interval"`
 
 	Log       LogConfig       `toml:"log"`
 	Health    HealthConfig    `toml:"health"`
@@ -275,6 +292,13 @@ func (c *Config) applyDefaults() {
 	if c.Window.Duration == 0 {
 		c.Window.Duration = time.Hour
 	}
+	if c.DriftCheck == nil {
+		v := true // drift detection is on by default
+		c.DriftCheck = &v
+	}
+	if c.DriftInterval.Duration == 0 {
+		c.DriftInterval.Duration = 2 * time.Minute
+	}
 	// "@poll" (no schedule, run every poll tick) is normalized here, once:
 	// after applyDefaults no consumer ever sees the sentinel.
 	if c.Schedule == "@poll" {
@@ -299,6 +323,10 @@ func (c *Config) applyDefaults() {
 		if st.Check == nil {
 			v := c.Check
 			st.Check = &v
+		}
+		if st.DriftCheck == nil {
+			v := *c.DriftCheck // global default already resolved above
+			st.DriftCheck = &v
 		}
 		if st.ComposeFile == "" {
 			st.ComposeFile = "docker-compose.yml"
@@ -337,6 +365,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PollInterval.Duration < 5*time.Second {
 		return fmt.Errorf("poll_interval must be >= 5s, got %s", c.PollInterval.Duration)
+	}
+	if c.DriftInterval.Duration < 5*time.Second {
+		return fmt.Errorf("drift_interval must be >= 5s, got %s", c.DriftInterval.Duration)
 	}
 	if c.MaxConcurrentDeploys < 1 {
 		return fmt.Errorf("max_concurrent_deploys must be >= 1, got %d", c.MaxConcurrentDeploys)

@@ -37,6 +37,9 @@ type StackRunner interface {
 	RunStack(ctx context.Context, st config.StackConfig) deploy.Outcome
 	// CheckStack fetches and diffs without deploying (F6).
 	CheckStack(ctx context.Context, st config.StackConfig) deploy.Outcome
+	// CheckHealth re-reads a deployed stack's health and notifies on drift,
+	// never remediating (reconciliation-lite).
+	CheckHealth(ctx context.Context, st config.StackConfig) deploy.Outcome
 }
 
 // catchUpLimit bounds the firing catch-up loop: robfig/cron's Next() is
@@ -59,6 +62,7 @@ type Scheduler struct {
 	outcomes  map[string]deploy.Outcome
 	outcomeAt map[string]time.Time
 	scheds    map[string]*stackSched // only stacks with a cron schedule
+	lastDrift map[string]time.Time   // last drift-check dispatch per stack (cadence gate)
 }
 
 // stackSched tracks one stack's deployment window state.
@@ -110,6 +114,7 @@ func NewAt(cfg *config.Config, d StackRunner, store *state.Store, notifier notif
 		outcomes:     map[string]deploy.Outcome{},
 		outcomeAt:    map[string]time.Time{},
 		scheds:       map[string]*stackSched{},
+		lastDrift:    map[string]time.Time{},
 	}
 	nowLoc := now.In(s.loc)
 	for _, st := range cfg.Stacks {
@@ -205,6 +210,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 			go func(st config.StackConfig) {
 				defer wg.Done()
 				s.runOne(ctx, st, true)
+			}(st)
+		}
+		// Drift detection is orthogonal to the deployment schedule/window, so
+		// it rides its own cadence and never touches the window state machine
+		// (driftDue reads only lastDrift; driftOne does no firing accounting).
+		for _, st := range s.driftDue(now) {
+			wg.Add(1)
+			go func(st config.StackConfig) {
+				defer wg.Done()
+				s.driftOne(ctx, st)
 			}(st)
 		}
 	}
@@ -439,6 +454,49 @@ func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig, checkOnly
 		}
 	}
 	s.mu.Unlock()
+}
+
+// driftDue returns the stacks whose drift-check interval has elapsed, and
+// stamps lastDrift for each so it will not be re-dispatched until the next
+// interval. It is deliberately independent of due()/the window state machine:
+// drift detection applies to every drift-enabled stack regardless of schedule
+// or window (a nightly-deployed stack must still be watched during the day).
+// A stack with no healthy baseline is filtered downstream in CheckHealth.
+//
+// Probes fire in lockstep (all stacks share one interval, stamped with the
+// same now), so N stacks mean N concurrent `compose ps` every interval with no
+// jitter. That is fine for plico's single-operator target (a handful of
+// stacks); it is not built for hundreds.
+func (s *Scheduler) driftDue(now time.Time) []config.StackConfig {
+	interval := s.cfg.DriftInterval.Duration
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var due []config.StackConfig
+	for _, st := range s.cfg.Stacks {
+		if !st.DriftCheckEnabled() { // global default resolved per-stack at config load
+			continue
+		}
+		last := s.lastDrift[st.Name]
+		if last.IsZero() || !now.Before(last.Add(interval)) {
+			s.lastDrift[st.Name] = now
+			due = append(due, st)
+		}
+	}
+	return due
+}
+
+// driftOne runs a single health probe. It never touches the running map, the
+// window firing accounting, or the anchor: a drift check must not perturb the
+// scheduler's deployment state. The deployer's own TryLock yields to a deploy
+// that owns the stack, and CheckHealth bounds itself by verify_timeout so a
+// wedged docker cannot hold the per-stack lock long enough to starve deploys.
+//
+// Unlike runOne, the ctx is passed through CANCELLABLE: a drift probe is a
+// read-only `compose ps` with nothing to protect from cancellation (runOne
+// detaches to avoid SIGKILLing a `compose up` mid-flight), so shutdown should
+// interrupt it immediately rather than wait out the drain.
+func (s *Scheduler) driftOne(ctx context.Context, st config.StackConfig) {
+	s.deployer.CheckHealth(ctx, st)
 }
 
 // advanceNext moves ss.next to the firing after `from`, loudly flagging a

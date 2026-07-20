@@ -28,12 +28,20 @@ const (
 	// GitSyncFailed: git fetch has been failing for N consecutive runs
 	// (revoked token, moved repo) — the stack is effectively unmanaged.
 	GitSyncFailed EventType = "git_sync_failed"
+	// DriftDetected: a periodic health re-check found a previously-deployed
+	// stack degraded (a service unhealthy, dead, or crashed) between
+	// deployments. Detection only — plico never auto-remediates.
+	DriftDetected EventType = "drift_detected"
+	// DriftResolved: a drifted stack returned to health. A recovery/positive
+	// signal, opt-in per channel like deploy_success.
+	DriftResolved EventType = "drift_resolved"
 )
 
 // AllEvents lists every event type, for config validation.
 var AllEvents = []EventType{
 	DeployQueued, DeployStart, PreHookFailed, PreHookSkipped,
 	DeployFailed, DeploySuccess, WindowMissed, GitSyncFailed,
+	DriftDetected, DriftResolved,
 }
 
 // DefaultEvents is what a channel receives when it does not configure an
@@ -41,6 +49,7 @@ var AllEvents = []EventType{
 // deploy_start are opt-in per channel.
 var DefaultEvents = []EventType{
 	PreHookFailed, PreHookSkipped, DeployFailed, WindowMissed, GitSyncFailed,
+	DriftDetected,
 }
 
 // ParseEvents validates a config-provided list. Empty means DefaultEvents;

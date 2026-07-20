@@ -212,6 +212,40 @@ plico beats immediately on start, then every `interval`. Set your monitor's
 grace period to **≥ 2× `interval`** so a single missed beat (restart, GC
 pause, brief blip) does not raise a false alarm.
 
+### Drift detection (reconciliation-lite)
+
+plico verifies a stack's health once, right after `up`. Between deployments —
+which a schedule can space days apart — a container can crash, be OOM-killed,
+or go `unhealthy` and nothing would notice (`/healthz` and the heartbeat cover
+the *daemon*, not the stacks' containers). Drift detection closes that gap: on
+by default, every `drift_interval` (2m) plico re-reads each deployed stack's
+`docker compose ps` and, on a **regression** (a service unhealthy, dead,
+crashed, or crash-looping), sends a `drift_detected` notification — and a
+`drift_resolved` one when it recovers.
+
+**Detection only — plico never auto-remediates.** Unlike Flux/Argo it does not
+re-apply desired state: a blind re-`up` on a failed migration or a corrupted
+volume can destroy data. The rule stands — backup + alert + human.
+
+```toml
+drift_check = true    # global default; set false to disable, or per stack
+drift_interval = "2m"
+```
+
+It is quiet in every ambiguous case: it only checks a stack whose last deploy
+succeeded (a verify-failed deploy that left the old version running is not
+watched until the next success), skips a stack a deploy currently owns, and
+swallows a transient `docker` error rather than cry wolf. One alert per drift
+episode (deduped), then one on recovery — except a successful redeploy closes
+an open episode silently (the deploy already re-established health). Tearing a
+drifted stack down (`compose down`) is not treated as recovery either.
+`drift_detected` is failure-oriented (on by default per channel);
+`drift_resolved` is a recovery signal, opt-in like `deploy_success`.
+
+Known limit (cut 1): a service **stopped by hand** (`compose stop` → exited 0,
+indistinguishable from a one-shot init container) and a **fully downed** stack
+(0 services) are not flagged — only unhealthy/dead/crashed services are.
+
 ### System layout
 
 New installations separate persistent data from runtime:

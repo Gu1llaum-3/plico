@@ -114,6 +114,52 @@ repo = "https://example.com/single.git"
 	}
 }
 
+func TestDriftDefaultsAndPerStackOptOut(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+base_dir = "/opt/docker"
+[[stack]]
+name = "watched"
+repo = "https://example.com/a.git"
+[[stack]]
+name = "noisy"
+repo = "https://example.com/b.git"
+drift_check = false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DriftInterval.Duration != 2*time.Minute {
+		t.Errorf("drift_interval default = %s, want 2m", cfg.DriftInterval.Duration)
+	}
+	if cfg.DriftCheck == nil || !*cfg.DriftCheck {
+		t.Errorf("drift_check global default should be true, got %v", cfg.DriftCheck)
+	}
+	if !cfg.Stacks[0].DriftCheckEnabled() {
+		t.Error("stack without drift_check should inherit the global true")
+	}
+	if cfg.Stacks[1].DriftCheckEnabled() {
+		t.Error("stack with drift_check=false must opt out")
+	}
+}
+
+func TestDriftCheckGlobalDisable(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+base_dir = "/opt/docker"
+drift_check = false
+[[stack]]
+name = "s"
+repo = "https://example.com/a.git"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stacks[0].DriftCheckEnabled() {
+		t.Error("global drift_check=false must disable the stack too")
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	t.Setenv("PLICO_TEST_TOKEN", "x")
 	base := `
@@ -145,6 +191,7 @@ repo = "https://example.com/repo.git"
 		{"absolute path", base + "\npath = \"/etc\"\n", "repo-relative subdirectory"},
 		{"escaping path", base + "\npath = \"../../evil\"\n", "repo-relative subdirectory"},
 		{"traversal path segment", base + "\npath = \"a/../../evil\"\n", "repo-relative subdirectory"},
+		{"drift_interval too small", "drift_interval = \"1s\"\n" + base, "drift_interval must be >= 5s"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

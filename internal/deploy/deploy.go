@@ -39,7 +39,8 @@ const (
 	OutcomeUpToDate                // no git delta, nothing done
 	OutcomeDeployed
 	OutcomeFailed
-	OutcomeQueued // check only: a delta is pending until the next window (F6)
+	OutcomeQueued  // check only: a delta is pending until the next window (F6)
+	OutcomeDrifted // health check only: a deployed stack has degraded
 )
 
 func (o Outcome) String() string {
@@ -52,6 +53,8 @@ func (o Outcome) String() string {
 		return "deployed"
 	case OutcomeQueued:
 		return "queued"
+	case OutcomeDrifted:
+		return "drifted"
 	default:
 		return "failed"
 	}
@@ -90,8 +93,9 @@ type Deployer struct {
 
 	mu       sync.Mutex
 	locks    map[string]*sync.Mutex
-	gitFails map[string]int // consecutive git sync failures per stack
-	sem      chan struct{}  // bounds concurrent deployments across stacks
+	gitFails map[string]int  // consecutive git sync failures per stack
+	driftBad map[string]bool // stacks currently in a drift episode (dedup)
+	sem      chan struct{}   // bounds concurrent deployments across stacks
 
 	// TmpfsRoot is overridable in tests; defaults to /dev/shm on Linux.
 	TmpfsRoot string
@@ -112,6 +116,7 @@ func New(cfg *config.Config, git *gitrepo.Client, rt compose.Runtime, hk *hooks.
 		log:       log,
 		locks:     map[string]*sync.Mutex{},
 		gitFails:  map[string]int{},
+		driftBad:  map[string]bool{},
 		sem:       make(chan struct{}, cfg.MaxConcurrentDeploys),
 		TmpfsRoot: sopsx.DefaultTmpfsRoot,
 	}
@@ -372,6 +377,13 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		return OutcomeFailed
 	}
 
+	// A successful deploy re-establishes a healthy baseline: close any open
+	// drift episode so a later health check does not fire a phantom
+	// drift_resolved for a state the deploy already fixed.
+	d.mu.Lock()
+	delete(d.driftBad, st.Name)
+	d.mu.Unlock()
+
 	ev(notify.DeploySuccess, "", "")
 	log.Info("deployed", "sha", newSHA)
 	return OutcomeDeployed
@@ -500,6 +512,105 @@ func (d *Deployer) DryRun(ctx context.Context, st config.StackConfig) (DryRunRep
 	return report, nil
 }
 
+// CheckHealth is the drift-detection probe (reconciliation-lite): a single
+// `compose ps` snapshot of an already-deployed stack, notifying on a
+// regression (a service unhealthy/dead/crashed) and once again on recovery.
+// It NEVER remediates — detection only; the operator decides (backup + human).
+//
+// It is deliberately quiet in every ambiguous case: it runs only for a stack
+// whose last deploy succeeded (a baseline exists), skips when a deploy owns
+// the stack (a `compose up` in flight would show a transient state), and
+// swallows a `ps` error (a docker hiccup is not a drift). A manually stopped
+// service (exited 0) or a fully downed stack (no services) is out of scope,
+// same family as a one-shot init container — see assess.
+func (d *Deployer) CheckHealth(ctx context.Context, st config.StackConfig) Outcome {
+	lock := d.stackLock(st.Name)
+	if !lock.TryLock() {
+		return OutcomeSkipped // a deploy owns the stack; its own verify covers health
+	}
+	defer lock.Unlock()
+
+	// Bound the probe by the health-check budget (verify_timeout), NOT the
+	// whole-deploy run_timeout: this lock is held across the ps, and a wedged
+	// docker under a 30m run_timeout would TryLock-starve real deploys for the
+	// stack. The caller passes a cancellable ctx so shutdown interrupts a hung
+	// probe at once.
+	timeout := st.VerifyTimeout.Duration
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	log := d.log.With("stack", st.Name, "mode", "drift")
+
+	prev, _ := d.store.Get(st.Name)
+	if prev.LastStatus != state.StatusSuccess {
+		return OutcomeUpToDate // no healthy baseline to drift from
+	}
+
+	dir := filepath.Join(d.cfg.BaseDir, st.Name)
+	root := stackRoot(dir, st)
+	// PS addresses the project by name only (-p), so no compose file or sops
+	// setup is needed (it never re-triggers secret decryption).
+	services, err := d.runtime.PS(ctx, compose.Options{Dir: root, Project: st.Name})
+	if err != nil {
+		// A docker hiccup is not a drift signal: log and leave the episode
+		// state untouched rather than raise (or clear) a false alert.
+		if ctx.Err() == nil {
+			log.Warn("drift check: compose ps failed, skipping this round", "error", err)
+		}
+		return OutcomeUpToDate
+	}
+	bad := driftBad(services) // pending (still starting) is not drift
+
+	d.mu.Lock()
+	wasBad := d.driftBad[st.Name]
+	switch {
+	case len(bad) > 0 && !wasBad:
+		d.driftBad[st.Name] = true
+		d.mu.Unlock()
+		log.Warn("drift detected", "services", bad)
+		d.notifyDrift(ctx, st, notify.DriftDetected,
+			fmt.Sprintf("degraded service(s): %s", strings.Join(bad, ", ")))
+		return OutcomeDrifted
+	case len(bad) > 0:
+		d.mu.Unlock()
+		return OutcomeDrifted // still bad, already notified — suppress
+	case wasBad && len(services) > 0:
+		// Genuine recovery: services are present and none are bad.
+		delete(d.driftBad, st.Name)
+		d.mu.Unlock()
+		log.Info("drift resolved", "stack", st.Name)
+		d.notifyDrift(ctx, st, notify.DriftResolved, "all services healthy again")
+		return OutcomeUpToDate
+	case wasBad:
+		// Zero services while an episode is open (e.g. the stack was torn down
+		// during incident response): NOT a recovery — nothing is healthy, it
+		// is gone. Keep the episode open and stay quiet rather than fire a
+		// false "all services healthy again".
+		d.mu.Unlock()
+		return OutcomeDrifted
+	default:
+		d.mu.Unlock()
+		return OutcomeUpToDate // healthy (or out of scope: 0 services, never drifted)
+	}
+}
+
+// notifyDrift sends a drift event on a detached, bounded context (a drift
+// notification must not be tied to the poll tick's lifetime), mirroring
+// noteGitSync.
+func (d *Deployer) notifyDrift(ctx context.Context, st config.StackConfig, t notify.EventType, detail string) {
+	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
+	defer cancel()
+	prev, _ := d.store.Get(st.Name)
+	_ = d.notifier.Notify(nctx, notify.Event{
+		Type: t, Stack: st.Name, Ref: st.Ref,
+		OldSHA: prev.LastDeployedSHA, Stage: "drift",
+		Detail: detail, Time: time.Now(),
+	})
+}
+
 // setupSops fills opts with either the exec-env prefix or tmpfs env-files.
 // The returned cleanup must always run.
 func (d *Deployer) setupSops(ctx context.Context, st config.StackConfig, dir, runID string, opts *compose.Options) (func(), error) {
@@ -581,6 +692,23 @@ func assess(services []compose.Service) (bad, pending []string) {
 		}
 	}
 	return bad, pending
+}
+
+// driftBad is assess's "bad" set widened for the periodic drift lens: a
+// crash-looping container reports State=="restarting", which assess buckets as
+// "pending". verify() tolerates that (it polls to a deadline, then fails), but
+// the drift check has no deadline — so without this a crash loop (the classic
+// OOM-with-restart-policy regression) would be ignored on every round forever.
+func driftBad(services []compose.Service) []string {
+	bad, _ := assess(services)
+	for _, s := range services {
+		// s.Health=="unhealthy" is already counted by assess; guard against
+		// listing a restarting-and-unhealthy container twice.
+		if s.State == "restarting" && s.Health != "unhealthy" {
+			bad = append(bad, fmt.Sprintf("%s (restarting)", s.Name))
+		}
+	}
+	return bad
 }
 
 // noteGitSync tracks consecutive git sync failures per stack and fires

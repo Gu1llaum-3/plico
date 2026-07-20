@@ -92,10 +92,16 @@ n'existe dans doco-cd.
       déploiement, SHA préservé si filtré. **Un clone par stack conservé** (pas
       le clone partagé de doco-cd et sa dette de concurrence repo+ref) : la
       duplication disque est négligeable en mono-opérateur.
-- [ ] **Détection de dérive (« reconciliation-lite »)** : re-check périodique
-      de la santé des stacks entre les déploiements via `compose ps` →
-      notification sur dérive (unhealthy, service arrêté à la main). **Pas de
-      remédiation automatique** : backup + alerte + humain, toujours
+- [x] **Détection de dérive (« reconciliation-lite »)** : re-check périodique
+      (`drift_interval`, défaut 2m, actif par défaut) de `compose ps` des stacks
+      déployées → `drift_detected` sur régression, `drift_resolved` à la reprise
+      (dédup une alerte par épisode). **Pas de remédiation automatique** :
+      backup + alerte + humain, toujours (contrairement à Flux/Argo qui
+      ré-appliquent). Passe scheduler **indépendante** de la machine à états des
+      fenêtres. **Cut minimal assumé** : signal = `assess.bad` (unhealthy / dead
+      / exited≠0) uniquement ; le stop manuel (`exited 0`) et la stack descendue
+      (0 service) sont hors périmètre (indistinguables d'un one-shot) — cut 2
+      « ensemble de services attendu » si besoin un jour.
 - [ ] **Options compose fines par stack** : `profiles`, `env_files`
       additionnels, `remove_orphans` désactivable, args `up` supplémentaires
 - [ ] **`plico healthcheck`** : sous-commande qui sonde son propre /healthz

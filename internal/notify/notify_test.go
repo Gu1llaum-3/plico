@@ -170,7 +170,7 @@ func TestDefaultEventsAreFailureOriented(t *testing.T) {
 			t.Errorf("%s must be opt-in, not part of the defaults", e)
 		}
 	}
-	for _, want := range []EventType{PreHookFailed, DeployFailed, WindowMissed, GitSyncFailed} {
+	for _, want := range []EventType{PreHookFailed, DeployFailed, WindowMissed, GitSyncFailed, DriftDetected} {
 		found := false
 		for _, e := range DefaultEvents {
 			if e == want {
@@ -179,6 +179,31 @@ func TestDefaultEventsAreFailureOriented(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("%s missing from the failure-oriented defaults", want)
+		}
+	}
+	// drift_resolved is a positive/recovery signal: opt-in, like deploy_success.
+	for _, e := range DefaultEvents {
+		if e == DriftResolved {
+			t.Errorf("%s must be opt-in, not part of the defaults", e)
+		}
+	}
+}
+
+func TestDriftEventsParseAndAreKnown(t *testing.T) {
+	t.Parallel()
+	evs, err := ParseEvents([]string{"drift_detected", "drift_resolved"})
+	if err != nil || len(evs) != 2 {
+		t.Fatalf("ParseEvents(drift_*) = %v, %v", evs, err)
+	}
+	for _, want := range []EventType{DriftDetected, DriftResolved} {
+		found := false
+		for _, e := range AllEvents {
+			if e == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s missing from AllEvents (config validation would reject it)", want)
 		}
 	}
 }

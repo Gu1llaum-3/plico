@@ -59,11 +59,11 @@ func formatBody(ev Event) string {
 
 func priorityFor(t EventType) string {
 	switch t {
-	case PreHookFailed, DeployFailed, GitSyncFailed:
+	case PreHookFailed, DeployFailed, GitSyncFailed, DriftDetected:
 		return "high"
 	case PreHookSkipped, WindowMissed:
 		return "default"
-	case DeploySuccess:
+	case DeploySuccess, DriftResolved:
 		return "default"
 	default: // deploy_queued, deploy_start
 		return "low"
@@ -72,11 +72,11 @@ func priorityFor(t EventType) string {
 
 func tagsFor(t EventType) string {
 	switch t {
-	case PreHookFailed, DeployFailed, GitSyncFailed:
+	case PreHookFailed, DeployFailed, GitSyncFailed, DriftDetected:
 		return "rotating_light"
 	case PreHookSkipped, WindowMissed:
 		return "warning"
-	case DeploySuccess:
+	case DeploySuccess, DriftResolved:
 		return "white_check_mark"
 	default:
 		return "package"
