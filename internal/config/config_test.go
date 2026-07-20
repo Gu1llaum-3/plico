@@ -91,6 +91,29 @@ func TestLoadValidConfigWithDefaults(t *testing.T) {
 	}
 }
 
+func TestStackPathDecodesAndDefaultsEmpty(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+base_dir = "/opt/docker"
+[[stack]]
+name = "traefik"
+repo = "https://example.com/infra.git"
+path = "traefik"
+[[stack]]
+name = "root"
+repo = "https://example.com/single.git"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Stacks[0].Path != "traefik" {
+		t.Errorf("path not decoded: %q", cfg.Stacks[0].Path)
+	}
+	if cfg.Stacks[1].Path != "" {
+		t.Errorf("unset path must default to empty (repo root), got %q", cfg.Stacks[1].Path)
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	t.Setenv("PLICO_TEST_TOKEN", "x")
 	base := `
@@ -119,6 +142,9 @@ repo = "https://example.com/repo.git"
 		{"undefined env var", base + "\n[ntfy]\nurl = \"${PLICO_UNDEFINED_VAR_42}\"\n", "PLICO_UNDEFINED_VAR_42"},
 		{"negative max_concurrent_deploys", "max_concurrent_deploys = -1\n" + base, ">= 1"},
 		{"traversal sops segment", base + "\nsops_files = [\"a/../../evil.env\"]\n", "repo-relative"},
+		{"absolute path", base + "\npath = \"/etc\"\n", "repo-relative subdirectory"},
+		{"escaping path", base + "\npath = \"../../evil\"\n", "repo-relative subdirectory"},
+		{"traversal path segment", base + "\npath = \"a/../../evil\"\n", "repo-relative subdirectory"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

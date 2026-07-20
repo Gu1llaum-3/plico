@@ -83,8 +83,15 @@ n'existe dans doco-cd.
 
 ## 🔭 v1.x — Combler l'écart doco-cd (à la carte, dans cet ordre)
 
-- [ ] **`path` par stack (monorepo)** : pointer un sous-répertoire du repo —
-      effort faible, forte valeur, aligné avec le modèle existant
+- [x] **`path` par stack (monorepo)** : `path` pointe un sous-répertoire du
+      repo comme racine de contenu (compose + son cwd, hooks `.deploy/`, sops).
+      Détection de changement **scopée au sous-dossier** (`git diff --name-only
+      old..new -- <path>`) : un commit ne touchant que `a/` ne redéploie pas
+      `b/` — sans quoi le HEAD du repo, commun aux stacks, redéploierait les 5.
+      Fail-open si le diff échoue, court-circuité par `--force` et au premier
+      déploiement, SHA préservé si filtré. **Un clone par stack conservé** (pas
+      le clone partagé de doco-cd et sa dette de concurrence repo+ref) : la
+      duplication disque est négligeable en mono-opérateur.
 - [ ] **Détection de dérive (« reconciliation-lite »)** : re-check périodique
       de la santé des stacks entre les déploiements via `compose ps` →
       notification sur dérive (unhealthy, service arrêté à la main). **Pas de

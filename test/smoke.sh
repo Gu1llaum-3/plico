@@ -33,9 +33,12 @@ ok() { echo "OK: $1"; }
 
 cleanup() {
   [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
+  [ -n "${MONO_PID:-}" ] && kill "$MONO_PID" 2>/dev/null
   [ -n "${NTFY_PID:-}" ] && kill "$NTFY_PID" 2>/dev/null
   [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null
   docker compose -p smoke down --timeout 2 >/dev/null 2>&1
+  docker compose -p mono-a down --timeout 2 >/dev/null 2>&1
+  docker compose -p mono-b down --timeout 2 >/dev/null 2>&1
   rm -rf "$WS"
 }
 trap cleanup EXIT
@@ -268,6 +271,110 @@ grep -q "smoke: pre_hook_failed" "$NTFY_LOG" 2>/dev/null \
   && grep "smoke: pre_hook_failed" "$NTFY_LOG" | grep -q "pg_dump: connection refused" \
   && ok "pre_hook_failed notification carries the hook stderr end to end" \
   || fail "pre_hook_failed notification missing or without hook stderr"
+
+# ── 8. monorepo: two stacks in one repo, path-scoped change detection ──
+# One repo, two subdirs (a/, b/), each a stack via `path`. Proves end to end
+# (real git diff, real compose cwd) that a commit touching only a/ redeploys
+# stack "a" alone and leaves "b" untouched — the guarantee that makes `path`
+# usable in a monorepo.
+MONO_ORIGIN="$WS/mono-origin.git"
+MONO_WORK="$WS/mono-work"
+MONO_BASE="$WS/mono-base"
+MONO_MDIR="$WS/mono-markers"   # per-stack hook markers, one line per hook run
+MONO_PORT=19446
+mkdir -p "$MONO_BASE" "$MONO_MDIR"
+
+git init -q --bare -b main "$MONO_ORIGIN"
+git init -q -b main "$MONO_WORK"
+cd "$MONO_WORK" || exit 1
+git config user.email smoke@test && git config user.name smoke
+for s in a b; do
+  mkdir -p "$s/.deploy"
+  cat > "$s/docker-compose.yml" <<'EOF'
+services:
+  app:
+    image: alpine:3.20
+    command: ["sleep", "300"]
+EOF
+  # Same hook in both subdirs: keys its marker by $DEPLOY_STACK and records
+  # its cwd, which must be the subdir (proves the content root moved).
+  cat > "$s/.deploy/pre-deploy.sh" <<EOF
+#!/bin/sh
+echo "\$DEPLOY_STACK cwd=\$(pwd)" >> "$MONO_MDIR/\$DEPLOY_STACK"
+exit 0
+EOF
+  chmod +x "$s/.deploy/pre-deploy.sh"
+done
+git add -A && git commit -qm "mono v1"
+git remote add origin "$MONO_ORIGIN"
+git push -q origin main
+
+cat > "$WS/mono.toml" <<EOF
+base_dir = "$MONO_BASE"
+poll_interval = "5s"
+run_timeout = "5m"
+[api]
+# A short socket path: the unix-socket staging dir lives under dirname(socket)
+# and the whole thing must fit macOS's ~104-char sun_path limit — the deep
+# mktemp workspace + "mono-base/" would otherwise overflow it.
+socket = "$WS/m.sock"
+[health]
+listen = "127.0.0.1:$MONO_PORT"
+[[stack]]
+name = "mono-a"
+repo = "file://$MONO_ORIGIN"
+path = "a"
+verify_timeout = "60s"
+[[stack]]
+name = "mono-b"
+repo = "file://$MONO_ORIGIN"
+path = "b"
+verify_timeout = "60s"
+EOF
+
+"$PLICO" serve --config "$WS/mono.toml" > "$WS/mono.log" 2>&1 &
+MONO_PID=$!
+
+i=0
+while [ $i -lt 90 ]; do
+  n=$(grep -c '"last_status": *"success"' "$MONO_BASE/state.json" 2>/dev/null || echo 0)
+  [ "$n" -ge 2 ] && break
+  i=$((i+1)); sleep 1
+done
+[ "${n:-0}" -ge 2 ] \
+  && ok "both monorepo stacks deployed from one repo" \
+  || fail "monorepo stacks did not both reach success (got ${n:-0}/2)"
+# Each hook ran once, with its cwd at its own subdirectory.
+grep -q "cwd=.*/a$" "$MONO_MDIR/mono-a" 2>/dev/null \
+  && grep -q "cwd=.*/b$" "$MONO_MDIR/mono-b" 2>/dev/null \
+  && ok "each stack's hook ran with cwd at its subdirectory" \
+  || fail "hook cwd not rooted at the subdirectory"
+
+A_BEFORE=$(wc -l < "$MONO_MDIR/mono-a" 2>/dev/null | tr -d ' ')
+B_BEFORE=$(wc -l < "$MONO_MDIR/mono-b" 2>/dev/null | tr -d ' ')
+
+# Commit touching ONLY a/. The repo HEAD moves for both stacks, but only "a"
+# has a change under its subtree.
+sed -i.bak 's/"300"/"301"/' a/docker-compose.yml && rm -f a/docker-compose.yml.bak
+git add -A && git commit -qm "mono v2: change a only" && git push -q origin main
+
+i=0
+while [ $i -lt 60 ]; do
+  A_NOW=$(wc -l < "$MONO_MDIR/mono-a" 2>/dev/null | tr -d ' ')
+  [ "${A_NOW:-0}" -gt "${A_BEFORE:-0}" ] && break
+  i=$((i+1)); sleep 1
+done
+# Give b at least two more poll ticks (5s each) to (wrongly) redeploy if the
+# filter leaks.
+sleep 12
+A_NOW=$(wc -l < "$MONO_MDIR/mono-a" 2>/dev/null | tr -d ' ')
+B_NOW=$(wc -l < "$MONO_MDIR/mono-b" 2>/dev/null | tr -d ' ')
+[ "${A_NOW:-0}" -gt "${A_BEFORE:-0}" ] \
+  && ok "commit under a/ redeployed stack a (hook re-ran)" \
+  || fail "stack a did not redeploy on a change to its subtree"
+[ "${B_NOW:-0}" -eq "${B_BEFORE:-0}" ] \
+  && ok "commit under a/ did NOT redeploy stack b (path-scoped detection)" \
+  || fail "stack b redeployed despite no change under its path (b: $B_BEFORE -> $B_NOW)"
 
 # ── verdict ────────────────────────────────────────────────────────────
 if [ -z "$FAILURES" ]; then

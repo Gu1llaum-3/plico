@@ -140,6 +140,17 @@ type DryRunReport struct {
 	Commits  []string `json:"commits,omitempty"` // git log --oneline old..new
 }
 
+// stackRoot is the stack's content root: the git checkout dir, or a
+// subdirectory of it when st.Path is set (monorepo). Compose, hooks and sops
+// resolve here; git operations stay at the checkout dir. filepath.Join cleans
+// the result, and st.Path is validated repo-relative at config load.
+func stackRoot(dir string, st config.StackConfig) string {
+	if st.Path == "" {
+		return dir
+	}
+	return filepath.Join(dir, st.Path)
+}
+
 // RunStack executes one full cycle for a stack. It never panics; every error
 // is logged and notified before returning.
 func (d *Deployer) RunStack(ctx context.Context, st config.StackConfig) Outcome {
@@ -161,7 +172,8 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	ctx, cancel := context.WithTimeout(ctx, d.cfg.RunTimeout.Duration)
 	defer cancel()
 
-	dir := filepath.Join(d.cfg.BaseDir, st.Name)
+	dir := filepath.Join(d.cfg.BaseDir, st.Name) // git checkout (whole repo)
+	root := stackRoot(dir, st)                   // stack content root (== dir unless st.Path is set)
 
 	// 1. git sync — a fetch failure is not a deploy failure: nothing was
 	// going to be deployed. Logged and counted: a PERSISTENT failure
@@ -179,6 +191,24 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	if newSHA == oldSHA && !opts.Force {
 		log.Debug("up to date", "sha", newSHA)
 		return OutcomeUpToDate
+	}
+	// Monorepo scoping: a stack rooted at a subdirectory only redeploys when
+	// the delta actually touches that subtree. A commit to a sibling stack
+	// must not re-run this stack's hook/pull. The deployed SHA is left
+	// untouched on a skip (the state never claims a deployment that did not
+	// happen). Bypassed by --force and by the first deploy (no oldSHA to diff
+	// against); fail-open if the diff errors (oldSHA gone after a force-push).
+	if st.Path != "" && oldSHA != "" && !opts.Force {
+		changed, derr := d.git.PathChanged(ctx, st.Repo, dir, oldSHA, newSHA, st.Path)
+		switch {
+		case derr != nil:
+			log.Warn("path-scoped diff failed, deploying to be safe",
+				"path", st.Path, "old_sha", oldSHA, "new_sha", newSHA, "error", derr)
+		case !changed:
+			log.Info("git delta is outside this stack's path, skipping",
+				"path", st.Path, "old_sha", oldSHA, "new_sha", newSHA)
+			return OutcomeUpToDate
+		}
 	}
 	log.Info("git delta detected", "old_sha", oldSHA, "new_sha", newSHA, "forced", opts.Force)
 
@@ -251,14 +281,14 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	// only through the API's force acknowledgement, and always loud (F30).
 	// The hook runs with a scoped environment (baseline + DEPLOY_* + the
 	// global∪stack passthrough), never the daemon's secrets.
-	hctx := hooks.Context{Stack: st.Name, Dir: dir, GitRef: st.Ref, OldSHA: oldSHA, NewSHA: newSHA}
+	hctx := hooks.Context{Stack: st.Name, Dir: root, GitRef: st.Ref, OldSHA: oldSHA, NewSHA: newSHA}
 	hookEnv := st.HookEnvPassthrough(d.cfg.Hooks.EnvPassthrough)
 	if opts.SkipPre {
 		log.Warn("PRE-DEPLOY HOOK MANUALLY SKIPPED: deploying without the backup gate",
 			"stage", StagePreHook)
 		ev(notify.PreHookSkipped, StagePreHook, "pre-deploy hook manually skipped (--skip-pre --force)")
 	} else {
-		res, err := hooks.Resolve(dir, hooks.RepoPreDeploy, d.cfg.Hooks.PreDeployPath)
+		res, err := hooks.Resolve(root, hooks.RepoPreDeploy, d.cfg.Hooks.PreDeployPath)
 		if err != nil {
 			log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
 			fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
@@ -281,8 +311,8 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	}
 
 	// 7. sops plumbing (F16).
-	copts := compose.Options{Dir: dir, ComposeFile: st.ComposeFile, Project: st.Name}
-	cleanup, err := d.setupSops(ctx, st, dir, runID, &copts)
+	copts := compose.Options{Dir: root, ComposeFile: st.ComposeFile, Project: st.Name}
+	cleanup, err := d.setupSops(ctx, st, root, runID, &copts)
 	if err != nil {
 		log.Error("sops setup failed", "stage", StageSops, "error", err)
 		fail(notify.DeployFailed, StageSops, err.Error(), oldSHA, state.StatusFailed)
@@ -319,7 +349,7 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	// low risk).
 	if opts.SkipPost {
 		log.Info("post-deploy hook manually skipped", "stage", StagePostHook)
-	} else if res, err := hooks.Resolve(dir, hooks.RepoPostDeploy, d.cfg.Hooks.PostDeployPath); err != nil {
+	} else if res, err := hooks.Resolve(root, hooks.RepoPostDeploy, d.cfg.Hooks.PostDeployPath); err != nil {
 		log.Warn("post-deploy hook unusable", "stage", StagePostHook, "error", err)
 	} else if res.Path != "" {
 		if _, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv); err != nil {
@@ -387,6 +417,31 @@ func (d *Deployer) CheckStack(ctx context.Context, st config.StackConfig) Outcom
 		return OutcomeQueued // already reported as failing; no new announcement
 	}
 
+	// Monorepo scoping (mirrors RunStackWith): don't announce a stack as
+	// pending when the delta is entirely in a sibling stack's subtree. Skip
+	// the first check (no prior SHA) and fail open on a diff error.
+	if st.Path != "" && prev.LastDeployedSHA != "" {
+		changed, derr := d.git.PathChanged(ctx, st.Repo, dir, prev.LastDeployedSHA, newSHA, st.Path)
+		switch {
+		case derr != nil:
+			log.Warn("path-scoped diff failed, announcing to be safe",
+				"path", st.Path, "old_sha", prev.LastDeployedSHA, "new_sha", newSHA, "error", derr)
+		case !changed:
+			log.Info("git delta is outside this stack's path, not queuing",
+				"path", st.Path, "old_sha", prev.LastDeployedSHA, "new_sha", newSHA)
+			// If a revision was previously queued but the current HEAD has
+			// since restored this stack's subtree to the deployed content,
+			// the announced revision is no longer pending: clear the stale
+			// dedup marker so state.json does not advertise a phantom queue.
+			if prev.LastQueuedSHA != "" {
+				d.saveState(log, st.Name, func(s2 *state.StackState) {
+					s2.LastQueuedSHA = ""
+				})
+			}
+			return OutcomeUpToDate
+		}
+	}
+
 	log.Info("git delta detected, queued until the next deployment window",
 		"old_sha", prev.LastDeployedSHA, "new_sha", newSHA)
 	nctx, ncancel := context.WithTimeout(context.WithoutCancel(ctx), notifyTimeout)
@@ -426,6 +481,14 @@ func (d *Deployer) DryRun(ctx context.Context, st config.StackConfig) (DryRunRep
 		Stack: st.Name, Ref: st.Ref,
 		OldSHA: prev.LastDeployedSHA, NewSHA: newSHA,
 		UpToDate: newSHA == prev.LastDeployedSHA,
+	}
+	// Monorepo scoping (mirrors RunStackWith): a delta outside this stack's
+	// subtree would be a no-op deploy, so report it as up-to-date. Fail open
+	// on a diff error (report the delta rather than hide it).
+	if !report.UpToDate && st.Path != "" && prev.LastDeployedSHA != "" {
+		if changed, derr := d.git.PathChanged(ctx, st.Repo, dir, prev.LastDeployedSHA, newSHA, st.Path); derr == nil && !changed {
+			report.UpToDate = true
+		}
 	}
 	if !report.UpToDate && prev.LastDeployedSHA != "" {
 		commits, err := d.git.LogRange(ctx, st.Repo, dir, prev.LastDeployedSHA, newSHA)

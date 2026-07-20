@@ -97,6 +97,25 @@ func (c *Client) LogRange(ctx context.Context, repoURL, dir, oldSHA, newSHA stri
 	return out, nil
 }
 
+// PathChanged reports whether any file under repoRelPath differs between
+// oldSHA and newSHA. It backs the monorepo scoping: a stack rooted at a
+// subdirectory must not redeploy when a commit only touched a sibling
+// subtree. It is a local object-store operation (no worktree, no network),
+// so it is safe to call before the checkout. An error (e.g. oldSHA gone
+// after an upstream force-push) is returned so the caller can fail open.
+func (c *Client) PathChanged(ctx context.Context, repoURL, dir, oldSHA, newSHA, repoRelPath string) (bool, error) {
+	// `:(literal)` disables pathspec glob magic, so a directory whose name
+	// contains *, ?, [ ] or a leading : is matched verbatim. Without it such a
+	// name would be read as a glob and could silently match nothing — a missed
+	// deploy, the one failure mode this whole feature must never have.
+	pathspec := ":(literal)" + repoRelPath
+	res, err := c.git(ctx, dir, repoURL, "diff", "--name-only", oldSHA+".."+newSHA, "--", pathspec)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(res.Stdout)) != "", nil
+}
+
 // CheckoutDetached puts the worktree at sha (F: versioned hooks and compose
 // files come from the exact revision being deployed).
 func (c *Client) CheckoutDetached(ctx context.Context, repoURL, dir, sha string) error {

@@ -111,10 +111,17 @@ type GitConfig struct {
 }
 
 type StackConfig struct {
-	Name          string   `toml:"name"`
-	Repo          string   `toml:"repo"`
-	Ref           string   `toml:"ref"`          // default "main"
-	ComposeFile   string   `toml:"compose_file"` // default "docker-compose.yml"
+	Name string `toml:"name"`
+	Repo string `toml:"repo"`
+	Ref  string `toml:"ref"` // default "main"
+	// Path is a repo-relative subdirectory that becomes this stack's content
+	// root (monorepo support): compose_file, sops_files and the .deploy hooks
+	// resolve under it, and docker compose runs with it as its working
+	// directory. Empty = the repo root (one repo == one stack, unchanged).
+	// A stack rooted at a subdirectory only redeploys when a commit touches a
+	// file under it (see the deploy pipeline's path-scoped change detection).
+	Path          string   `toml:"path"`
+	ComposeFile   string   `toml:"compose_file"` // default "docker-compose.yml"; relative to Path
 	ForcePull     *bool    `toml:"force_pull"`   // default true (F17)
 	SopsFiles     []string `toml:"sops_files"`   // repo-relative; empty = no sops
 	SopsMode      string   `toml:"sops_mode"`    // "exec-env" (default) | "tmpfs"
@@ -418,6 +425,9 @@ func (c *Config) Validate() error {
 			if err := validateSchedule(st.Schedule); err != nil {
 				return fmt.Errorf("stack %q: schedule %q: %w", st.Name, st.Schedule, err)
 			}
+		}
+		if st.Path != "" && (filepath.IsAbs(st.Path) || escapesRepo(st.Path)) {
+			return fmt.Errorf("stack %q: path %q must be a repo-relative subdirectory", st.Name, st.Path)
 		}
 		for _, f := range st.SopsFiles {
 			if filepath.IsAbs(f) || escapesRepo(f) {

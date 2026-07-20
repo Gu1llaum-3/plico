@@ -199,3 +199,49 @@ func TestNonCorruptionErrorIsNotRetried(t *testing.T) {
 		t.Errorf("network error must not trigger re-clone, got %d calls", len(fake.Calls))
 	}
 }
+
+func TestPathChanged(t *testing.T) {
+	t.Parallel()
+	const old, newer = "aaa", "bbb"
+	tests := []struct {
+		name    string
+		out     string
+		callErr error
+		want    bool
+		wantErr bool
+	}{
+		{"files under path changed", "traefik/docker-compose.yml\ntraefik/.env\n", nil, true, false},
+		{"nothing under path", "", nil, false, false},
+		{"whitespace-only output", "  \n", nil, false, false},
+		{"diff error propagates", "", errors.New("fatal: bad object aaa"), false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fake := &execx.FakeRunner{Script: []execx.Response{
+				{Result: execx.Result{Stdout: []byte(tt.out)}, Err: tt.callErr},
+			}}
+			c := New(fake, nil, discard())
+			got, err := c.PathChanged(context.Background(), "https://example.com/r.git", mkClone(t), old, newer, "traefik")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("want error to propagate")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Errorf("PathChanged = %v, want %v", got, tt.want)
+			}
+			args := fake.Calls[0].Args
+			// The subpath is a literal pathspec (glob magic disabled) so a
+			// directory named e.g. foo[bar] is matched verbatim, not as a glob.
+			want := []string{"diff", "--name-only", old + ".." + newer, "--", ":(literal)traefik"}
+			if !slices.Equal(args, want) {
+				t.Errorf("argv = %v, want %v", args, want)
+			}
+		})
+	}
+}

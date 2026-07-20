@@ -96,6 +96,13 @@ type harness struct {
 	store    *state.Store
 	worktree string
 	gitFake  *execx.FakeRunner
+
+	// diffFiles/diffErr drive the path-scoped change filter (`git diff
+	// --name-only`), only consulted when a stack has a non-empty Path.
+	// Default: a non-empty listing, so a subdir stack deploys unless a test
+	// clears it.
+	diffFiles string
+	diffErr   error
 }
 
 const (
@@ -127,6 +134,7 @@ func newHarness(t *testing.T) *harness {
 		VerifyTimeout: config.Duration{Duration: 30 * time.Second},
 	}}
 
+	h := &harness{}
 	gitFake := &execx.FakeRunner{Match: func(c execx.Cmd) (execx.Result, error) {
 		if c.Name != "git" {
 			return execx.Result{}, errors.New("harness: only git goes through the fake runner")
@@ -138,6 +146,8 @@ func newHarness(t *testing.T) *harness {
 			return execx.Result{Stdout: []byte(newSHA + "\n")}, nil
 		case "log":
 			return execx.Result{Stdout: []byte("2222222 add feature\n")}, nil
+		case "diff":
+			return execx.Result{Stdout: []byte(h.diffFiles)}, h.diffErr
 		}
 		return execx.Result{}, errors.New("harness: unexpected git subcommand " + c.Args[0])
 	}}
@@ -163,12 +173,26 @@ func newHarness(t *testing.T) *harness {
 		gitFake, // sops tmpfs path unused in these tests
 		discard(),
 	)
-	return &harness{deployer: d, cfg: cfg, stack: cfg.Stacks[0], runtime: rt, events: events, store: store, worktree: worktree, gitFake: gitFake}
+	*h = harness{deployer: d, cfg: cfg, stack: cfg.Stacks[0], runtime: rt, events: events, store: store, worktree: worktree, gitFake: gitFake, diffFiles: "changed-file\n"}
+	return h
 }
 
 func (h *harness) writePreHook(t *testing.T, body string) {
 	t.Helper()
 	path := filepath.Join(h.worktree, hooks.RepoPreDeploy)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writePreHookAt writes a pre-deploy hook under a subdirectory of the
+// worktree (monorepo layout), proving Resolve roots at dir/path.
+func (h *harness) writePreHookAt(t *testing.T, subdir, body string) {
+	t.Helper()
+	path := filepath.Join(h.worktree, subdir, hooks.RepoPreDeploy)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -822,3 +846,219 @@ func TestAssess(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// diffCalls counts `git diff` invocations recorded by the fake git runner.
+func (h *harness) diffCalls() int {
+	n := 0
+	for _, c := range h.gitFake.Calls {
+		if c.Name == "git" && len(c.Args) > 0 && c.Args[0] == "diff" {
+			n++
+		}
+	}
+	return n
+}
+
+// --- monorepo: `path` per stack -------------------------------------------
+
+// With a non-empty Path, compose, hooks and sops root at <worktree>/<path>,
+// not the repo root. The hook lives only under the subdir, so a deploy that
+// finds and runs it proves Resolve rooted correctly; the marker it writes
+// proves the hook's cwd is the subdir too.
+func TestStackPathRootsContentAtSubdir(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	st := h.stack
+	st.Path = "web-sub"
+	h.writePreHookAt(t, "web-sub", "touch ran-here")
+
+	if outcome := h.deployer.RunStack(context.Background(), st); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", outcome)
+	}
+	// Hook was resolved from the subdir (not skipped) and ran there.
+	wantEvents(t, h.events.types(), notify.DeployQueued, notify.DeployStart, notify.DeploySuccess)
+	subdir := filepath.Join(h.worktree, "web-sub")
+	if _, err := os.Stat(filepath.Join(subdir, "ran-here")); err != nil {
+		t.Errorf("hook cwd was not the subdir: %v", err)
+	}
+	// compose ran with the subdir as its working directory.
+	if len(h.runtime.ups) != 1 || h.runtime.ups[0].Dir != subdir {
+		t.Errorf("compose Dir = %q, want %q", h.runtime.ups[0].Dir, subdir)
+	}
+}
+
+// A commit that touches nothing under the stack's path is a no-op: no hook,
+// no pull, no notification, and the deployed SHA is left untouched (the state
+// must not claim a deployment that never happened).
+func TestPathFilterSkipsWhenNothingChangedUnderPath(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffFiles = "" // the delta is entirely in a sibling stack's subtree
+	st := h.stack
+	st.Path = "web-sub"
+	h.writePreHookAt(t, "web-sub", "touch SHOULD-NOT-RUN")
+
+	if outcome := h.deployer.RunStack(context.Background(), st); outcome != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date", outcome)
+	}
+	if got := h.events.types(); len(got) != 0 {
+		t.Errorf("filtered stack must not notify, got %v", got)
+	}
+	if len(h.runtime.pulls)+len(h.runtime.ups) != 0 {
+		t.Error("filtered stack must not touch compose")
+	}
+	if _, err := os.Stat(filepath.Join(h.worktree, "web-sub", "SHOULD-NOT-RUN")); err == nil {
+		t.Error("hook ran despite the path filter")
+	}
+	if st, _ := h.store.Get("web"); st.LastDeployedSHA != oldSHA {
+		t.Errorf("filtered stack advanced its SHA to %q, want unchanged %q", st.LastDeployedSHA, oldSHA)
+	}
+	// The filter must have asked git, scoped to the repo root + the subpath.
+	if h.diffCalls() != 1 {
+		t.Fatalf("want exactly one git diff, got %d", h.diffCalls())
+	}
+	var diff execx.Cmd
+	for _, c := range h.gitFake.Calls {
+		if len(c.Args) > 0 && c.Args[0] == "diff" {
+			diff = c
+		}
+	}
+	if diff.Dir != h.worktree {
+		t.Errorf("git diff ran in %q, want repo root %q", diff.Dir, h.worktree)
+	}
+	if diff.Args[len(diff.Args)-1] != ":(literal)web-sub" {
+		t.Errorf("git diff not scoped to the subpath as a literal pathspec: %v", diff.Args)
+	}
+}
+
+func TestPathFilterDeploysWhenChangeUnderPath(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffFiles = "web-sub/docker-compose.yml\n"
+	st := h.stack
+	st.Path = "web-sub"
+	if outcome := h.deployer.RunStack(context.Background(), st); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", outcome)
+	}
+}
+
+// If the diff can't be computed (oldSHA gone after an upstream force-push),
+// deploy rather than risk missing a real change.
+func TestPathFilterFailsOpenOnDiffError(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffErr = errors.New("fatal: bad object 1111")
+	st := h.stack
+	st.Path = "web-sub"
+	if outcome := h.deployer.RunStack(context.Background(), st); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed (fail-open)", outcome)
+	}
+}
+
+func TestPathFilterBypassedByForce(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffFiles = "" // nothing under path — but the operator forces
+	st := h.stack
+	st.Path = "web-sub"
+	if outcome := h.deployer.RunStackWith(context.Background(), st, RunOptions{Force: true}); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed (force bypasses the filter)", outcome)
+	}
+	if h.diffCalls() != 0 {
+		t.Errorf("force must not consult the path filter, got %d diff calls", h.diffCalls())
+	}
+}
+
+// The first deploy (no prior deployed SHA) has nothing to diff against and
+// must deploy without consulting the filter.
+func TestPathFilterFirstDeployNeedsNoDiff(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffFiles = "" // would skip if wrongly consulted
+	if err := h.store.Put("web", state.StackState{}); err != nil {
+		t.Fatal(err)
+	}
+	st := h.stack
+	st.Path = "web-sub"
+	if outcome := h.deployer.RunStack(context.Background(), st); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", outcome)
+	}
+	if h.diffCalls() != 0 {
+		t.Errorf("first deploy must not diff, got %d calls", h.diffCalls())
+	}
+}
+
+// CheckStack must not announce a subdir stack as pending when the delta is
+// in a sibling subtree — otherwise a monorepo would queue every stack on any
+// commit.
+func TestCheckStackPathFilterDoesNotQueue(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffFiles = "" // delta is elsewhere in the repo
+	st := h.stack
+	st.Path = "web-sub"
+	if outcome := h.deployer.CheckStack(context.Background(), st); outcome != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date", outcome)
+	}
+	if len(h.events.types()) != 0 {
+		t.Errorf("must not announce queued, got %v", h.events.types())
+	}
+	if st, _ := h.store.Get("web"); st.LastQueuedSHA != "" {
+		t.Errorf("must not record a queued SHA, got %q", st.LastQueuedSHA)
+	}
+}
+
+// A revision queued earlier becomes moot once HEAD restores this stack's
+// subtree to the deployed content: CheckStack must clear the stale
+// LastQueuedSHA rather than leave state.json advertising a phantom queue.
+func TestCheckStackPathFilterClearsStaleQueuedSHA(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffFiles = "" // HEAD moved, but nothing under this stack's subtree
+	if err := h.store.Put("web", state.StackState{
+		LastDeployedSHA: oldSHA,
+		LastQueuedSHA:   "3333333333333333333333333333333333333333",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st := h.stack
+	st.Path = "web-sub"
+	if outcome := h.deployer.CheckStack(context.Background(), st); outcome != OutcomeUpToDate {
+		t.Fatalf("outcome = %s, want up_to_date", outcome)
+	}
+	if st, _ := h.store.Get("web"); st.LastQueuedSHA != "" {
+		t.Errorf("stale queued SHA not cleared: %q", st.LastQueuedSHA)
+	}
+}
+
+// DryRun reports up-to-date when the delta does not touch the stack's subtree
+// (a deploy would be a no-op), and lists no pending commits.
+func TestDryRunPathFilterReportsUpToDate(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.diffFiles = ""
+	st := h.stack
+	st.Path = "web-sub"
+	report, err := h.deployer.DryRun(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.UpToDate {
+		t.Errorf("report should be up-to-date for an out-of-subtree delta: %+v", report)
+	}
+	if len(report.Commits) != 0 {
+		t.Errorf("no commits should be listed, got %v", report.Commits)
+	}
+}
+
+// One repo == one stack (no Path) is strictly unchanged: no path-scoped diff
+// is ever issued.
+func TestNoPathIssuesNoDiff(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", outcome)
+	}
+	if h.diffCalls() != 0 {
+		t.Errorf("a repo-root stack must not issue git diff, got %d", h.diffCalls())
+	}
+}

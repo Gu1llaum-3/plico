@@ -120,7 +120,13 @@ timeout = "10m"
 name = "webapp"                       # directory name AND compose project name
 repo = "https://bitbucket.org/acme/webapp-deploy.git"
 ref = "main"                          # branch to follow
-compose_file = "docker-compose.yml"   # relative to the repo root
+# path = "webapp"                     # monorepo: subdirectory holding this
+                                      # stack (compose_file, sops_files and the
+                                      # .deploy hooks resolve under it). Empty =
+                                      # repo root. A subdir stack only
+                                      # redeploys when a commit touches its
+                                      # subtree.
+compose_file = "docker-compose.yml"   # relative to path (or the repo root)
 force_pull = true                     # run `compose pull` before `up`
 # SOPS-encrypted dotenv files (repo-relative). Decrypted in memory via
 # `sops exec-env`; compose interpolates ${VARS} from them. Never on disk.
@@ -136,3 +142,15 @@ verify_timeout = "90s"                # post-up healthcheck budget
 # name = "internal-tools"
 # repo = "https://gitea.example.com/infra/tools-deploy.git"
 # ref = "prod"
+
+# Monorepo: several stacks from ONE repo, each in its own subdirectory. Each
+# gets its own clone under <base_dir>/<name>; a commit touching only traefik/
+# redeploys "traefik" alone, not "nextcloud".
+# [[stack]]
+# name = "traefik"
+# repo = "https://github.com/acme/infra.git"
+# path = "traefik"                    # <repo>/traefik/{docker-compose.yml,.deploy/…}
+# [[stack]]
+# name = "nextcloud"
+# repo = "https://github.com/acme/infra.git"
+# path = "nextcloud"
