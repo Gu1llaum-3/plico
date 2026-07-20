@@ -186,7 +186,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 		s.mu.Lock()
 		s.lastTick = now
 		s.mu.Unlock()
-		apply, check := s.due(now.In(s.loc))
+		apply, check, events := s.due(now.In(s.loc))
+		// Emit missed-window events BEFORE dispatching this tick's runs, and
+		// off the tick path: a slow channel must not stall the loop (which
+		// would itself cause missed windows), and giving these events a head
+		// start reduces — but cannot fully remove — the chance a run's
+		// deploy_* notification overtakes them (they come from the deployer).
+		s.emit(events)
 		for _, st := range apply {
 			wg.Add(1)
 			go func(st config.StackConfig) {
@@ -216,14 +222,15 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// due returns the stacks to process this tick: apply gets the full pipeline,
-// check only fetch+diff+queued-notification (F6). A stack without a schedule
-// is always apply-due; a scheduled stack is apply-due while its window is
-// open, and check-due outside it when checks are enabled. Missed-window
-// notifications are collected under the lock and emitted after release.
-func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
+// due returns the stacks to process this tick and the missed-window
+// notifications this tick surfaced: apply gets the full pipeline, check only
+// fetch+diff+queued-notification (F6). A stack without a schedule is always
+// apply-due; a scheduled stack is apply-due while its window is open, and
+// check-due outside it when checks are enabled. The events are RETURNED (not
+// emitted here) so the caller controls timing and tests assert them
+// deterministically.
+func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig, events []notify.Event) {
 	grace := s.cfg.PollInterval.Duration // tolerated discovery lateness (ticker jitter)
-	var events []notify.Event
 	missed := func(st config.StackConfig, detail string) {
 		events = append(events, notify.Event{
 			Type: notify.WindowMissed, Stack: st.Name, Ref: st.Ref,
@@ -280,6 +287,14 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 			skipped = 0
 		}
 
+		// A skip streak ends the moment a tick does not skip — including a
+		// firing-less tick (skipped == 0, fired zero). Reset here, not only
+		// on a skip-free caught-up firing, or two distinct streaks separated
+		// by quiet ticks would collapse into one notification.
+		if skipped == 0 {
+			ss.skipNotified = false
+		}
+
 		justOpened := false
 		if !fired.IsZero() {
 			if skipped > 0 {
@@ -295,8 +310,6 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 					missed(st, fmt.Sprintf("%d scheduled firing(s) skipped without a run between %s and %s (daemon unavailable, or cron period < poll_interval); further occurrences are logged only",
 						skipped, firstSkipped.Format(time.RFC3339), lastSkipped.Format(time.RFC3339)))
 				}
-			} else {
-				ss.skipNotified = false
 			}
 			// A still-open window superseded by a new firing before any of
 			// its runs happened is a missed deployment. Deferred only when
@@ -358,21 +371,23 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig) {
 		}
 	}
 	s.mu.Unlock()
+	return apply, check, events
+}
 
-	// Emitted outside the lock AND asynchronously: a slow channel must
-	// stall neither Snapshot/healthz (the lock) nor the tick loop itself —
-	// a notifier burning its full timeout inside tick() would delay the
-	// dispatch of the runs this very tick selected.
-	if len(events) > 0 {
-		go func(events []notify.Event) {
-			for _, ev := range events {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				_ = s.notifier.Notify(ctx, ev)
-				cancel()
-			}
-		}(events)
+// emit sends collected events off the tick path: a slow channel must stall
+// neither the tick loop nor Snapshot/healthz (the lock). Best-effort by
+// design (see the deploy-notification ordering caveat in Run).
+func (s *Scheduler) emit(events []notify.Event) {
+	if len(events) == 0 {
+		return
 	}
-	return apply, check
+	go func() {
+		for _, ev := range events {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = s.notifier.Notify(ctx, ev)
+			cancel()
+		}
+	}()
 }
 
 func (s *Scheduler) runOne(ctx context.Context, st config.StackConfig, checkOnly bool) {

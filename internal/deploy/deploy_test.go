@@ -777,6 +777,28 @@ func TestGitSyncFailedAlertsOncePerOutage(t *testing.T) {
 	if count != 2 {
 		t.Errorf("dry-run success must reset the counter (no alert at 4 post-reset failures), got %d alerts", count)
 	}
+
+	// A CANCELLED dry-run (user Ctrl-C: context.Canceled) tells us nothing
+	// about git's health and must not count toward the outage threshold —
+	// otherwise repeated aborts alone would page the operator.
+	gitDown = false
+	if outcome := d.RunStack(context.Background(), cfg.Stacks[0]); outcome != OutcomeUpToDate {
+		t.Fatalf("recovery outcome = %s", outcome)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 6; i++ {
+		_, _ = d.DryRun(cancelled, cfg.Stacks[0])
+	}
+	count = 0
+	for _, tpe := range events.types() {
+		if tpe == notify.GitSyncFailed {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("cancelled dry-runs must not count as git failures, got %d alerts", count)
+	}
 }
 
 func TestAssess(t *testing.T) {

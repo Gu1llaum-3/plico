@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/smtp"
@@ -58,14 +59,17 @@ func (s *SMTP) auth() smtp.Auth {
 	return smtp.PlainAuth("", s.Username, s.Password, s.Host)
 }
 
-// deadlineSendMail is smtp.SendMail with a dial timeout and a hard deadline
-// on every read/write, plus STARTTLS when the server offers it.
+// deadlineSendMail is smtp.SendMail with a dial timeout and a PER-OPERATION
+// deadline (each protocol step gets a fresh smtpTimeout budget, so a slow
+// but progressing relay — greylisting, a delayed banner — is not killed by a
+// single deadline covering the whole exchange), plus STARTTLS when offered.
 func (s *SMTP) deadlineSendMail(addr string, a smtp.Auth, from string, to []string, msg []byte) error {
 	conn, err := net.DialTimeout("tcp", addr, smtpTimeout)
 	if err != nil {
 		return err
 	}
-	if err := conn.SetDeadline(time.Now().Add(smtpTimeout)); err != nil {
+	bump := func() error { return conn.SetDeadline(time.Now().Add(smtpTimeout)) }
+	if err := bump(); err != nil {
 		_ = conn.Close()
 		return err
 	}
@@ -75,25 +79,45 @@ func (s *SMTP) deadlineSendMail(addr string, a smtp.Auth, from string, to []stri
 		return err
 	}
 	defer func() { _ = c.Close() }()
+
 	if ok, _ := c.Extension("STARTTLS"); ok {
+		if err := bump(); err != nil {
+			return err
+		}
 		if err := c.StartTLS(&tls.Config{ServerName: s.Host}); err != nil {
 			return err
 		}
 	}
 	if a != nil {
-		if ok, _ := c.Extension("AUTH"); ok {
-			if err := c.Auth(a); err != nil {
-				return err
-			}
+		// Configured credentials against a server that doesn't advertise
+		// AUTH is a misconfiguration, not a silent unauthenticated send —
+		// match stdlib SendMail rather than hide it.
+		if ok, _ := c.Extension("AUTH"); !ok {
+			return errors.New("smtp: server doesn't support AUTH")
 		}
+		if err := bump(); err != nil {
+			return err
+		}
+		if err := c.Auth(a); err != nil {
+			return err
+		}
+	}
+	if err := bump(); err != nil {
+		return err
 	}
 	if err := c.Mail(from); err != nil {
 		return err
 	}
 	for _, rcpt := range to {
+		if err := bump(); err != nil {
+			return err
+		}
 		if err := c.Rcpt(rcpt); err != nil {
 			return err
 		}
+	}
+	if err := bump(); err != nil {
+		return err
 	}
 	w, err := c.Data()
 	if err != nil {
@@ -103,6 +127,9 @@ func (s *SMTP) deadlineSendMail(addr string, a smtp.Auth, from string, to []stri
 		return err
 	}
 	if err := w.Close(); err != nil {
+		return err
+	}
+	if err := bump(); err != nil {
 		return err
 	}
 	return c.Quit()

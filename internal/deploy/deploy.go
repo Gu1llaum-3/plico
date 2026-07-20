@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -522,6 +523,12 @@ func assess(services []compose.Service) (bad, pending []string) {
 func (d *Deployer) noteGitSync(ctx context.Context, st config.StackConfig, syncErr error) {
 	threshold := d.cfg.GitSyncAlertThreshold()
 	if threshold == 0 {
+		return
+	}
+	// A cancellation or timeout is not a git outage: a user Ctrl-C on a
+	// dry-run, or a run_timeout, must neither count toward the alert nor
+	// reset the counter — it carries no information about git's health.
+	if syncErr != nil && (errors.Is(syncErr, context.Canceled) || errors.Is(syncErr, context.DeadlineExceeded)) {
 		return
 	}
 	d.mu.Lock()

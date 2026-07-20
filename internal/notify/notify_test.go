@@ -111,10 +111,14 @@ func TestParseEvents(t *testing.T) {
 	if _, err := ParseEvents([]string{"deploy_sucess"}); err == nil {
 		t.Error("typoed event name must be rejected")
 	}
-	// "all" mixed with other names must not be rejected with a message that
-	// lists "all" as valid.
+	// "all" anywhere selects everything...
 	if evs, err := ParseEvents([]string{"deploy_success", "all"}); err != nil || len(evs) != len(AllEvents) {
 		t.Errorf("'all' anywhere in the list must select everything, got %v (%v)", evs, err)
+	}
+	// ...but a typo alongside "all" must still be rejected: the operator may
+	// later drop "all" and silently lose the mistyped event.
+	if _, err := ParseEvents([]string{"all", "deploy_sucess"}); err == nil {
+		t.Error("a typo alongside 'all' must be rejected, not short-circuited away")
 	}
 }
 

@@ -44,18 +44,20 @@ var DefaultEvents = []EventType{
 }
 
 // ParseEvents validates a config-provided list. Empty means DefaultEvents;
-// "all" anywhere in the list means every event.
+// "all" anywhere in the list means every event. Every OTHER name is still
+// validated even when "all" is present, so a typo cannot ride along
+// undetected (the operator may later drop "all" and silently lose it).
 func ParseEvents(names []string) ([]EventType, error) {
 	if len(names) == 0 {
 		return DefaultEvents, nil
 	}
-	for _, n := range names {
-		if n == "all" {
-			return AllEvents, nil
-		}
-	}
+	hasAll := false
 	var out []EventType
 	for _, n := range names {
+		if n == "all" {
+			hasAll = true
+			continue
+		}
 		found := false
 		for _, e := range AllEvents {
 			if string(e) == n {
@@ -67,6 +69,9 @@ func ParseEvents(names []string) ([]EventType, error) {
 		if !found {
 			return nil, fmt.Errorf("unknown event %q (valid: all, %s)", n, joinEvents(AllEvents))
 		}
+	}
+	if hasAll {
+		return AllEvents, nil
 	}
 	return out, nil
 }

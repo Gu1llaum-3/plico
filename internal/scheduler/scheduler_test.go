@@ -79,16 +79,23 @@ func mustNewAt(t *testing.T, cfg *config.Config, r StackRunner, store *state.Sto
 
 func dueNames(s *Scheduler, now time.Time) []string {
 	var names []string
-	apply, _ := s.due(now)
+	apply, _, _ := s.due(now)
 	for _, st := range apply {
 		names = append(names, st.Name)
 	}
 	return names
 }
 
+// dueEvents returns the notifications due() would emit this tick, for
+// deterministic assertions (no async goroutine, no sleeps).
+func dueEvents(s *Scheduler, now time.Time) []notify.Event {
+	_, _, events := s.due(now)
+	return events
+}
+
 func checkNames(s *Scheduler, now time.Time) []string {
 	var names []string
-	_, check := s.due(now)
+	_, check, _ := s.due(now)
 	for _, st := range check {
 		names = append(names, st.Name)
 	}
@@ -281,34 +288,19 @@ func TestDueRespectsScheduleWindow(t *testing.T) {
 	}
 }
 
-// notifyRecorder captures scheduler-emitted events.
-type notifyRecorder struct {
-	mu     sync.Mutex
-	events []notify.Event
-}
-
-func (r *notifyRecorder) Notify(_ context.Context, ev notify.Event) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.events = append(r.events, ev)
-	return nil
-}
-
 func TestMissedWindowIsNeverDeployedLate(t *testing.T) {
 	t.Parallel()
 	loc := paris(t)
 	store := testStore(t)
 	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
-	rec := &notifyRecorder{}
-	s, err := NewAt(nightlyConfig(time.Hour), &countingRunner{}, store, rec, discard(), boot)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNewAt(t, nightlyConfig(time.Hour), &countingRunner{}, store, boot)
 
 	// Host paused from 03:30 to 09:00: the first tick after resume sees the
-	// 04:00 firing but its window (04:00-05:00) is long gone.
-	if got := dueNames(s, time.Date(2026, 7, 19, 9, 0, 0, 0, loc)); len(got) != 1 || got[0] != "always" {
-		t.Errorf("missed window must not deploy late, due = %v", got)
+	// 04:00 firing but its window (04:00-05:00) is long gone. That same tick
+	// both selects the due stacks AND surfaces the missed-window event.
+	apply, _, events := s.due(time.Date(2026, 7, 19, 9, 0, 0, 0, loc))
+	if len(apply) != 1 || apply[0].Name != "always" {
+		t.Errorf("missed window must not deploy late, apply = %v", apply)
 	}
 	// The missed firing is accounted (persisted anchor) so it is not
 	// rediscovered after a restart.
@@ -317,26 +309,14 @@ func TestMissedWindowIsNeverDeployedLate(t *testing.T) {
 		t.Errorf("missed firing not persisted: anchor = %v, want %v", st.LastFiring, fire)
 	}
 	// A missed nightly deployment is exactly what the operator sleeps
-	// through: it must NOTIFY, not just log. Emission is asynchronous
-	// (the tick loop must never wait on a channel): poll for it.
-	deadline := time.After(5 * time.Second)
-	for {
-		rec.mu.Lock()
-		n := len(rec.events)
-		rec.mu.Unlock()
-		if n >= 1 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("window_missed notification never emitted")
-		case <-time.After(10 * time.Millisecond):
-		}
+	// through: it must NOTIFY, not just log. Assert EXACTLY one, so a
+	// duplicate regression (both the elapsed and superseded branches
+	// firing) is caught.
+	if len(events) != 1 {
+		t.Fatalf("want exactly 1 window_missed event, got %d: %+v", len(events), events)
 	}
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	if rec.events[0].Type != notify.WindowMissed || rec.events[0].Stack != "nightly" {
-		t.Errorf("window_missed notification wrong: %+v", rec.events)
+	if events[0].Type != notify.WindowMissed || events[0].Stack != "nightly" {
+		t.Errorf("window_missed notification wrong: %+v", events[0])
 	}
 }
 
@@ -444,6 +424,16 @@ func TestCollapsedFiringsOpenLatestWindowOnly(t *testing.T) {
 	}
 }
 
+func countSkipEvents(events []notify.Event) int {
+	n := 0
+	for _, ev := range events {
+		if strings.Contains(ev.Detail, "skipped") {
+			n++
+		}
+	}
+	return n
+}
+
 func TestSkippedFiringsNotifyOncePerStreak(t *testing.T) {
 	t.Parallel()
 	loc := paris(t)
@@ -457,38 +447,50 @@ func TestSkippedFiringsNotifyOncePerStreak(t *testing.T) {
 		},
 	}
 	boot := time.Date(2026, 7, 19, 12, 0, 30, 0, loc)
-	rec := &notifyRecorder{}
-	s, err := NewAt(cfg, &countingRunner{}, store, rec, discard(), boot)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := mustNewAt(t, cfg, &countingRunner{}, store, boot)
+
+	// due() returns its events: count deterministically across three
+	// consecutive skipping ticks — exactly one skip notification for the
+	// whole continuous streak, no per-tick spam, no sleep.
+	total := 0
 	for i := 1; i <= 3; i++ {
-		_, _ = s.due(boot.Add(time.Duration(i) * 5 * time.Minute))
+		total += countSkipEvents(dueEvents(s, boot.Add(time.Duration(i)*5*time.Minute)))
 	}
-	// Async emission: count only the skipped-firings events (each 1-minute
-	// window legitimately produces its own elapsed-window notification).
-	countSkips := func() int {
-		rec.mu.Lock()
-		defer rec.mu.Unlock()
-		n := 0
-		for _, ev := range rec.events {
-			if strings.Contains(ev.Detail, "skipped") {
-				n++
-			}
-		}
-		return n
+	if total != 1 {
+		t.Errorf("per-tick spam: %d skipped-firings events for one continuous streak, want 1", total)
 	}
-	deadline := time.After(5 * time.Second)
-	for countSkips() < 1 {
-		select {
-		case <-deadline:
-			t.Fatal("skipped-firings notification never emitted")
-		case <-time.After(10 * time.Millisecond):
-		}
+}
+
+// A second distinct skip streak, separated from the first only by
+// firing-less ticks, must notify again — skipNotified must reset when a
+// tick has no skips, not only when a skip-free FIRING is caught up.
+func TestSecondSkipStreakNotifiesAgain(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	cfg := &config.Config{
+		Timezone:     "Europe/Paris",
+		PollInterval: config.Duration{Duration: time.Minute},
+		Stacks: []config.StackConfig{
+			{Name: "nightly", Schedule: "0 4 * * *", Window: config.Duration{Duration: 2 * time.Hour}},
+		},
 	}
-	time.Sleep(100 * time.Millisecond) // would-be extra events land here
-	if got := countSkips(); got != 1 {
-		t.Errorf("per-tick spam: %d skipped-firings events for one continuous streak, want 1", got)
+	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
+	s := mustNewAt(t, cfg, &countingRunner{}, store, boot)
+
+	// First streak: suspended across the 19th and 20th 04:00 firings,
+	// resume the 20th at 09:00 → one catch-up tick skips one firing.
+	first := countSkipEvents(dueEvents(s, time.Date(2026, 7, 20, 9, 0, 0, 0, loc)))
+	if first != 1 {
+		t.Fatalf("first streak: %d skip events, want 1", first)
+	}
+	// Firing-less ticks in between (nothing due) must clear the flag.
+	_ = dueEvents(s, time.Date(2026, 7, 20, 12, 0, 0, 0, loc))
+	// Second streak: suspended across the 21st and 22nd firings, resume the
+	// 22nd at 09:00 → must notify again.
+	second := countSkipEvents(dueEvents(s, time.Date(2026, 7, 22, 9, 0, 0, 0, loc)))
+	if second != 1 {
+		t.Errorf("second distinct streak was not notified (skipNotified stuck): %d skip events, want 1", second)
 	}
 }
 
