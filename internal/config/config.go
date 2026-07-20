@@ -37,6 +37,26 @@ type HealthConfig struct {
 	Listen string `toml:"listen"` // default 127.0.0.1:9444
 }
 
+type HeartbeatConfig struct {
+	// URL is an outbound liveness push target (Uptime Kuma push,
+	// Healthchecks.io, …), pinged while the daemon is healthy — a
+	// dead-man's switch. Empty = disabled. Paste the monitor's push URL
+	// verbatim (query string included); plico GETs it as-is.
+	URL string `toml:"url"`
+	// Interval between beats; nil = default 30s, min 5s when set. A pointer
+	// so an explicit "0s" (typo) is rejected rather than silently defaulted.
+	// Decoupled from poll_interval so a death is detected quickly.
+	Interval *Duration `toml:"interval"`
+}
+
+// IntervalOr returns the configured beat interval, or fallback when unset.
+func (h HeartbeatConfig) IntervalOr(fallback time.Duration) time.Duration {
+	if h.Interval == nil {
+		return fallback
+	}
+	return h.Interval.Duration
+}
+
 type ApiConfig struct {
 	// Socket is the unix socket the client CLI talks to (F24).
 	// Default: <base_dir>/plico.sock.
@@ -149,14 +169,15 @@ type Config struct {
 	Window               Duration `toml:"window"`   // global default window, 1h
 	Check                bool     `toml:"check"`    // global default for out-of-window checks (F6)
 
-	Log      LogConfig       `toml:"log"`
-	Health   HealthConfig    `toml:"health"`
-	Api      ApiConfig       `toml:"api"`
-	Ntfy     NtfyConfig      `toml:"ntfy"`
-	Webhooks []WebhookConfig `toml:"webhook"` // [[webhook]]
-	Smtp     SmtpConfig      `toml:"smtp"`
-	Hooks    HooksConfig     `toml:"hooks"`
-	Git      GitConfig       `toml:"git"`
+	Log       LogConfig       `toml:"log"`
+	Health    HealthConfig    `toml:"health"`
+	Heartbeat HeartbeatConfig `toml:"heartbeat"`
+	Api       ApiConfig       `toml:"api"`
+	Ntfy      NtfyConfig      `toml:"ntfy"`
+	Webhooks  []WebhookConfig `toml:"webhook"` // [[webhook]]
+	Smtp      SmtpConfig      `toml:"smtp"`
+	Hooks     HooksConfig     `toml:"hooks"`
+	Git       GitConfig       `toml:"git"`
 
 	// GitSyncAlertAfter fires git_sync_failed after N consecutive git sync
 	// failures for a stack (0 disables; unset = 5).
@@ -225,6 +246,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Health.Listen == "" {
 		c.Health.Listen = "127.0.0.1:9444"
+	}
+	if c.Heartbeat.URL != "" && c.Heartbeat.Interval == nil {
+		c.Heartbeat.Interval = &Duration{30 * time.Second} // unset → default; explicit 0 stays 0 (rejected in Validate)
 	}
 	if c.Api.Socket == "" && c.BaseDir != "" {
 		c.Api.Socket = filepath.Join(c.BaseDir, "plico.sock")
@@ -309,6 +333,14 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxConcurrentDeploys < 1 {
 		return fmt.Errorf("max_concurrent_deploys must be >= 1, got %d", c.MaxConcurrentDeploys)
+	}
+	if c.Heartbeat.URL != "" {
+		if err := validateHTTPURL(c.Heartbeat.URL); err != nil {
+			return fmt.Errorf("heartbeat.url: %w", err)
+		}
+		if d := c.Heartbeat.IntervalOr(0); d < 5*time.Second {
+			return fmt.Errorf("heartbeat.interval must be >= 5s, got %s", d)
+		}
 	}
 	if c.Schedule != "" {
 		if err := validateSchedule(c.Schedule); err != nil {

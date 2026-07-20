@@ -71,7 +71,15 @@ n'existe dans doco-cd.
       `git_sync_failed` (N échecs git consécutifs, `git_sync_alert_after`,
       une alerte par panne) ; notifications validées de bout en bout dans le
       smoke test (capteur HTTP local, stderr du hook inclus, zéro secret)
-- [ ] **Heartbeat Uptime Kuma** par stack (F36)
+- [x] **Heartbeat de liveness** (F36, redéfini) : un heartbeat **global** (pas
+      par stack) en dead-man's switch — `[heartbeat] url + interval`, GET
+      régulier tant que le daemon est sain (même prédicat que `/healthz`,
+      partagé via `api.Healthy`), silence sinon → le moniteur alerte sur
+      l'absence. Sortant (traverse NAT/firewall), up-only, cadence découplée
+      du polling. Un échec de déploiement ne coupe pas le battement (rôle des
+      notifiers). Le F36 « par stack, en fin de déploiement » est abandonné
+      (déploiements sporadiques ⇒ faux heartbeat ; suivi par stack délégué au
+      monitoring externe de l'opérateur).
 
 ## 🔭 v1.x — Combler l'écart doco-cd (à la carte, dans cet ordre)
 

@@ -154,6 +154,30 @@ url = "https://chat.googleapis.com/v1/spaces/.../messages?key=..."
 A failing channel never breaks a deployment (the send error is logged
 locally), and a failure alert survives even a run killed by `run_timeout`.
 
+### Liveness heartbeat
+
+`[heartbeat]` turns plico into an outbound **dead-man's switch**: while the
+daemon is healthy (same predicate as `/healthz` — scheduler ticking, no stuck
+run) it GETs the configured URL every `interval`; when degraded or dead it
+stays **silent**, so the monitor alerts on the *missing* beat. It is the
+outbound mirror of `/healthz` — it works when the monitor cannot reach the
+host (behind NAT/firewall), and the silence covers both "plico degraded" and
+"plico dead" (a dead process cannot send a status). Paste the push URL your
+monitor gives you (Uptime Kuma push, Healthchecks.io, …) verbatim:
+
+```toml
+[heartbeat]
+url = "https://kuma.example.com/api/push/aBcD1234?status=up&msg=OK"
+interval = "30s"
+```
+
+A failed deployment does **not** stop the beat — the daemon is alive and
+scheduling; deploy failures are the notifiers' job. Per-stack deployment
+status is a separate concern (use `plico status` or your own monitoring).
+plico beats immediately on start, then every `interval`. Set your monitor's
+grace period to **≥ 2× `interval`** so a single missed beat (restart, GC
+pause, brief blip) does not raise a false alarm.
+
 ### System layout
 
 New installations separate persistent data from runtime:

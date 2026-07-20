@@ -104,3 +104,44 @@ func TestHealthzOKAfterTick(t *testing.T) {
 		t.Errorf("web = %v", web)
 	}
 }
+
+func TestHealthy(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	poll := time.Minute
+	runTimeout := 30 * time.Minute
+
+	tick := func(ago time.Duration) time.Time { return now.Add(-ago) }
+	running := func(ago time.Duration) *time.Time { t := now.Add(-ago); return &t }
+
+	tests := []struct {
+		name string
+		snap scheduler.Snapshot
+		want bool
+	}{
+		{"never ticked", scheduler.Snapshot{}, false},
+		{"recent tick, idle", scheduler.Snapshot{LastTick: tick(10 * time.Second)}, true},
+		{"tick older than 2x poll", scheduler.Snapshot{LastTick: tick(3 * time.Minute)}, false},
+		{
+			"recent tick, run within run_timeout",
+			scheduler.Snapshot{LastTick: tick(5 * time.Second), Stacks: map[string]scheduler.StackStatus{
+				"web": {RunningSince: running(10 * time.Minute)},
+			}},
+			true,
+		},
+		{
+			"recent tick, run stuck past run_timeout",
+			scheduler.Snapshot{LastTick: tick(5 * time.Second), Stacks: map[string]scheduler.StackStatus{
+				"web": {RunningSince: running(31 * time.Minute)},
+			}},
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Healthy(tt.snap, poll, runTimeout, now); got != tt.want {
+				t.Errorf("Healthy = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

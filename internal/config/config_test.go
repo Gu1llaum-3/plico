@@ -225,6 +225,41 @@ repo = "https://example.com/repo.git"
 	}
 }
 
+func TestHeartbeatConfig(t *testing.T) {
+	t.Parallel()
+	base := `
+base_dir = "/opt/docker"
+[[stack]]
+name = "app"
+repo = "https://example.com/repo.git"
+`
+	// Default interval applied when a URL is set.
+	c, err := Load(writeConfig(t, base+"\n[heartbeat]\nurl = \"https://kuma.example.com/api/push/abc\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Heartbeat.IntervalOr(0) != 30*time.Second {
+		t.Errorf("heartbeat interval default = %s, want 30s", c.Heartbeat.IntervalOr(0))
+	}
+	// An explicit 0 is a typo, not "use the default": it must be rejected,
+	// not silently coerced to 30s.
+	if _, err := Load(writeConfig(t, base+"\n[heartbeat]\nurl = \"https://k/x\"\ninterval = \"0s\"\n")); err == nil {
+		t.Error("explicit heartbeat interval of 0 must fail validation, not default to 30s")
+	}
+	// Empty URL = disabled, no error, no default interval imposed.
+	if c2, err := Load(writeConfig(t, base)); err != nil || c2.Heartbeat.URL != "" {
+		t.Errorf("no heartbeat block should be valid and disabled: %v", err)
+	}
+	// Non-http(s) URL rejected.
+	if _, err := Load(writeConfig(t, base+"\n[heartbeat]\nurl = \"/relative/push\"\n")); err == nil {
+		t.Error("non-http(s) heartbeat url must fail validation")
+	}
+	// Interval below the floor rejected.
+	if _, err := Load(writeConfig(t, base+"\n[heartbeat]\nurl = \"https://k/x\"\ninterval = \"1s\"\n")); err == nil {
+		t.Error("heartbeat interval < 5s must fail validation")
+	}
+}
+
 func TestNotifierValidation(t *testing.T) {
 	t.Parallel()
 	base := `

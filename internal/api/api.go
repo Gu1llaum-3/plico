@@ -30,24 +30,32 @@ type StackHealth struct {
 	QueuedSHA       string     `json:"queued_sha,omitempty"` // pending revision announced by a check (F6)
 }
 
-// buildStatus assembles the shared health/status view. Healthy means: the
-// scheduler ticked recently (< 2× poll interval) and no run has been in
-// flight longer than runTimeout.
+// Healthy reports whether the daemon is live and working: the scheduler
+// ticked recently (< 2× poll interval) AND no run has been in flight longer
+// than runTimeout. It is the single source of truth for both /healthz and
+// the liveness heartbeat, so the two can never disagree. A failed deployment
+// is NOT unhealthy — the daemon is still scheduling; failures are the
+// notifiers' concern.
+func Healthy(snap scheduler.Snapshot, pollInterval, runTimeout time.Duration, now time.Time) bool {
+	if snap.LastTick.IsZero() || now.Sub(snap.LastTick) >= 2*pollInterval {
+		return false
+	}
+	for _, st := range snap.Stacks {
+		if st.RunningSince != nil && now.Sub(*st.RunningSince) > runTimeout {
+			return false // stuck run
+		}
+	}
+	return true
+}
+
+// buildStatus assembles the shared health/status view.
 func buildStatus(sched *scheduler.Scheduler, store *state.Store,
 	pollInterval, runTimeout time.Duration) StatusResponse {
 
 	snap := sched.Snapshot()
-	now := time.Now()
-
-	healthy := !snap.LastTick.IsZero() && now.Sub(snap.LastTick) < 2*pollInterval
-	for _, st := range snap.Stacks {
-		if st.RunningSince != nil && now.Sub(*st.RunningSince) > runTimeout {
-			healthy = false // stuck run
-		}
-	}
 
 	resp := StatusResponse{Status: "ok", LastTick: snap.LastTick, Stacks: map[string]StackHealth{}}
-	if !healthy {
+	if !Healthy(snap, pollInterval, runTimeout, time.Now()) {
 		resp.Status = "degraded"
 	}
 	persisted := store.All()

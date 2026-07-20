@@ -22,6 +22,7 @@ import (
 	"github.com/Gu1llaum-3/plico/internal/deploy"
 	"github.com/Gu1llaum-3/plico/internal/execx"
 	"github.com/Gu1llaum-3/plico/internal/gitrepo"
+	"github.com/Gu1llaum-3/plico/internal/heartbeat"
 	"github.com/Gu1llaum-3/plico/internal/hooks"
 	"github.com/Gu1llaum-3/plico/internal/notify"
 	"github.com/Gu1llaum-3/plico/internal/scheduler"
@@ -124,6 +125,16 @@ func serve(configPath string) error {
 		sched.Run(ctx)
 		close(schedDone)
 	}()
+
+	// Started after the scheduler (whose first tick is immediate) so the
+	// heartbeat's immediate first beat is likely to see a healthy state.
+	if cfg.Heartbeat.URL != "" {
+		beater := heartbeat.New(cfg.Heartbeat.URL, cfg.Heartbeat.IntervalOr(30*time.Second),
+			func() bool {
+				return api.Healthy(sched.Snapshot(), cfg.PollInterval.Duration, cfg.RunTimeout.Duration, time.Now())
+			}, log)
+		go beater.Run(ctx) // stops on ctx cancel; no state to drain
+	}
 	var runErr error
 	select {
 	case <-ctx.Done():

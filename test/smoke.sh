@@ -34,6 +34,7 @@ ok() { echo "OK: $1"; }
 cleanup() {
   [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
   [ -n "${NTFY_PID:-}" ] && kill "$NTFY_PID" 2>/dev/null
+  [ -n "${HB_PID:-}" ] && kill "$HB_PID" 2>/dev/null
   docker compose -p smoke down --timeout 2 >/dev/null 2>&1
   rm -rf "$WS"
 }
@@ -118,6 +119,22 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
 ' "$NTFY_LOG" "$NTFY_PORT" &
 NTFY_PID=$!
 
+# ── 2b. local heartbeat capture: the liveness push is validated too ────
+HB_LOG=$WS/heartbeat-capture.log
+HB_PORT=${PLICO_SMOKE_HB_PORT:-19556}
+: >"$HB_LOG"
+python3 -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(sys.argv[1], "a") as f:
+            f.write("beat\n")
+        self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
+' "$HB_LOG" "$HB_PORT" &
+HB_PID=$!
+
 # ── 3. plico config with sops and ntfy enabled on the stack ────────────
 cat > "$WS/config.toml" <<EOF
 base_dir = "$BASE"
@@ -126,6 +143,10 @@ run_timeout = "5m"
 
 [health]
 listen = "127.0.0.1:$PORT"
+
+[heartbeat]
+url = "http://127.0.0.1:$HB_PORT/push"
+interval = "5s"
 
 [ntfy]
 url = "http://127.0.0.1:$NTFY_PORT/plico"
@@ -194,6 +215,14 @@ if grep -q "$SECRET" "$NTFY_LOG" 2>/dev/null; then
 else
   ok "no cleartext secret in notifications"
 fi
+# Liveness heartbeat: the daemon is healthy with a 5s beat. Wait up to two
+# intervals for the first outbound push (the deploy can finish faster than
+# one beat when the image is cached).
+i=0
+while [ $i -lt 12 ] && [ ! -s "$HB_LOG" ]; do i=$((i+1)); sleep 1; done
+[ -s "$HB_LOG" ] \
+  && ok "liveness heartbeat pushed while healthy" \
+  || fail "no heartbeat reached the capture"
 
 # ── 6. client CLI over the unix socket ─────────────────────────────────
 "$PLICO" validate --config "$WS/config.toml" >/dev/null 2>&1 \

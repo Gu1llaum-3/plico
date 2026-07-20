@@ -47,6 +47,17 @@ level = "info"                        # debug | info | warn | error
 # Semantic healthcheck endpoint (GET /healthz). Local by default.
 listen = "127.0.0.1:9444"
 
+[heartbeat]
+# Outbound liveness push (dead-man's switch): while plico is healthy it GETs
+# this URL every `interval`; when degraded or dead it stays silent, so the
+# monitor alerts on the MISSING beat. The outbound mirror of /healthz — works
+# from outside your network. Paste your monitor's push URL verbatim.
+# Empty = disabled.
+# url = "https://kuma.example.com/api/push/aBcD1234?status=up&msg=OK"
+# interval = "30s"
+# Set your monitor's grace period to >= 2x this interval: a single missed
+# beat (restart, GC pause, brief network blip) should not trip an alert.
+
 [api]
 # Volatile Unix socket for the client CLI. systemd creates /run/plico.
 socket = "/run/plico/plico.sock"
