@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Gu1llaum-3/plico/internal/execx"
@@ -37,6 +38,84 @@ func (c Context) env() []string {
 		"DEPLOY_OLD_SHA=" + c.OldSHA,
 		"DEPLOY_NEW_SHA=" + c.NewSHA,
 	}
+}
+
+// baseline is the set of environment variables a hook needs to be a usable
+// shell + Docker client, and nothing sensitive: PATH (find docker, pg_dump,
+// sleep…), HOME (~/.docker/config.json, ~/.pgpass), locale, and the Docker
+// client's non-secret pointers. Everything else — SOPS_AGE_KEY_FILE, ntfy /
+// SMTP / git tokens from the daemon environment — is withheld by default.
+// SSH_AUTH_SOCK is deliberately NOT here: a backup-over-ssh hook opts into it
+// via env_passthrough (a repo-controlled hook must not get the operator's ssh
+// agent for free).
+var baseline = []string{
+	"PATH", "HOME", "USER", "LOGNAME", "SHELL",
+	"LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+	"TZ", "TERM", "TMPDIR",
+	// XDG_RUNTIME_DIR: how the docker/podman CLI finds the ROOTLESS socket
+	// and config when DOCKER_HOST is unset — omitting it breaks every hook
+	// that shells out to docker on a rootless host.
+	"XDG_RUNTIME_DIR",
+	// Docker/Compose client pointers, all non-secret: host, config dir,
+	// context, API-version pin, and the compose selectors. DOCKER_TLS_VERIFY
+	// is a non-secret flag (default certs under ~/.docker via HOME still
+	// work). DOCKER_CERT_PATH is DELIBERATELY excluded — it points at the
+	// client's TLS private key, the same credential class as SSH_AUTH_SOCK;
+	// a custom cert path is opted in via env_passthrough.
+	"DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT",
+	"DOCKER_TLS_VERIFY", "DOCKER_API_VERSION",
+	"COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES",
+}
+
+// buildEnv assembles the COMPLETE, scoped environment for a hook subprocess:
+// the safe baseline + the operator-allowed passthrough + the DEPLOY_*
+// context, each taken from lookup only if present. lookup is injected so this
+// is a pure, deterministic function (tests do not depend on the real
+// environment). Order matters: DEPLOY_* comes LAST and dedup is last-wins, so
+// the per-deploy context is authoritative and a passthrough entry that
+// collides with a DEPLOY_* name can never override the real deploy target.
+// It also returns the passthrough names the operator declared but that are
+// ABSENT from the environment — the caller warns about them (fail-loudly:
+// a typo or a missing credential should be visible), without refusing, since
+// some passthrough vars are legitimately optional.
+func buildEnv(lookup func(string) (string, bool), hctx Context, passthrough []string) (env, missing []string) {
+	var out []string
+	add := func(key string) bool {
+		if v, ok := lookup(key); ok {
+			out = append(out, key+"="+v)
+			return true
+		}
+		return false
+	}
+	for _, k := range baseline {
+		add(k)
+	}
+	for _, k := range passthrough {
+		if !add(k) {
+			missing = append(missing, k)
+		}
+	}
+	out = append(out, hctx.env()...) // DEPLOY_* last: authoritative
+	return dedupEnv(out), missing
+}
+
+// dedupEnv keeps the last assignment of each key (POSIX exec semantics),
+// preserving first-seen order of the surviving keys.
+func dedupEnv(env []string) []string {
+	last := make(map[string]string, len(env))
+	var order []string
+	for _, kv := range env {
+		key, _, _ := strings.Cut(kv, "=")
+		if _, seen := last[key]; !seen {
+			order = append(order, key)
+		}
+		last[key] = kv
+	}
+	out := make([]string, 0, len(order))
+	for _, key := range order {
+		out = append(out, last[key])
+	}
+	return out
 }
 
 type Runner struct {
@@ -77,14 +156,24 @@ func Resolve(repoDir, repoRelPath, globalPath string) (Resolution, error) {
 
 // Run executes the hook with the deploy context and a hard timeout (F13).
 // stdout/stderr are captured for the log and the failure notification (F14).
-func (r *Runner) Run(ctx context.Context, path string, hctx Context, timeout time.Duration) (execx.Result, error) {
+// The hook runs with a SCOPED environment (baseline + DEPLOY_* + the
+// operator-allowed passthrough), never the daemon's full environment: a
+// repo-controlled hook must not inherit SOPS_AGE_KEY_FILE or the notifier
+// tokens.
+func (r *Runner) Run(ctx context.Context, path string, hctx Context, timeout time.Duration, passthrough []string) (execx.Result, error) {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	env, missing := buildEnv(os.LookupEnv, hctx, passthrough)
+	if len(missing) > 0 {
+		r.log.Warn("env_passthrough variables declared but absent from the environment; the hook will not receive them",
+			"hook", path, "stack", hctx.Stack, "missing", missing)
+	}
 	res, err := r.runner.Run(runCtx, execx.Cmd{
-		Name: path,
-		Dir:  hctx.Dir,
-		Env:  hctx.env(),
+		Name:     path,
+		Dir:      hctx.Dir,
+		Env:      env,
+		CleanEnv: true,
 	})
 
 	logger := r.log.With("hook", path, "stack", hctx.Stack)

@@ -108,13 +108,15 @@ ci-dessous réduisent le rayon de souffle **sans toucher à la thèse
       si absent/invalide. C'est le seul vrai emprunt Argo/Flux (`spec.verify`)
       qui a du sens hors Kubernetes, et il coupe la voie d'attaque dominante
       (repo compromis → hook → clé age + socket Docker).
-- [ ] **Scoper l'environnement des sous-processus (hooks) à une allowlist**
-      au lieu de propager `os.Environ()` en bloc (`execx.go` : `cmd.Env =
-      append(os.Environ(), …)`). Un hook versionné dans le dépôt s'exécute
-      en tant que `plico` et voit aujourd'hui `SOPS_AGE_KEY_FILE`, les tokens
-      de notification, etc. Passer les seules variables `DEPLOY_*` (+ une
-      allowlist configurable) empêche une fuite vers du shell contrôlé par le
-      dépôt. Ne change rien au design des hooks génériques.
+- [x] **Scoper l'environnement des sous-processus (hooks) à une allowlist**
+      (fait). Les hooks tournent avec `CleanEnv` (execx) : baseline sûre
+      (PATH/HOME/locale/DOCKER_*) + `DEPLOY_*` uniquement ; les secrets du
+      démon (`SOPS_AGE_KEY_FILE`, tokens ntfy/SMTP/git) sont retenus.
+      Soupape `env_passthrough` global + par stack (additif, union), noms de
+      variables validés (pas `KEY=VALUE`). `SSH_AUTH_SOCK` hors baseline
+      (opt-in). git/sops/compose intouchés (gardent `os.Environ()`). Prouvé
+      de bout en bout par le smoke test (clé age retenue, passthrough
+      visible). Rupture documentée dans le README § hooks.
 - [ ] **Releases signées** : cosign + provenance SLSA + SBOM signé. Aujourd'hui
       `checksums.txt` vient de la *même* release GitHub (TOFU sur GitHub+TLS,
       pin `--sha256` opt-in seulement) — sous la barre supply-chain que plico

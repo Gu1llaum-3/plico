@@ -249,7 +249,10 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 
 	// 6. pre-deploy hook — the backup gate (F9–F14). Manually skippable
 	// only through the API's force acknowledgement, and always loud (F30).
+	// The hook runs with a scoped environment (baseline + DEPLOY_* + the
+	// global∪stack passthrough), never the daemon's secrets.
 	hctx := hooks.Context{Stack: st.Name, Dir: dir, GitRef: st.Ref, OldSHA: oldSHA, NewSHA: newSHA}
+	hookEnv := st.HookEnvPassthrough(d.cfg.Hooks.EnvPassthrough)
 	if opts.SkipPre {
 		log.Warn("PRE-DEPLOY HOOK MANUALLY SKIPPED: deploying without the backup gate",
 			"stage", StagePreHook)
@@ -266,7 +269,7 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 			ev(notify.PreHookSkipped, StagePreHook, "no pre-deploy hook in repo or config")
 		} else {
 			log.Info("running pre-deploy hook", "hook", res.Path, "source", res.Source)
-			hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration)
+			hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv)
 			if err != nil {
 				log.Error("pre-deploy hook failed, deployment aborted", "stage", StagePreHook, "error", err)
 				fail(notify.PreHookFailed, StagePreHook,
@@ -319,7 +322,7 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	} else if res, err := hooks.Resolve(dir, hooks.RepoPostDeploy, d.cfg.Hooks.PostDeployPath); err != nil {
 		log.Warn("post-deploy hook unusable", "stage", StagePostHook, "error", err)
 	} else if res.Path != "" {
-		if _, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration); err != nil {
+		if _, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv); err != nil {
 			log.Warn("post-deploy hook failed (non-blocking)", "stage", StagePostHook, "error", err)
 		}
 	}

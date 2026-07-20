@@ -28,6 +28,14 @@ Every `poll_interval`, for each stack:
    a hook writing sensitive data (a database dump before backup, say) must
    set `umask 077` at the top of the script or write to a
    permission-restricted directory.
+   ⚠️ Hooks run with a **scoped environment**: a safe baseline (`PATH`,
+   `HOME`, locale, `DOCKER_HOST`/`DOCKER_CONFIG`/`DOCKER_CONTEXT`) plus the
+   `DEPLOY_*` variables — the daemon's secrets (`SOPS_AGE_KEY_FILE`, notifier
+   and git tokens) are **withheld** so a repo-controlled hook cannot exfiltrate
+   them. A hook that genuinely needs another variable (e.g. `RESTIC_PASSWORD`,
+   AWS creds) opts in via `[hooks].env_passthrough` (global) or a stack's
+   `env_passthrough` (added to the global list). `SSH_AUTH_SOCK` is not in the
+   baseline — add it via passthrough for a backup-over-ssh hook.
 3. SOPS decryption in memory: `sops exec-env secrets.enc.env -- docker
    compose … up -d`. tmpfs mode (`/dev/shm`) available on Linux.
 4. `docker compose pull` (`force_pull` option) then `up -d --remove-orphans`.

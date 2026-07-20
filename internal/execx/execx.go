@@ -21,11 +21,15 @@ const MaxCapture = 4 << 20 // 4 MiB
 
 // Cmd describes one external command invocation.
 type Cmd struct {
-	Name  string // binary name, e.g. "git", "sops", "docker"
-	Args  []string
-	Dir   string   // working directory ("" = inherit)
-	Env   []string // appended to os.Environ(), never a replacement
-	Stdin io.Reader
+	Name string // binary name, e.g. "git", "sops", "docker"
+	Args []string
+	Dir  string // working directory ("" = inherit)
+	// Env is appended to os.Environ() by default. With CleanEnv it becomes
+	// the command's COMPLETE environment instead (no inheritance) — used to
+	// scope repo-controlled hooks away from the daemon's secrets.
+	Env      []string
+	CleanEnv bool
+	Stdin    io.Reader
 }
 
 // Result holds the captured output of a finished command.
@@ -69,7 +73,18 @@ func (r *osRunner) Run(ctx context.Context, c Cmd) (Result, error) {
 func (r *osRunner) runOnce(ctx context.Context, c Cmd) (Result, error) {
 	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
 	cmd.Dir = c.Dir
-	cmd.Env = append(os.Environ(), c.Env...)
+	if c.CleanEnv {
+		// A nil cmd.Env would make os/exec INHERIT the full process
+		// environment — the exact leak CleanEnv exists to prevent. Force a
+		// non-nil (possibly empty) slice so the scoping always holds.
+		if c.Env == nil {
+			cmd.Env = []string{}
+		} else {
+			cmd.Env = c.Env
+		}
+	} else {
+		cmd.Env = append(os.Environ(), c.Env...) // git/sops/compose: inherit
+	}
 	cmd.Stdin = c.Stdin
 
 	var stdout, stderr boundedBuffer
@@ -96,7 +111,9 @@ func (r *osRunner) runOnce(ctx context.Context, c Cmd) (Result, error) {
 		"cmd", c.Name,
 		"args", strings.Join(c.Args, " "),
 		"dir", c.Dir,
-		"env", Redact(c.Env),
+		// Names only, never values: a passthrough secret whose NAME does not
+		// match Redact's heuristic (e.g. DATABASE_URL) must not reach the log.
+		"env", EnvNames(c.Env),
 		"exit_code", res.ExitCode,
 		"duration", time.Since(start).Round(time.Millisecond).String(),
 	)
@@ -131,8 +148,21 @@ func Tail(b []byte, max int) string {
 	return "…" + s[len(s)-max:]
 }
 
-// Redact masks values of env entries whose key looks secret. Always use it
-// when logging Cmd.Env.
+// EnvNames returns only the KEY of each KEY=VALUE entry — never the value.
+// Use it for logging: a value heuristic (see Redact) can miss a secret whose
+// name does not look sensitive (DATABASE_URL, RESTIC_REPOSITORY, …), so no
+// value belongs in a log at all.
+func EnvNames(env []string) []string {
+	out := make([]string, len(env))
+	for i, kv := range env {
+		key, _, _ := strings.Cut(kv, "=")
+		out[i] = key
+	}
+	return out
+}
+
+// Redact masks values of env entries whose key looks secret. Used where the
+// names alone are not enough (test diagnostics on git auth env).
 func Redact(env []string) []string {
 	out := make([]string, len(env))
 	for i, kv := range env {

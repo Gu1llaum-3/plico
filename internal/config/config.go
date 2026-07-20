@@ -73,6 +73,12 @@ type HooksConfig struct {
 	PreDeployPath  string   `toml:"pre_deploy_path"`  // global fallback (F10)
 	PostDeployPath string   `toml:"post_deploy_path"` // global fallback (F15)
 	Timeout        Duration `toml:"timeout"`          // F13, default 10m
+	// EnvPassthrough lists environment variable NAMES a hook may receive on
+	// top of the safe baseline + DEPLOY_* (e.g. SOPS_AGE_KEY_FILE, AWS creds
+	// for a restic backup). Everything else in the daemon environment is
+	// withheld from repo-controlled hooks. Per-stack passthrough is added
+	// (union) to this global list.
+	EnvPassthrough []string `toml:"env_passthrough"`
 }
 
 type GitAuth struct {
@@ -108,6 +114,18 @@ type StackConfig struct {
 	// without deploying. nil = inherit the global default (false). Only
 	// meaningful with a schedule; ignored otherwise.
 	Check *bool `toml:"check"`
+	// EnvPassthrough is added (union) to [hooks].env_passthrough for this
+	// stack's hooks, so a secret can be exposed only to the hook that needs
+	// it rather than every stack's hooks.
+	EnvPassthrough []string `toml:"env_passthrough"`
+}
+
+// HookEnvPassthrough is the union of the global and this stack's passthrough
+// lists — the env var names this stack's hooks may receive beyond the
+// baseline + DEPLOY_*. Duplicates are harmless: buildEnv dedups the final
+// KEY=VALUE list downstream, so this stays a plain concatenation.
+func (s StackConfig) HookEnvPassthrough(global []string) []string {
+	return append(append([]string{}, global...), s.EnvPassthrough...)
 }
 
 // CheckEnabled resolves the *bool (false when unset after defaults).
@@ -148,6 +166,19 @@ type Config struct {
 }
 
 var stackNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
+
+// envNameRe matches a bare environment variable NAME (not KEY=VALUE): the
+// passthrough config lists names to let through, never assignments.
+var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func validateEnvNames(where string, names []string) error {
+	for _, n := range names {
+		if !envNameRe.MatchString(n) {
+			return fmt.Errorf("%s: %q is not a valid variable name (list names to pass through, not KEY=VALUE)", where, n)
+		}
+	}
+	return nil
+}
 
 // Load reads path, interpolates ${ENV_VAR} references, decodes the TOML,
 // applies defaults and validates. Unknown keys are an error.
@@ -267,6 +298,9 @@ func (c *Config) Validate() error {
 	if !filepath.IsAbs(c.StateFile) {
 		return fmt.Errorf("state_file must be an absolute path, got %q", c.StateFile)
 	}
+	if err := validateEnvNames("hooks.env_passthrough", c.Hooks.EnvPassthrough); err != nil {
+		return err
+	}
 	if _, err := time.LoadLocation(c.Timezone); err != nil {
 		return fmt.Errorf("timezone: %w", err)
 	}
@@ -344,6 +378,9 @@ func (c *Config) Validate() error {
 		}
 		if st.Window.Duration < 0 {
 			return fmt.Errorf("stack %q: window must be positive, got %s", st.Name, st.Window.Duration)
+		}
+		if err := validateEnvNames(fmt.Sprintf("stack %q: env_passthrough", st.Name), st.EnvPassthrough); err != nil {
+			return err
 		}
 		if st.Schedule != "" {
 			if err := validateSchedule(st.Schedule); err != nil {

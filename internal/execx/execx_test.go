@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -61,17 +62,70 @@ func TestRunTimeoutKillsProcessGroup(t *testing.T) {
 }
 
 func TestRunAppendsEnv(t *testing.T) {
-	t.Parallel()
+	t.Setenv("PLICO_INHERITED_VAR", "from-daemon")
 	r := NewRunner(discard())
 	res, err := r.Run(context.Background(), Cmd{
-		Name: "sh", Args: []string{"-c", "printf '%s' \"$PLICO_TEST_VAR\""},
+		Name: "sh", Args: []string{"-c", "printf '%s|%s' \"$PLICO_TEST_VAR\" \"$PLICO_INHERITED_VAR\""},
 		Env: []string{"PLICO_TEST_VAR=hello"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(res.Stdout) != "hello" {
-		t.Errorf("env not propagated, stdout = %q", res.Stdout)
+	// Default: appended to os.Environ() — both the explicit and the
+	// inherited var are visible (git/sops/compose rely on this).
+	if got := string(res.Stdout); got != "hello|from-daemon" {
+		t.Errorf("default env = %q, want %q", got, "hello|from-daemon")
+	}
+}
+
+func TestRunCleanEnvDoesNotInherit(t *testing.T) {
+	t.Setenv("PLICO_INHERITED_VAR", "from-daemon")
+	r := NewRunner(discard())
+	res, err := r.Run(context.Background(), Cmd{
+		Name: "sh", Args: []string{"-c", "printf '%s|%s' \"$PLICO_ONLY\" \"$PLICO_INHERITED_VAR\""},
+		Env:      []string{"PLICO_ONLY=x", "PATH=" + os.Getenv("PATH")},
+		CleanEnv: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CleanEnv: the command sees ONLY what Env provides — the daemon's
+	// inherited var must be absent (this is how hooks are scoped).
+	if got := string(res.Stdout); got != "x|" {
+		t.Errorf("clean env = %q, want %q (inherited var must be absent)", got, "x|")
+	}
+}
+
+func TestRunCleanEnvNilStillScopes(t *testing.T) {
+	t.Setenv("PLICO_INHERITED_VAR", "from-daemon")
+	r := NewRunner(discard())
+	// A nil Env with CleanEnv MUST yield an empty environment, not inherit
+	// the daemon's (Go's os/exec treats nil cmd.Env as "inherit").
+	res, err := r.Run(context.Background(), Cmd{
+		Name: "/bin/sh", Args: []string{"-c", "printf '%s' \"$PLICO_INHERITED_VAR\""},
+		Env:      nil,
+		CleanEnv: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(res.Stdout); got != "" {
+		t.Errorf("nil clean env leaked the daemon environment: %q", got)
+	}
+}
+
+func TestEnvNames(t *testing.T) {
+	t.Parallel()
+	// Only keys, never values — a secret whose name looks innocent
+	// (DATABASE_URL) must not have its value logged.
+	got := EnvNames([]string{"DATABASE_URL=postgres://u:p@h/db", "PATH=/bin"})
+	if len(got) != 2 || got[0] != "DATABASE_URL" || got[1] != "PATH" {
+		t.Errorf("EnvNames = %v", got)
+	}
+	for _, s := range got {
+		if strings.Contains(s, "=") {
+			t.Errorf("EnvNames leaked a value: %q", s)
+		}
 	}
 }
 

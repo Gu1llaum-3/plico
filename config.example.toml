@@ -88,6 +88,12 @@ socket = "/run/plico/plico.sock"
 # pre_deploy_path = "/opt/plico/hooks/pre-deploy.sh"
 # post_deploy_path = "/opt/plico/hooks/post-deploy.sh"
 timeout = "10m"
+# Hooks run with a SCOPED environment: a safe baseline (PATH, HOME, locale,
+# DOCKER_HOST/CONFIG/CONTEXT) + the DEPLOY_* context, and NOTHING else. The
+# daemon's secrets (SOPS_AGE_KEY_FILE, notifier/git tokens) are withheld from
+# repo-controlled hooks by default. List extra variable NAMES to pass through
+# (never KEY=VALUE). A per-stack env_passthrough is added to this global list.
+# env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
 
 # Git HTTPS credentials, one table per host. SSH remotes use the system agent.
 # [git.auths."bitbucket.org"]
@@ -111,6 +117,7 @@ sops_files = [".deploy/secrets.enc.env"]
 sops_mode = "exec-env"                # or "tmpfs" (Linux only)
 verify_timeout = "90s"                # post-up healthcheck budget
 # hook_timeout = "20m"                # override [hooks].timeout per stack
+# env_passthrough = ["RESTIC_PASSWORD"]  # extra hook env, only for this stack
 # schedule = "0 4 * * *"              # override the global schedule (or "@poll")
 # window = "30m"                      # override the global window
 

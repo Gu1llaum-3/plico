@@ -89,6 +89,9 @@ grep -q "PUBLIC_MESSAGE=hello-in-clear" .deploy/secrets.enc.env \
 cat > .deploy/pre-deploy.sh <<EOF
 #!/bin/sh
 echo "backup for \$DEPLOY_STACK: \$DEPLOY_OLD_SHA -> \$DEPLOY_NEW_SHA" >> "$MARKER"
+# Env scoping: SOPS_AGE_KEY_FILE is a daemon secret and must NOT be visible
+# to a repo-controlled hook; PLICO_SMOKE_PASS is opt-in via env_passthrough.
+echo "age=[\${SOPS_AGE_KEY_FILE:-}] pass=[\${PLICO_SMOKE_PASS:-}]" >> "$MARKER"
 exit 0
 EOF
 chmod +x .deploy/pre-deploy.sh
@@ -128,6 +131,10 @@ listen = "127.0.0.1:$PORT"
 url = "http://127.0.0.1:$NTFY_PORT/plico"
 events = ["all"]
 
+[hooks]
+# PLICO_SMOKE_PASS is opted in for the hook; SOPS_AGE_KEY_FILE is NOT.
+env_passthrough = ["PLICO_SMOKE_PASS"]
+
 [[stack]]
 name = "smoke"
 repo = "file://$ORIGIN"
@@ -136,7 +143,7 @@ verify_timeout = "60s"
 EOF
 
 # ── 4. daemon: the age key reaches sops through plico's environment ────
-SOPS_AGE_KEY_FILE="$WS/age.key" "$PLICO" serve --config "$WS/config.toml" > "$LOG" 2>&1 &
+SOPS_AGE_KEY_FILE="$WS/age.key" PLICO_SMOKE_PASS="passed-through" "$PLICO" serve --config "$WS/config.toml" > "$LOG" 2>&1 &
 DAEMON_PID=$!
 
 i=0
@@ -153,6 +160,10 @@ grep -q "$SHA1" "$BASE/state.json" 2>/dev/null \
   && ok "state.json records SHA1" || fail "state.json missing SHA1"
 grep -q "backup for smoke:  -> $SHA1" "$MARKER" 2>/dev/null \
   && ok "pre-deploy hook ran with deploy context" || fail "hook marker missing/wrong"
+# Env scoping: the age key must be withheld, the passthrough var present.
+grep -q "age=\[\] pass=\[passed-through\]" "$MARKER" 2>/dev/null \
+  && ok "hook env scoped: age key withheld, passthrough var present" \
+  || fail "hook env scoping wrong: $(grep '^age=' "$MARKER" 2>/dev/null)"
 docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -q "app running" \
   && ok "container app is running" || fail "container not running"
 
