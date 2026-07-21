@@ -5,11 +5,12 @@
 #
 # Covers:
 #   - clone/fetch + deploy on git delta, hook context (F11), healthz, state
-#   - SOPS gate (F16): PARTIALLY encrypted dotenv (.sops.yaml with
-#     encrypted_regex — the recommended diff-friendly workflow) decrypted in
-#     memory via `sops exec-env`; both clear and secret values reach the
-#     container env, the secret cleartext never touches base_dir nor logs
+#   - repo-side .plico/ recipe: [sops] env (partial encryption, sops exec-env),
+#     ordered pre/post hooks, [compose] profiles/up_args, and (Linux) [secrets]
+#     files decrypted to tmpfs and bind-mounted via $PLICO_SECRETS_DIR — all
+#     declared IN the repo, secrets never touching base_dir/logs/notifications
 #   - backup gate (F12/F14): failing pre-deploy hook blocks the new revision
+#   - drift detection, monorepo path-scoping
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,6 +27,8 @@ MARKER="$WS/marker"
 LOG="$WS/plico.log"
 PORT=19444
 SECRET="s3cret-from-sops-42"
+TLS_SECRET="tls-key-material-99"
+IS_LINUX=""; [ "$(uname -s)" = Linux ] && IS_LINUX=1
 FAILURES=""
 
 fail() { FAILURES="$FAILURES\n- $1"; echo "FAIL: $1"; }
@@ -58,52 +61,76 @@ git init -q -b main "$WORK"
 cd "$WORK" || exit 1
 git config user.email smoke@test && git config user.name smoke
 
-cat > docker-compose.yml <<'EOF'
+# The whole deployment RECIPE lives in the repo under .plico/ (the server config
+# only knows the stack + repo). On Linux we also exercise an encrypted FILE
+# bind-mounted via ${PLICO_SECRETS_DIR} (tmpfs-only, so gated).
+SECRET_VOLUME=""
+if [ -n "$IS_LINUX" ]; then
+  SECRET_VOLUME='    volumes:
+      - ${PLICO_SECRETS_DIR}/tls.key:/etc/tls/tls.key:ro'
+fi
+
+cat > docker-compose.yml <<EOF
 services:
   app:
     image: alpine:3.20
     command: ["sleep", "300"]
     environment:
-      SECRET_MESSAGE: ${SECRET_MESSAGE}
-      PUBLIC_MESSAGE: ${PUBLIC_MESSAGE}
+      SECRET_MESSAGE: \${SECRET_MESSAGE}
+      PUBLIC_MESSAGE: \${PUBLIC_MESSAGE}
+${SECRET_VOLUME}
   extra:
     image: alpine:3.20
     command: ["sleep", "300"]
     profiles: ["extra"]
 EOF
 
-# Repo-side recipe: activate the "extra" profile so its service comes up. Proves
-# the .plico.toml is read from the repo at the deployed SHA and applied end to
-# end (a profile-gated service only starts if plico passed --profile).
-cat > .plico.toml <<'EOF'
-[compose]
-profiles = ["extra"]
-up_args = ["--wait"]
-EOF
-
 # Partial encryption, the diff-friendly workflow: .sops.yaml declares which
 # keys must be encrypted (encrypted_regex); everything else stays readable
 # in git diffs. mac_only_encrypted lets cleartext values be edited without
-# going through `sops edit`.
+# going through `sops edit`. The .key rule fully encrypts the cert file.
 cat > .sops.yaml <<EOF
 creation_rules:
-  - path_regex: \.deploy/.*\.enc\.env\$
+  - path_regex: secrets/.*\.enc\.env\$
     encrypted_regex: "(SECRET|PASSWORD|TOKEN|KEY)"
     mac_only_encrypted: true
     age: $RECIPIENT
+  - path_regex: secrets/.*\.enc\.key\$
+    age: $RECIPIENT
 EOF
 
-mkdir -p .deploy
-printf 'PUBLIC_MESSAGE=hello-in-clear\nSECRET_MESSAGE=%s\n' "$SECRET" > .deploy/secrets.enc.env
-sops encrypt --in-place .deploy/secrets.enc.env
-grep -q "SECRET_MESSAGE=ENC\[" .deploy/secrets.enc.env \
+mkdir -p secrets .plico
+printf 'PUBLIC_MESSAGE=hello-in-clear\nSECRET_MESSAGE=%s\n' "$SECRET" > secrets/app.enc.env
+sops encrypt --in-place secrets/app.enc.env
+grep -q "SECRET_MESSAGE=ENC\[" secrets/app.enc.env \
   && ok "secret key is encrypted in the committed file" \
   || fail "SECRET_MESSAGE not encrypted (encrypted_regex not applied?)"
-grep -q "PUBLIC_MESSAGE=hello-in-clear" .deploy/secrets.enc.env \
+grep -q "PUBLIC_MESSAGE=hello-in-clear" secrets/app.enc.env \
   && ok "non-secret key stays readable for git diff" \
   || fail "PUBLIC_MESSAGE should stay in clear (partial encryption)"
 
-cat > .deploy/pre-deploy.sh <<EOF
+# .plico/ recipe: sops env + ordered pre/post hooks + compose options.
+cat > .plico/plico.toml <<EOF
+pre_deploy  = [".plico/pre-deploy.sh"]
+post_deploy = [".plico/post.sh"]
+
+[compose]
+profiles = ["extra"]
+up_args  = ["--wait"]
+
+[sops]
+files = ["secrets/app.enc.env"]
+mode  = "exec-env"
+EOF
+
+# Linux only: an encrypted FILE decrypted to tmpfs and bind-mounted RO.
+if [ -n "$IS_LINUX" ]; then
+  printf -- '-----BEGIN KEY-----\n%s\n-----END KEY-----\n' "$TLS_SECRET" > secrets/tls.enc.key
+  sops encrypt --in-place secrets/tls.enc.key
+  printf '\n[secrets]\nfiles = ["secrets/tls.enc.key"]\n' >> .plico/plico.toml
+fi
+
+cat > .plico/pre-deploy.sh <<EOF
 #!/bin/sh
 echo "backup for \$DEPLOY_STACK: \$DEPLOY_OLD_SHA -> \$DEPLOY_NEW_SHA" >> "$MARKER"
 # Env scoping: SOPS_AGE_KEY_FILE is a daemon secret and must NOT be visible
@@ -111,7 +138,12 @@ echo "backup for \$DEPLOY_STACK: \$DEPLOY_OLD_SHA -> \$DEPLOY_NEW_SHA" >> "$MARK
 echo "age=[\${SOPS_AGE_KEY_FILE:-}] pass=[\${PLICO_SMOKE_PASS:-}]" >> "$MARKER"
 exit 0
 EOF
-chmod +x .deploy/pre-deploy.sh
+cat > .plico/post.sh <<EOF
+#!/bin/sh
+echo "post-hook ran for \$DEPLOY_STACK" >> "$MARKER"
+exit 0
+EOF
+chmod +x .plico/pre-deploy.sh .plico/post.sh
 git add -A && git commit -qm "v1"
 git remote add origin "$ORIGIN"
 git push -q origin main
@@ -173,10 +205,11 @@ events = ["all"]
 # PLICO_SMOKE_PASS is opted in for the hook; SOPS_AGE_KEY_FILE is NOT.
 env_passthrough = ["PLICO_SMOKE_PASS"]
 
+# sops, hooks, compose options, secret files: all declared in the repo's
+# .plico/plico.toml — the server config only names the stack + repo.
 [[stack]]
 name = "smoke"
 repo = "file://$ORIGIN"
-sops_files = [".deploy/secrets.enc.env"]
 verify_timeout = "60s"
 EOF
 
@@ -209,6 +242,9 @@ docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep
 docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -q "extra running" \
   && ok "repo .plico.toml applied (profile-gated service is up)" \
   || fail "profile-gated service not running — manifest not applied"
+# Ordered manifest hooks: pre (backup marker, above) AND post both ran.
+grep -q "post-hook ran for smoke" "$MARKER" 2>/dev/null \
+  && ok "manifest post-deploy hook ran" || fail "post-deploy hook marker missing"
 
 # ── 5. SOPS and notification assertions ────────────────────────────────
 CID=$(docker compose -p smoke ps -q app)
@@ -219,6 +255,17 @@ echo "$CONTAINER_ENV" | grep -q "SECRET_MESSAGE=$SECRET" \
 echo "$CONTAINER_ENV" | grep -q "PUBLIC_MESSAGE=hello-in-clear" \
   && ok "clear value from the same file injected too" \
   || fail "PUBLIC_MESSAGE not present in container env"
+# [secrets]: an encrypted FILE, decrypted to tmpfs and bind-mounted RO (Linux).
+if [ -n "$IS_LINUX" ]; then
+  docker exec "$CID" cat /etc/tls/tls.key 2>/dev/null | grep -q "$TLS_SECRET" \
+    && ok "encrypted file decrypted + bind-mounted into the container" \
+    || fail "secret file not decrypted/mounted in the container"
+  if grep -R -q "$TLS_SECRET" "$BASE" 2>/dev/null; then
+    fail "cleartext secret FILE found under base_dir"
+  else
+    ok "no cleartext secret file under base_dir"
+  fi
+fi
 if grep -R -q "$SECRET" "$BASE" 2>/dev/null; then
   fail "cleartext secret found under base_dir"
 else
@@ -284,12 +331,12 @@ echo "$DN" | grep -q "smoke: deployed" \
 # ── 7. gate test: failing pre-deploy hook must block the new revision ──
 cd "$WORK" || exit 1
 sed -i.bak 's/"300"/"301"/' docker-compose.yml && rm -f docker-compose.yml.bak
-cat > .deploy/pre-deploy.sh <<'EOF'
+cat > .plico/pre-deploy.sh <<'EOF'
 #!/bin/sh
 echo "pg_dump: connection refused" >&2
 exit 1
 EOF
-chmod +x .deploy/pre-deploy.sh
+chmod +x .plico/pre-deploy.sh
 git add -A && git commit -qm "v2 with broken backup" && git push -q origin main
 
 i=0
@@ -329,21 +376,22 @@ git init -q -b main "$MONO_WORK"
 cd "$MONO_WORK" || exit 1
 git config user.email smoke@test && git config user.name smoke
 for s in a b; do
-  mkdir -p "$s/.deploy"
+  mkdir -p "$s/.plico"
   cat > "$s/docker-compose.yml" <<'EOF'
 services:
   app:
     image: alpine:3.20
     command: ["sleep", "300"]
 EOF
-  # Same hook in both subdirs: keys its marker by $DEPLOY_STACK and records
-  # its cwd, which must be the subdir (proves the content root moved).
-  cat > "$s/.deploy/pre-deploy.sh" <<EOF
+  # Default single hook under .plico/ (no manifest): keys its marker by
+  # $DEPLOY_STACK and records its cwd, which must be the subdir (proves the
+  # content root moved) — and proves a .plico/ with only hooks needs no manifest.
+  cat > "$s/.plico/pre-deploy.sh" <<EOF
 #!/bin/sh
 echo "\$DEPLOY_STACK cwd=\$(pwd)" >> "$MONO_MDIR/\$DEPLOY_STACK"
 exit 0
 EOF
-  chmod +x "$s/.deploy/pre-deploy.sh"
+  chmod +x "$s/.plico/pre-deploy.sh"
 done
 git add -A && git commit -qm "mono v1"
 git remote add origin "$MONO_ORIGIN"

@@ -55,14 +55,17 @@ func TestResolveManifest(t *testing.T) {
 			t.Fatal("want error for ambiguous layout")
 		}
 	})
-	t.Run("dir without manifest", func(t *testing.T) {
+	t.Run("dir without manifest is valid (hooks-only .plico/)", func(t *testing.T) {
 		t.Parallel()
 		d := t.TempDir()
+		// a .plico/ holding only hook scripts (no plico.toml) is legitimate:
+		// no manifest, but .plico/pre-deploy.sh may still run.
 		if err := os.MkdirAll(filepath.Join(d, ".plico"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ResolveManifest(d); err == nil {
-			t.Fatal("want error for .plico/ without plico.toml")
+		p, err := ResolveManifest(d)
+		if err != nil || p != "" {
+			t.Fatalf("got (%q, %v), want (\"\", nil)", p, err)
 		}
 	})
 	t.Run("symlinked manifest is rejected", func(t *testing.T) {
@@ -89,12 +92,22 @@ func TestLoadManifest(t *testing.T) {
 		t.Parallel()
 		p := filepath.Join(d, "ok.toml")
 		if err := os.WriteFile(p, []byte(`
+pre_deploy  = [".plico/hooks/backup.sh", ".plico/hooks/migrate.sh"]
+post_deploy = [".plico/hooks/notify.sh"]
+
 [compose]
 compose_file = "docker-compose.prod.yml"
 profiles = ["web", "worker"]
 env_files = ["config/app.env"]
 remove_orphans = false
 up_args = ["--wait", "--pull=always", "--scale=web=2"]
+
+[sops]
+files = ["secrets/app.enc.env"]
+mode  = "tmpfs"
+
+[secrets]
+files = ["secrets/tls.enc.key"]
 `), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -110,6 +123,15 @@ up_args = ["--wait", "--pull=always", "--scale=web=2"]
 		}
 		if m.Compose.RemoveOrphans == nil || *m.Compose.RemoveOrphans {
 			t.Errorf("remove_orphans should be explicit false")
+		}
+		if len(m.Sops.Files) != 1 || m.Sops.Mode != "tmpfs" {
+			t.Errorf("sops = %+v", m.Sops)
+		}
+		if len(m.Secrets.Files) != 1 {
+			t.Errorf("secrets = %+v", m.Secrets)
+		}
+		if len(m.PreDeploy) != 2 || len(m.PostDeploy) != 1 {
+			t.Errorf("hooks = %v / %v", m.PreDeploy, m.PostDeploy)
 		}
 	})
 
@@ -132,7 +154,14 @@ up_args = ["--wait", "--pull=always", "--scale=web=2"]
 
 	errCases := []struct{ name, content, want string }{
 		{"unknown key", "[compose]\nnope = true\n", "unknown key"},
-		{"phase-2 key rejected", "pre_deploy = [\"a.sh\"]\n", "unknown key"},
+		{"unknown top-level key", "wat = true\n", "unknown key"},
+		{"bad sops mode", "[sops]\nmode = \"plain\"\n", "sops.mode"},
+		{"absolute sops file", "[sops]\nfiles = [\"/etc/x.env\"]\n", "repo-relative"},
+		{"escaping secret file", "[secrets]\nfiles = [\"../../k\"]\n", "repo-relative"},
+		{"absolute pre_deploy", "pre_deploy = [\"/etc/evil.sh\"]\n", "repo-relative"},
+		{"escaping post_deploy", "post_deploy = [\"a/../../evil.sh\"]\n", "repo-relative"},
+		{"secret name collision", "[secrets]\nfiles = [\"a/tls.enc.key\", \"b/tls.enc.key\"]\n", "collide"},
+		{"secret degenerate name", "[secrets]\nfiles = [\"secrets/.enc\"]\n", "invalid name"},
 		{"absolute compose_file", "[compose]\ncompose_file = \"/etc/x.yml\"\n", "repo-relative"},
 		{"escaping compose_file", "[compose]\ncompose_file = \"../../x.yml\"\n", "repo-relative"},
 		{"absolute env_file", "[compose]\nenv_files = [\"/etc/x.env\"]\n", "repo-relative"},
@@ -215,6 +244,39 @@ func TestMerge(t *testing.T) {
 		}
 		if r := Merge(StackConfig{}, &Manifest{}); !r.RemoveOrphans {
 			t.Error("remove_orphans should default true")
+		}
+	})
+
+	t.Run("sops server overrides repo wholesale", func(t *testing.T) {
+		t.Parallel()
+		m := &Manifest{Sops: SopsManifest{Files: []string{"repo.enc.env"}, Mode: "tmpfs"}}
+		// server sops_files set → server wins (files + mode)
+		r := Merge(StackConfig{SopsFiles: []string{"srv.enc.env"}, SopsMode: "exec-env"}, m)
+		if len(r.SopsFiles) != 1 || r.SopsFiles[0] != "srv.enc.env" || r.SopsMode != "exec-env" {
+			t.Errorf("server sops should win: %+v / %s", r.SopsFiles, r.SopsMode)
+		}
+		// server unset → repo applies, its mode honoured
+		r = Merge(StackConfig{}, m)
+		if len(r.SopsFiles) != 1 || r.SopsFiles[0] != "repo.enc.env" || r.SopsMode != "tmpfs" {
+			t.Errorf("repo sops should apply: %+v / %s", r.SopsFiles, r.SopsMode)
+		}
+		// repo sops with no mode → default exec-env
+		r = Merge(StackConfig{}, &Manifest{Sops: SopsManifest{Files: []string{"x.enc.env"}}})
+		if r.SopsMode != "exec-env" {
+			t.Errorf("repo sops default mode = %q, want exec-env", r.SopsMode)
+		}
+	})
+
+	t.Run("secrets + hooks pass through from repo", func(t *testing.T) {
+		t.Parallel()
+		m := &Manifest{
+			Secrets:    SecretsManifest{Files: []string{"tls.enc.key"}},
+			PreDeploy:  []string{".plico/pre.sh"},
+			PostDeploy: []string{".plico/post.sh"},
+		}
+		r := Merge(StackConfig{}, m)
+		if len(r.SecretFiles) != 1 || len(r.PreHooks) != 1 || len(r.PostHooks) != 1 {
+			t.Errorf("secrets/hooks not passed through: %+v", r)
 		}
 	})
 

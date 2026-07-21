@@ -18,7 +18,7 @@ Every `poll_interval`, for each stack:
 
 1. `git fetch` + compare the `origin/<ref>` SHA with the last deployed SHA
    (persisted in `state.json`). No delta → silent no-op.
-2. **Pre-deploy hook**: `.deploy/pre-deploy.sh` from the repo (takes
+2. **Pre-deploy hook**: `.plico/pre-deploy.sh` from the repo (takes
    precedence) or a configured global path. It receives `DEPLOY_STACK`,
    `DEPLOY_DIR`, `DEPLOY_GIT_REF`, `DEPLOY_OLD_SHA`, `DEPLOY_NEW_SHA`.
    **`exit != 0` → deployment aborted**, notification, retried on the next
@@ -94,7 +94,7 @@ runs once (first occurrence).
 
 By default one repo is one stack, cloned into `<base_dir>/<name>`. Set a
 `path` to point a stack at a **subdirectory** of its repo instead — the
-`compose_file`, `sops_files` and the `.deploy/` hooks resolve under it, and
+`compose_file`, `sops_files` and the `.plico/` hooks resolve under it, and
 `docker compose` runs with it as its working directory (so relative
 `build:`/`env_file:` paths inside the compose file resolve correctly).
 
@@ -102,7 +102,7 @@ By default one repo is one stack, cloned into `<base_dir>/<name>`. Set a
 [[stack]]
 name = "traefik"
 repo = "https://github.com/acme/infra.git"
-path = "traefik"      # <repo>/traefik/{docker-compose.yml,.deploy/pre-deploy.sh,…}
+path = "traefik"      # <repo>/traefik/{docker-compose.yml,.plico/pre-deploy.sh,…}
 
 [[stack]]
 name = "nextcloud"
@@ -242,16 +242,50 @@ This is safe because the repo already runs arbitrary code via its hooks; a recip
 choosing more compose flags grants no new privilege, and every hook still runs in
 the same server-scoped environment.
 
-Guardrails: `compose_file`/`env_files` must be lexically repo-relative (absolute
-paths and `..` segments rejected); the manifest file itself must not be a
-symlink (no escaping the repo, no leaking a host file into a parse-error
-notification); `up_args` is an **allowlist** of safe `up` flags in long-form
-only (`--wait`, `--pull=…`, `--scale=…`, `--build`, …), so a repo cannot
-reclaim `-p`/`-f` or the project identity that isolates stacks; unknown keys and
-missing files are hard errors (fail loudly); the manifest is **not**
-`${ENV}`-interpolated (a `${VAR}` is left for docker compose). No `.plico.toml`
-⇒ behaviour is exactly as before. (Ordered multi-hooks and sops secret *files*
-are planned follow-on phases.)
+The recipe also covers secrets and hooks — all repo-side, encrypted files
+committed IN the repo, only the age key stays on the server:
+
+```toml
+# .plico/plico.toml (directory form: manifest + scripts)
+pre_deploy  = [".plico/backup.sh", ".plico/migrate.sh"]  # ordered; a blocking gate
+post_deploy = [".plico/notify.sh"]                       # ordered; non-blocking
+
+[compose]
+profiles = ["monitoring"]
+
+[sops]                            # encrypted ENV files → sops exec-env / tmpfs
+files = ["secrets/app.enc.env"]   # injected as ${VAR} for compose interpolation
+mode  = "exec-env"                # or "tmpfs"
+
+[secrets]                         # encrypted FILES → decrypted onto tmpfs
+files = ["secrets/tls.enc.key"]   # bind-mount via ${PLICO_SECRETS_DIR}/tls.key
+```
+
+- **`[sops]`** — sops-encrypted dotenv files, committed in the repo, decrypted
+  in memory (never on disk) and injected as environment for `${VAR}`
+  interpolation. The server's `sops_files`, if set, override this wholesale.
+- **`[secrets]`** — sops-encrypted *files* (certs, keys) an app reads as files,
+  not env. plico decrypts them onto a stable per-stack **tmpfs** dir
+  (`/dev/shm/plico/<stack>-secrets`) exposed as **`$PLICO_SECRETS_DIR`**, so the
+  compose file can bind-mount them RO. Cleartext lives only in RAM; the `.enc`
+  marker is stripped from the target name. **Linux-only** (needs a real tmpfs),
+  and a reboot clears it — the stack re-materialises them on the next deploy.
+- **`pre_deploy`/`post_deploy`** — ordered hook scripts. Pre-hooks are the
+  blocking backup gate (first non-zero exit aborts); post-hooks are
+  non-blocking. They run in the same server-scoped environment as the default
+  `.plico/*.sh` hooks (no daemon secrets unless `env_passthrough`). If unset,
+  the default single `.plico/pre-deploy.sh`/`post-deploy.sh` still apply.
+
+Guardrails: `compose_file`/`env_files`/`[sops]`/`[secrets]`/hook paths must be
+lexically repo-relative (absolute paths and `..` segments rejected); the
+manifest file itself must not be a symlink (no escaping the repo, no leaking a
+host file into a parse-error notification); a plico-decrypted secret file lands
+only in the plico-owned tmpfs dir, never a repo-chosen path; `up_args` is an
+**allowlist** of safe `up` flags in long-form only (`--wait`, `--pull=…`,
+`--scale=…`, `--build`, …), so a repo cannot reclaim `-p`/`-f` or the project
+identity that isolates stacks; unknown keys and missing files/hooks are hard
+errors (fail loudly); the manifest is **not** `${ENV}`-interpolated (a `${VAR}`
+is left for docker compose). No `.plico.toml` ⇒ behaviour is exactly as before.
 
 ### Drift detection (reconciliation-lite)
 
@@ -313,14 +347,14 @@ in git diffs) is therefore supported natively:
 ```yaml
 # .sops.yaml at the stack repo root
 creation_rules:
-  - path_regex: \.deploy/.*\.enc\.env$
+  - path_regex: secrets/.*\.enc\.env$
     encrypted_regex: "(SECRET|PASSWORD|TOKEN|KEY)"
     mac_only_encrypted: true
     age: age1...   # recipient(s)
 ```
 
 ```sh
-sops encrypt --in-place .deploy/secrets.enc.env   # or: sops edit
+sops encrypt --in-place secrets/app.enc.env   # or: sops edit
 ```
 
 ⚠️ Without `mac_only_encrypted: true`, the MAC also covers cleartext values:

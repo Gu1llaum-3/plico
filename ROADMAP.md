@@ -109,9 +109,17 @@ n'existe dans doco-cd.
       serveur ; **le serveur surcharge le repo** ; `ignore_manifest` = kill-switch.
       **Phase 1 faite** : infra manifeste + **options compose fines** (`profiles`,
       `env_files`, `remove_orphans`, args `up`, `compose_file`) — remplace l'ancien
-      item « options compose ». **Phase 2** (à venir) : hooks pré/post multiples
-      ordonnés. **Phase 3** (à venir) : refs de fichiers-secrets sops déchiffrés
-      vers un tmpfs plico-contrôlé (`PLICO_SECRETS_DIR`), Linux-only, caveat reboot.
+      item « options compose ». **Phase 2 faite** : `[sops]` (env chiffrés déclarés
+      dans le repo) + hooks pré/post **multiples ordonnés** (pré = gate bloquante,
+      post = non-bloquant ; fallback sur `.deploy/*.sh`). **Phase 3 faite** :
+      `[secrets]` — fichiers sops déchiffrés vers un tmpfs plico-contrôlé exposé en
+      `PLICO_SECRETS_DIR` pour bind-mount (`.enc` retiré du nom, `0644` dans un
+      dossier `0700` **isolé par UID** `/dev/shm/plico-<uid>`, recréé à chaque
+      déploiement, Linux-only, caveat reboot). Tous les hooks/fichiers plico
+      vivent sous **`.plico/`** (défaut `.plico/pre-deploy.sh`/`post-deploy.sh`,
+      plus `.deploy/` — un `.deploy/` de l'utilisateur ne peut plus être
+      confondu). Validé bout-en-bout sur une VM réelle **et** dans le smoke CI
+      (env + fichier chiffré + hooks pré/post, zéro clair sur disque persistant).
 - [ ] **`plico healthcheck`** : sous-commande qui sonde son propre /healthz
       (HEALTHCHECK Docker, watchdog systemd)
 - [ ] **`/metrics` Prometheus** : `deployments_total`, `deploy_errors_total`,

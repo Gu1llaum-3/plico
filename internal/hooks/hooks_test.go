@@ -97,6 +97,40 @@ func TestResolve(t *testing.T) {
 	})
 }
 
+func TestResolveList(t *testing.T) {
+	t.Parallel()
+
+	t.Run("preserves order", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeScript(t, filepath.Join(root, ".plico/a.sh"), "exit 0", 0o755)
+		writeScript(t, filepath.Join(root, ".plico/b.sh"), "exit 0", 0o755)
+		res, err := ResolveList(root, []string{".plico/b.sh", ".plico/a.sh"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 2 || res[0].Path != filepath.Join(root, ".plico/b.sh") || res[1].Path != filepath.Join(root, ".plico/a.sh") {
+			t.Errorf("order not preserved: %+v", res)
+		}
+	})
+
+	t.Run("missing hook is an error", func(t *testing.T) {
+		t.Parallel()
+		if _, err := ResolveList(t.TempDir(), []string{".plico/gone.sh"}); err == nil {
+			t.Fatal("a declared but missing hook must be an error, not a skip")
+		}
+	})
+
+	t.Run("non-executable hook is an error", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeScript(t, filepath.Join(root, ".plico/x.sh"), "exit 0", 0o644)
+		if _, err := ResolveList(root, []string{".plico/x.sh"}); err == nil {
+			t.Fatal("a committed hook without +x must block, not bypass")
+		}
+	})
+}
+
 func TestRunPassesDeployContext(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

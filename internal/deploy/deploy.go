@@ -100,6 +100,11 @@ type Deployer struct {
 
 	// TmpfsRoot is overridable in tests; defaults to /dev/shm on Linux.
 	TmpfsRoot string
+	// tmpfsCheck verifies TmpfsRoot is a real tmpfs before any decrypt-to-RAM;
+	// overridable in tests (the real one refuses on non-Linux). It enforces
+	// "secrets never hit disk in cleartext" at the point of use, so it covers
+	// manifest-driven decryption too (which startup cannot see).
+	tmpfsCheck func(string) error
 
 	runner execx.Runner // for sops tmpfs decryption
 }
@@ -107,19 +112,20 @@ type Deployer struct {
 func New(cfg *config.Config, git *gitrepo.Client, rt compose.Runtime, hk *hooks.Runner,
 	n notify.Notifier, st *state.Store, r execx.Runner, log *slog.Logger) *Deployer {
 	return &Deployer{
-		cfg:       cfg,
-		git:       git,
-		runtime:   rt,
-		hooks:     hk,
-		notifier:  n,
-		store:     st,
-		runner:    r,
-		log:       log,
-		locks:     map[string]*sync.Mutex{},
-		gitFails:  map[string]int{},
-		driftBad:  map[string]bool{},
-		sem:       make(chan struct{}, cfg.MaxConcurrentDeploys),
-		TmpfsRoot: sopsx.DefaultTmpfsRoot,
+		cfg:        cfg,
+		git:        git,
+		runtime:    rt,
+		hooks:      hk,
+		notifier:   n,
+		store:      st,
+		runner:     r,
+		log:        log,
+		locks:      map[string]*sync.Mutex{},
+		gitFails:   map[string]int{},
+		driftBad:   map[string]bool{},
+		sem:        make(chan struct{}, cfg.MaxConcurrentDeploys),
+		TmpfsRoot:  sopsx.DefaultTmpfsRoot,
+		tmpfsCheck: sopsx.CheckTmpfs,
 	}
 }
 
@@ -323,6 +329,26 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		log.Warn("PRE-DEPLOY HOOK MANUALLY SKIPPED: deploying without the backup gate",
 			"stage", StagePreHook)
 		ev(notify.PreHookSkipped, StagePreHook, "pre-deploy hook manually skipped (--skip-pre --force)")
+	} else if len(rec.PreHooks) > 0 {
+		// Manifest-declared ordered pre-hooks: a blocking gate, first non-zero
+		// exit aborts the deploy (same semantics as the single legacy hook).
+		resList, err := hooks.ResolveList(root, rec.PreHooks)
+		if err != nil {
+			log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
+			fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
+			return OutcomeFailed
+		}
+		for i, res := range resList {
+			log.Info("running pre-deploy hook", "hook", res.Path, "index", i, "of", len(resList))
+			hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv)
+			if err != nil {
+				log.Error("pre-deploy hook failed, deployment aborted", "stage", StagePreHook, "hook", res.Path, "error", err)
+				fail(notify.PreHookFailed, StagePreHook,
+					fmt.Sprintf("hook %s: %v\n%s", res.Path, err, execx.Tail(hres.Stderr, 1024)),
+					oldSHA, state.StatusPreHookFailed)
+				return OutcomeFailed
+			}
+		}
 	} else {
 		res, err := hooks.Resolve(root, hooks.RepoPreDeploy, d.cfg.Hooks.PreDeployPath)
 		if err != nil {
@@ -353,13 +379,23 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		ExtraArgs: rec.TopLevelArgs(),
 		UpArgs:    rec.UpArgsResolved(),
 	}
-	cleanup, err := d.setupSops(ctx, st, root, runID, &copts)
+	cleanup, err := d.setupSops(ctx, rec.SopsFiles, rec.SopsMode, st.Name, root, runID, &copts)
 	if err != nil {
 		log.Error("sops setup failed", "stage", StageSops, "error", err)
 		fail(notify.DeployFailed, StageSops, err.Error(), oldSHA, state.StatusFailed)
 		return OutcomeFailed
 	}
 	defer cleanup()
+
+	// 7b. secret files (manifest [secrets].files): decrypt onto a plico-owned
+	// tmpfs dir and expose it as $PLICO_SECRETS_DIR for compose bind-mounts.
+	if secretsDir, err := d.setupSecretFiles(ctx, rec.SecretFiles, st.Name, root); err != nil {
+		log.Error("secret files setup failed", "stage", StageSops, "error", err)
+		fail(notify.DeployFailed, StageSops, err.Error(), oldSHA, state.StatusFailed)
+		return OutcomeFailed
+	} else if secretsDir != "" {
+		copts.Env = append(copts.Env, "PLICO_SECRETS_DIR="+secretsDir)
+	}
 
 	// 8. pull — a failure leaves the running stack untouched (F18).
 	if rec.ForcePull {
@@ -390,6 +426,20 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	// low risk).
 	if opts.SkipPost {
 		log.Info("post-deploy hook manually skipped", "stage", StagePostHook)
+	} else if len(rec.PostHooks) > 0 {
+		// Manifest-declared ordered post-hooks: resolve+run each INDIVIDUALLY so
+		// one unusable entry does not drop the others (non-blocking stage —
+		// every failure is logged, never fatal, unlike the pre-hook gate).
+		for _, rel := range rec.PostHooks {
+			res, err := hooks.Resolve(root, rel, "")
+			if err != nil || res.Path == "" {
+				log.Warn("post-deploy hook unusable (non-blocking), skipping", "stage", StagePostHook, "hook", rel, "error", err)
+				continue
+			}
+			if _, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv); err != nil {
+				log.Warn("post-deploy hook failed (non-blocking)", "stage", StagePostHook, "hook", res.Path, "error", err)
+			}
+		}
 	} else if res, err := hooks.Resolve(root, hooks.RepoPostDeploy, d.cfg.Hooks.PostDeployPath); err != nil {
 		log.Warn("post-deploy hook unusable", "stage", StagePostHook, "error", err)
 	} else if res.Path != "" {
@@ -647,24 +697,32 @@ func (d *Deployer) notifyDrift(ctx context.Context, st config.StackConfig, t not
 	})
 }
 
-// setupSops fills opts with either the exec-env prefix or tmpfs env-files.
+// setupSops fills opts with either the exec-env prefix or tmpfs env-files, for
+// the resolved sops ENV files (from the server config or the repo manifest).
 // The returned cleanup must always run.
-func (d *Deployer) setupSops(ctx context.Context, st config.StackConfig, dir, runID string, opts *compose.Options) (func(), error) {
-	if len(st.SopsFiles) == 0 {
-		d.log.Debug("sops: no files configured, skipping", "stack", st.Name)
+func (d *Deployer) setupSops(ctx context.Context, files []string, mode, stack, dir, runID string, opts *compose.Options) (func(), error) {
+	if len(files) == 0 {
+		d.log.Debug("sops: no files configured, skipping", "stack", stack)
 		return func() {}, nil
 	}
-	for _, f := range st.SopsFiles {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+	for _, f := range files {
+		fi, err := os.Lstat(filepath.Join(dir, f))
+		if err != nil {
 			return func() {}, fmt.Errorf("sops file %q not found in worktree at deployed revision: %w", f, err)
 		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return func() {}, fmt.Errorf("sops file %q must not be a symlink", f)
+		}
 	}
-	if st.SopsMode == "tmpfs" {
-		abs := make([]string, len(st.SopsFiles))
-		for i, f := range st.SopsFiles {
+	if mode == "tmpfs" {
+		if err := d.tmpfsCheck(d.TmpfsRoot); err != nil {
+			return func() {}, err
+		}
+		abs := make([]string, len(files))
+		for i, f := range files {
 			abs[i] = filepath.Join(dir, f)
 		}
-		env, err := sopsx.DecryptToTmpfs(ctx, d.runner, abs, d.TmpfsRoot, st.Name, runID)
+		env, err := sopsx.DecryptToTmpfs(ctx, d.runner, abs, d.TmpfsRoot, stack, runID)
 		if err != nil {
 			return func() {}, err
 		}
@@ -672,9 +730,42 @@ func (d *Deployer) setupSops(ctx context.Context, st config.StackConfig, dir, ru
 		return env.Cleanup, nil
 	}
 	// exec-env: paths stay repo-relative, the command runs with Dir = worktree.
-	files := st.SopsFiles
 	opts.Wrap = func(argv []string) []string { return sopsx.ExecEnvArgv(files, argv) }
 	return func() {}, nil
+}
+
+// setupSecretFiles decrypts the manifest's [secrets].files onto a stable,
+// per-stack tmpfs directory and returns PLICO_SECRETS_DIR so the compose file
+// can bind-mount them (`${PLICO_SECRETS_DIR}/foo`). Unlike sops env files there
+// is NO per-run cleanup: the decrypted files must outlive the deploy (a
+// container reads them for its whole lifetime); they are overwritten on each
+// deploy and cleared on host reboot (tmpfs). Linux-only in practice (needs a
+// real tmpfs at TmpfsRoot). Returns ("", nil) when no secret files.
+func (d *Deployer) setupSecretFiles(ctx context.Context, files []string, stack, dir string) (string, error) {
+	if len(files) == 0 {
+		// A stack that no longer declares [secrets] must have any previously
+		// decrypted cleartext revoked, not left lingering in tmpfs.
+		_ = sopsx.RemoveStackSecrets(d.TmpfsRoot, stack)
+		return "", nil
+	}
+	// Enforce the tmpfs invariant at the point of use (startup can't see the
+	// manifest): cleartext secret files must never land on persistent disk.
+	if err := d.tmpfsCheck(d.TmpfsRoot); err != nil {
+		return "", err
+	}
+	abs := make([]string, len(files))
+	for i, f := range files {
+		p := filepath.Join(dir, f)
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return "", fmt.Errorf("secret file %q not found in worktree at deployed revision: %w", f, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("secret file %q must not be a symlink", f)
+		}
+		abs[i] = p
+	}
+	return sopsx.DecryptToDir(ctx, d.runner, abs, d.TmpfsRoot, stack)
 }
 
 // verify polls `compose ps` until every service is healthy or the timeout

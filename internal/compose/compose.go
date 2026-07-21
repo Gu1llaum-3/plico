@@ -36,6 +36,11 @@ type Options struct {
 	// UpArgs are appended AFTER `up -d` (command position): --remove-orphans
 	// and any manifest up_args.
 	UpArgs []string
+	// Env are extra environment variables for the compose process (added to
+	// the inherited env, NOT a clean env) — e.g. PLICO_SECRETS_DIR so the
+	// compose file can interpolate it in bind-mount volumes. Never applied to
+	// PS.
+	Env []string
 }
 
 type Runtime interface {
@@ -91,7 +96,7 @@ func (d *docker) run(ctx context.Context, o Options, verb ...string) (execx.Resu
 	if o.Wrap != nil {
 		argv = o.Wrap(argv)
 	}
-	return d.runner.Run(ctx, execx.Cmd{Name: argv[0], Args: argv[1:], Dir: o.Dir})
+	return d.runner.Run(ctx, execx.Cmd{Name: argv[0], Args: argv[1:], Dir: o.Dir, Env: o.Env})
 }
 
 // psLine matches the JSON emitted by `docker compose ps --format json`

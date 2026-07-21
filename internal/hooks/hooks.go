@@ -15,10 +15,12 @@ import (
 	"github.com/Gu1llaum-3/plico/internal/execx"
 )
 
-// Repo-side hook locations (F10).
+// Repo-side hook locations (F10). Everything plico reads from a repo lives
+// under .plico/, so a user's own .deploy/ (for some other tool) is never
+// mistaken for a plico hook.
 const (
-	RepoPreDeploy  = ".deploy/pre-deploy.sh"
-	RepoPostDeploy = ".deploy/post-deploy.sh"
+	RepoPreDeploy  = ".plico/pre-deploy.sh"
+	RepoPostDeploy = ".plico/post-deploy.sh"
 )
 
 // Context is passed to hooks as environment variables (F11).
@@ -152,6 +154,30 @@ func Resolve(repoDir, repoRelPath, globalPath string) (Resolution, error) {
 		return Resolution{}, fmt.Errorf("configured hook %s is missing or not executable", globalPath)
 	}
 	return Resolution{Path: globalPath, Source: "global"}, nil
+}
+
+// ResolveList validates an ORDERED list of repo-relative hook scripts (from a
+// repo manifest), preserving order. Every entry must exist, be a regular file,
+// and be executable — a declared-but-unusable hook is a hard error, never a
+// silent skip (same rule as Resolve). repoRelPaths are joined under root and
+// must have been validated as repo-relative upstream.
+func ResolveList(root string, repoRelPaths []string) ([]Resolution, error) {
+	out := make([]Resolution, 0, len(repoRelPaths))
+	for _, rel := range repoRelPaths {
+		p := filepath.Join(root, rel)
+		info, err := os.Stat(p)
+		if err != nil {
+			return nil, fmt.Errorf("hook %s not found: %w", rel, err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("hook %s is a directory", rel)
+		}
+		if info.Mode()&0o111 == 0 {
+			return nil, fmt.Errorf("hook %s exists but is not executable (missing chmod +x?)", rel)
+		}
+		out = append(out, Resolution{Path: p, Source: "repo"})
+	}
+	return out, nil
 }
 
 // Run executes the hook with the deploy context and a hard timeout (F13).

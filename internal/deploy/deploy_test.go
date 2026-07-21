@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -136,8 +137,13 @@ func newHarness(t *testing.T) *harness {
 
 	h := &harness{}
 	gitFake := &execx.FakeRunner{Match: func(c execx.Cmd) (execx.Result, error) {
+		// sops decrypt (secret files / tmpfs env): write the --output target so
+		// the pipeline sees a decrypted file, without a real sops.
+		if c.Name == "sops" && len(c.Args) >= 3 && c.Args[0] == "decrypt" && c.Args[1] == "--output" {
+			return execx.Result{}, os.WriteFile(c.Args[2], []byte("decrypted"), 0o600)
+		}
 		if c.Name != "git" {
-			return execx.Result{}, errors.New("harness: only git goes through the fake runner")
+			return execx.Result{}, errors.New("harness: only git/sops go through the fake runner")
 		}
 		switch c.Args[0] {
 		case "fetch", "checkout":
@@ -350,7 +356,7 @@ func TestSopsFileMissingFailsBeforePull(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.writePreHook(t, "exit 0")
-	h.stack.SopsFiles = []string{".deploy/secrets.enc.env"} // not created in worktree
+	h.stack.SopsFiles = []string{"secrets/app.enc.env"} // not created in worktree
 
 	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeFailed {
 		t.Fatal("want failure on missing sops file")
@@ -368,11 +374,14 @@ func TestSopsExecEnvPrefixReachesCompose(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.writePreHook(t, "exit 0")
-	secret := filepath.Join(h.worktree, ".deploy", "secrets.enc.env")
+	secret := filepath.Join(h.worktree, "secrets", "app.enc.env")
+	if err := os.MkdirAll(filepath.Dir(secret), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(secret, []byte("ENC"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	h.stack.SopsFiles = []string{".deploy/secrets.enc.env"}
+	h.stack.SopsFiles = []string{"secrets/app.enc.env"}
 
 	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeDeployed {
 		t.Fatalf("outcome = %s", outcome)
@@ -382,7 +391,7 @@ func TestSopsExecEnvPrefixReachesCompose(t *testing.T) {
 			t.Fatal("pull and up must receive the sops wrap")
 		}
 		got := opts[0].Wrap([]string{"docker", "compose", "up", "-d"})
-		want := []string{"sops", "exec-env", ".deploy/secrets.enc.env", "'docker' 'compose' 'up' '-d'"}
+		want := []string{"sops", "exec-env", "secrets/app.enc.env", "'docker' 'compose' 'up' '-d'"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("wrapped argv = %q, want %q", got, want)
 		}
@@ -922,6 +931,155 @@ func TestBadManifestFailsLoudly(t *testing.T) {
 	}
 	if len(h.runtime.ups) != 0 {
 		t.Error("a bad manifest must abort before compose up")
+	}
+}
+
+func (h *harness) writeExec(t *testing.T, rel, body string) {
+	t.Helper()
+	p := filepath.Join(h.worktree, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManifestOrderedPreHooksRunInOrder(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, "pre_deploy = [\"hooks/1.sh\", \"hooks/2.sh\"]\n")
+	h.writeExec(t, "hooks/1.sh", `echo 1 >> "$DEPLOY_DIR/order"`)
+	h.writeExec(t, "hooks/2.sh", `echo 2 >> "$DEPLOY_DIR/order"`)
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	b, err := os.ReadFile(filepath.Join(h.worktree, "order"))
+	if err != nil || string(b) != "1\n2\n" {
+		t.Errorf("hook order = %q (err %v), want \"1\\n2\\n\"", string(b), err)
+	}
+}
+
+func TestManifestPreHookGateAbortsOnFirstFailure(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, "pre_deploy = [\"hooks/bad.sh\", \"hooks/never.sh\"]\n")
+	h.writeExec(t, "hooks/bad.sh", "echo boom >&2; exit 1")
+	h.writeExec(t, "hooks/never.sh", `touch "$DEPLOY_DIR/SHOULD-NOT-RUN"`)
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeFailed {
+		t.Fatalf("outcome = %s, want failed", got)
+	}
+	if last := h.events.last(); last.Type != notify.PreHookFailed {
+		t.Errorf("want pre_hook_failed, got %s", last.Type)
+	}
+	if _, err := os.Stat(filepath.Join(h.worktree, "SHOULD-NOT-RUN")); err == nil {
+		t.Error("second hook ran despite the first failing — gate is not blocking")
+	}
+	if len(h.runtime.ups) != 0 {
+		t.Error("a failed pre-hook gate must abort before compose up")
+	}
+}
+
+func TestManifestPostHooksNonBlocking(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, "post_deploy = [\"hooks/p.sh\"]\n")
+	h.writeExec(t, "hooks/p.sh", "exit 1") // fails, but post-hooks are non-blocking
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed (post-hook failure must not abort)", got)
+	}
+}
+
+// One unusable post-hook must not drop the others: they are resolved and run
+// individually (non-blocking, best effort).
+func TestManifestPostHooksOneBadDoesNotDropRest(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, "post_deploy = [\"hooks/good.sh\", \"hooks/missing.sh\"]\n")
+	h.writeExec(t, "hooks/good.sh", `touch "$DEPLOY_DIR/good-ran"`)
+	// hooks/missing.sh intentionally absent
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if _, err := os.Stat(filepath.Join(h.worktree, "good-ran")); err != nil {
+		t.Error("a valid post-hook was skipped because a later one was missing")
+	}
+}
+
+func TestManifestSecretFilesExposePlicoSecretsDir(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.deployer.TmpfsRoot = t.TempDir()                        // avoid /dev/shm on non-Linux test hosts
+	h.deployer.tmpfsCheck = func(string) error { return nil } // the temp dir isn't a real tmpfs
+	h.writeManifest(t, "[secrets]\nfiles = [\"secrets/tls.enc.key\"]\n")
+	// the encrypted source must exist in the worktree (content irrelevant — the
+	// fake sops just writes the --output target).
+	h.writeExec(t, "secrets/tls.enc.key", "ENC")
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	up := h.runtime.ups[0]
+	wantDir := filepath.Join(h.deployer.TmpfsRoot, fmt.Sprintf("plico-%d", os.Getuid()), "web-secrets")
+	found := false
+	for _, e := range up.Env {
+		if e == "PLICO_SECRETS_DIR="+wantDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("compose Env = %v, want PLICO_SECRETS_DIR=%s", up.Env, wantDir)
+	}
+	// decrypted file materialised, `.enc` stripped.
+	if _, err := os.Stat(filepath.Join(wantDir, "tls.key")); err != nil {
+		t.Errorf("decrypted secret file missing: %v", err)
+	}
+}
+
+// Secret files must never be decrypted onto non-tmpfs: the tmpfs guard is
+// enforced at the point of use, so a repo declaring [secrets] on a host
+// without a real tmpfs fails the deploy loudly instead of writing cleartext to
+// disk.
+// Removing [secrets] must revoke the decrypted cleartext — not leave it in
+// tmpfs until reboot.
+func TestManifestSecretFilesRevokedOnRemoval(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.deployer.TmpfsRoot = t.TempDir()
+	h.deployer.tmpfsCheck = func(string) error { return nil }
+	h.writeManifest(t, "[secrets]\nfiles = [\"secrets/tls.enc.key\"]\n")
+	h.writeExec(t, "secrets/tls.enc.key", "ENC")
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("first deploy = %s, want deployed", got)
+	}
+	dir := filepath.Join(h.deployer.TmpfsRoot, fmt.Sprintf("plico-%d", os.Getuid()), "web-secrets")
+	if _, err := os.Stat(filepath.Join(dir, "tls.key")); err != nil {
+		t.Fatalf("secret not decrypted on first deploy: %v", err)
+	}
+	// Redeploy with [secrets] gone (force, since the SHA is unchanged).
+	h.writeManifest(t, "[compose]\nprofiles = [\"x\"]\n")
+	if got := h.deployer.RunStackWith(context.Background(), h.stack, RunOptions{Force: true}); got != OutcomeDeployed {
+		t.Fatalf("redeploy = %s, want deployed", got)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("secrets dir not cleared after [secrets] removed (err=%v)", err)
+	}
+}
+
+func TestManifestSecretFilesRefuseNonTmpfs(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.deployer.TmpfsRoot = t.TempDir()
+	h.deployer.tmpfsCheck = func(string) error { return errors.New("not a tmpfs") }
+	h.writeManifest(t, "[secrets]\nfiles = [\"secrets/tls.enc.key\"]\n")
+	h.writeExec(t, "secrets/tls.enc.key", "ENC")
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeFailed {
+		t.Fatalf("outcome = %s, want failed (must refuse non-tmpfs)", got)
+	}
+	if last := h.events.last(); last.Stage != StageSops {
+		t.Errorf("want failure at sops stage, got %s", last.Stage)
+	}
+	if len(h.runtime.ups) != 0 {
+		t.Error("must abort before compose up")
 	}
 }
 

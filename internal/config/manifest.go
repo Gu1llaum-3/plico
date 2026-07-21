@@ -15,12 +15,25 @@ import (
 // NON-SENSITIVE recipe: trust and bootstrap (repo, ref, auth, base_dir,
 // env_passthrough, sops_mode, schedule…) live exclusively in the server
 // plico.toml and are not expressible here — a repo can never grant itself a
-// secret or a privilege. Phase 1 wires the [compose] table; pre_deploy /
-// post_deploy / [secrets] are intentionally absent from the struct so they are
-// rejected as unknown keys until their phases land (fail loudly, never a silent
-// no-op).
+// secret or a privilege (the age key, git auth and env_passthrough stay
+// server-side). Encrypted files live IN the repo; the manifest only declares
+// WHICH ones to decrypt.
 type Manifest struct {
 	Compose ComposeManifest `toml:"compose"`
+	// Sops declares repo-committed, sops-encrypted ENV files to inject as
+	// environment (sops exec-env / tmpfs --env-file), for compose ${VAR}
+	// interpolation. The server's sops_files, when set, override this.
+	Sops SopsManifest `toml:"sops"`
+	// Secrets declares repo-committed, sops-encrypted FILES to decrypt onto a
+	// plico-controlled tmpfs dir (exposed as $PLICO_SECRETS_DIR) so a container
+	// can bind-mount them — for certs/keys an app reads as files, not env.
+	Secrets SecretsManifest `toml:"secrets"`
+	// PreDeploy / PostDeploy are ordered, repo-relative hook scripts. Pre-hooks
+	// are a blocking gate (first non-zero exit aborts); post-hooks are
+	// non-blocking. They run in the same server-scoped environment as the
+	// default .plico/*.sh hooks (no daemon secrets unless env_passthrough).
+	PreDeploy  []string `toml:"pre_deploy"`
+	PostDeploy []string `toml:"post_deploy"`
 }
 
 // ComposeManifest holds the per-stack compose options a repo may set.
@@ -33,6 +46,17 @@ type ComposeManifest struct {
 	UpArgs        []string `toml:"up_args"`        // extra args appended after `up -d`
 }
 
+// SopsManifest declares encrypted env files and the decryption mode.
+type SopsManifest struct {
+	Files []string `toml:"files"` // repo-relative, sops-encrypted dotenv files
+	Mode  string   `toml:"mode"`  // "exec-env" (default) | "tmpfs"
+}
+
+// SecretsManifest declares encrypted files to materialise on tmpfs.
+type SecretsManifest struct {
+	Files []string `toml:"files"` // repo-relative, sops-encrypted files
+}
+
 // Recipe is the resolved, non-pointer result of merging a stack's server config
 // with its repo manifest. It is what the deploy pipeline consumes.
 type Recipe struct {
@@ -42,6 +66,11 @@ type Recipe struct {
 	RemoveOrphans bool
 	ForcePull     bool
 	UpArgs        []string
+	SopsFiles     []string
+	SopsMode      string
+	SecretFiles   []string
+	PreHooks      []string
+	PostHooks     []string
 }
 
 // TopLevelArgs are the flags that belong BEFORE the compose subcommand, so they
@@ -113,12 +142,15 @@ func ResolveManifest(root string) (string, error) {
 	case fileOK:
 		return fileP, nil
 	case dirOK:
+		// .plico/ is plico's directory: it may hold the manifest AND/OR hook
+		// scripts (.plico/pre-deploy.sh, …). A .plico/ without plico.toml is
+		// valid (hooks only) — not an error, just "no manifest".
 		mOK, err := isRegularNoSymlink(dirManifest)
 		if err != nil {
 			return "", err
 		}
 		if !mOK {
-			return "", fmt.Errorf(".plico/ exists but .plico/plico.toml is missing")
+			return "", nil
 		}
 		return dirManifest, nil
 	default:
@@ -174,7 +206,56 @@ func (m *Manifest) validate(path string) error {
 			return fmt.Errorf("%s: up_args flag %q is not allowed (plico owns -d/-f/-p/--remove-orphans; use profiles/env_files/remove_orphans instead)", path, a)
 		}
 	}
+	if m.Sops.Mode != "" && m.Sops.Mode != "exec-env" && m.Sops.Mode != "tmpfs" {
+		return fmt.Errorf("%s: sops.mode must be \"exec-env\" or \"tmpfs\", got %q", path, m.Sops.Mode)
+	}
+	repoRel := func(kind string, files []string) error {
+		for _, f := range files {
+			if filepath.IsAbs(f) || escapesRepo(f) {
+				return fmt.Errorf("%s: %s %q must be a repo-relative path", path, kind, f)
+			}
+		}
+		return nil
+	}
+	for _, chk := range []struct {
+		kind  string
+		files []string
+	}{
+		{"sops file", m.Sops.Files},
+		{"secret file", m.Secrets.Files},
+		{"pre_deploy hook", m.PreDeploy},
+		{"post_deploy hook", m.PostDeploy},
+	} {
+		if err := repoRel(chk.kind, chk.files); err != nil {
+			return err
+		}
+	}
+	// Secret files are decrypted to fixed names (`.enc` stripped); reject
+	// degenerate names and collisions so a container never silently mounts the
+	// wrong secret. Mirrors sopsx.decryptedName.
+	seen := map[string]bool{}
+	for _, f := range m.Secrets.Files {
+		n := decryptedSecretName(f)
+		if n == "" || n == "." || n == ".." {
+			return fmt.Errorf("%s: secret file %q decrypts to an invalid name %q", path, f, n)
+		}
+		if seen[n] {
+			return fmt.Errorf("%s: secret files collide on decrypted name %q", path, n)
+		}
+		seen[n] = true
+	}
 	return nil
+}
+
+// decryptedSecretName mirrors sopsx.decryptedName: the source basename with a
+// single ".enc" marker removed. Kept here (not imported) to avoid a config→sops
+// dependency; the two must stay in sync.
+func decryptedSecretName(f string) string {
+	base := filepath.Base(f)
+	if strings.HasSuffix(base, ".enc") {
+		return base[:len(base)-len(".enc")]
+	}
+	return strings.Replace(base, ".enc.", ".", 1)
 }
 
 // Merge resolves a stack's effective recipe. server config overrides the repo
@@ -198,6 +279,9 @@ func Merge(st StackConfig, m *Manifest) Recipe {
 		r.Profiles = m.Compose.Profiles
 		r.EnvFiles = m.Compose.EnvFiles
 		r.UpArgs = m.Compose.UpArgs
+		r.SecretFiles = m.Secrets.Files
+		r.PreHooks = m.PreDeploy
+		r.PostHooks = m.PostDeploy
 	}
 	// Server overrides win over the repo.
 	if st.ComposeFile != "" {
@@ -205,6 +289,20 @@ func Merge(st StackConfig, m *Manifest) Recipe {
 	}
 	if st.ForcePull != nil {
 		r.ForcePull = *st.ForcePull
+	}
+	// sops env files are all-or-nothing per source (not a field-by-field
+	// merge): if the operator declared sops_files server-side, that wins
+	// wholesale (files + mode); otherwise the repo manifest's [sops] applies.
+	switch {
+	case len(st.SopsFiles) > 0:
+		r.SopsFiles = st.SopsFiles
+		r.SopsMode = st.SopsMode // defaulted to exec-env at config load
+	case m != nil && len(m.Sops.Files) > 0:
+		r.SopsFiles = m.Sops.Files
+		r.SopsMode = m.Sops.Mode
+		if r.SopsMode == "" {
+			r.SopsMode = "exec-env"
+		}
 	}
 	return r
 }

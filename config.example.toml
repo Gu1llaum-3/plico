@@ -102,7 +102,7 @@ socket = "/run/plico/plico.sock"
 # git_sync_alert_after = 5
 
 [hooks]
-# Global fallbacks; a hook versioned in the repo (.deploy/pre-deploy.sh)
+# Global fallbacks; a hook versioned in the repo (.plico/pre-deploy.sh)
 # always takes priority. exit != 0 in pre-deploy = deployment aborted.
 # pre_deploy_path = "/opt/plico/hooks/pre-deploy.sh"
 # post_deploy_path = "/opt/plico/hooks/post-deploy.sh"
@@ -138,7 +138,7 @@ compose_file = "docker-compose.yml"   # relative to path (or the repo root)
 force_pull = true                     # run `compose pull` before `up`
 # SOPS-encrypted dotenv files (repo-relative). Decrypted in memory via
 # `sops exec-env`; compose interpolates ${VARS} from them. Never on disk.
-sops_files = [".deploy/secrets.enc.env"]
+sops_files = ["secrets/app.enc.env"]  # repo-relative; any path you choose
 sops_mode = "exec-env"                # or "tmpfs" (Linux only)
 verify_timeout = "90s"                # post-up healthcheck budget
 # hook_timeout = "20m"                # override [hooks].timeout per stack
@@ -150,10 +150,12 @@ verify_timeout = "90s"                # post-up healthcheck budget
                                       # (kill-switch for a sensitive/untrusted repo)
 
 # Repo-side recipe: a stack's repo may carry a `.plico.toml` (or a `.plico/`
-# directory) that declares NON-SENSITIVE deployment options — compose profiles,
-# extra env_files, remove_orphans, extra `up` args, compose_file. The server
-# config here overrides it, and trust/bootstrap (repo, auth, base_dir,
-# env_passthrough, secrets) NEVER come from the repo. See the README.
+# directory) declaring the deployment recipe — compose options ([compose]),
+# encrypted env files ([sops]), encrypted files to bind-mount ([secrets], via
+# $PLICO_SECRETS_DIR), and ordered pre/post-deploy hooks. Encrypted files live
+# IN the repo; only the age key (SOPS_AGE_KEY_FILE) stays on the server. The
+# server config here overrides the repo, and bootstrap/trust (repo, auth,
+# base_dir, env_passthrough) NEVER come from the repo. See the README.
 
 # [[stack]]
 # name = "internal-tools"
@@ -166,7 +168,7 @@ verify_timeout = "90s"                # post-up healthcheck budget
 # [[stack]]
 # name = "traefik"
 # repo = "https://github.com/acme/infra.git"
-# path = "traefik"                    # <repo>/traefik/{docker-compose.yml,.deploy/…}
+# path = "traefik"                    # <repo>/traefik/{docker-compose.yml,.plico/…}
 # [[stack]]
 # name = "nextcloud"
 # repo = "https://github.com/acme/infra.git"
