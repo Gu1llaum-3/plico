@@ -847,6 +847,98 @@ func TestAssess(t *testing.T) {
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
+// --- repo-side manifest (.plico.toml) -------------------------------------
+
+func (h *harness) writeManifest(t *testing.T, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(h.worktree, ".plico.toml"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManifestDrivesComposeOptions(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, `
+[compose]
+profiles = ["web"]
+remove_orphans = false
+up_args = ["--wait"]
+`)
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	up := h.runtime.ups[0]
+	if !reflect.DeepEqual(up.ExtraArgs, []string{"--profile", "web"}) {
+		t.Errorf("ExtraArgs = %v, want [--profile web]", up.ExtraArgs)
+	}
+	// remove_orphans=false drops it; up_args follow.
+	if !reflect.DeepEqual(up.UpArgs, []string{"--wait"}) {
+		t.Errorf("UpArgs = %v, want [--wait]", up.UpArgs)
+	}
+}
+
+func TestNoManifestKeepsDefaultBehaviour(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	up := h.runtime.ups[0]
+	if len(up.ExtraArgs) != 0 {
+		t.Errorf("ExtraArgs = %v, want none", up.ExtraArgs)
+	}
+	if !reflect.DeepEqual(up.UpArgs, []string{"--remove-orphans"}) {
+		t.Errorf("UpArgs = %v, want [--remove-orphans]", up.UpArgs)
+	}
+	if up.ComposeFile != "docker-compose.yml" {
+		t.Errorf("ComposeFile = %q, want docker-compose.yml", up.ComposeFile)
+	}
+}
+
+func TestIgnoreManifestKillSwitch(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, "[compose]\nprofiles = [\"web\"]\n")
+	st := h.stack
+	st.IgnoreManifest = true
+	if got := h.deployer.RunStack(context.Background(), st); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if len(h.runtime.ups[0].ExtraArgs) != 0 {
+		t.Errorf("ignore_manifest must skip the repo recipe, got ExtraArgs %v", h.runtime.ups[0].ExtraArgs)
+	}
+}
+
+func TestBadManifestFailsLoudly(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, "[compose]\nunknown_key = true\n")
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeFailed {
+		t.Fatalf("outcome = %s, want failed", got)
+	}
+	if last := h.events.last(); last.Type != notify.DeployFailed || last.Stage != StageManifest {
+		t.Errorf("want deploy_failed at manifest stage, got %s/%s", last.Type, last.Stage)
+	}
+	if len(h.runtime.ups) != 0 {
+		t.Error("a bad manifest must abort before compose up")
+	}
+}
+
+func TestManifestComposeFileWhenServerUnset(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.writeManifest(t, "[compose]\ncompose_file = \"docker-compose.prod.yml\"\n")
+	st := h.stack
+	st.ComposeFile = "" // server unset → repo manifest supplies it
+	if got := h.deployer.RunStack(context.Background(), st); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if cf := h.runtime.ups[0].ComposeFile; cf != "docker-compose.prod.yml" {
+		t.Errorf("ComposeFile = %q, want the manifest value", cf)
+	}
+}
+
 // --- drift detection (reconciliation-lite) --------------------------------
 
 var unhealthy = []compose.Service{{Name: "api", State: "running", Health: "unhealthy"}}

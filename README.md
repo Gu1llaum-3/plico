@@ -212,6 +212,47 @@ plico beats immediately on start, then every `interval`. Set your monitor's
 grace period to **≥ 2× `interval`** so a single missed beat (restart, GC
 pause, brief blip) does not raise a false alarm.
 
+### Repo-side deployment recipe (`.plico.toml`)
+
+A stack's git repo can carry its own **non-sensitive** deployment recipe, so the
+server `plico.toml` stays minimal (repos, auth, schedule, notifiers) and the
+*how* lives with the code, versioned at the deployed revision. Two layouts under
+the stack's content root (respects `path` for monorepos):
+
+- a single file `.plico.toml`, or
+- a `.plico/` directory holding `plico.toml` (plus scripts, in later phases).
+
+```toml
+# .plico.toml — checked out at the deployed SHA
+[compose]
+compose_file   = "docker-compose.prod.yml"
+profiles       = ["web", "worker"]   # --profile, applied to pull AND up
+env_files      = ["config/app.env"]  # extra --env-file (interpolation)
+remove_orphans = false               # default true
+up_args        = ["--wait"]          # appended after `up -d`
+```
+
+**The trust boundary is strict.** The repo recipe carries only orchestration.
+It can **never** set bootstrap or trust — `repo`, `ref`, git `auth`, `base_dir`,
+`env_passthrough` (which secrets a hook may see), `sops_mode`, `schedule` — those
+live only in the server `plico.toml`. And **the server always overrides the
+repo**: an operator setting `compose_file`/`force_pull` in `plico.toml` wins, and
+`ignore_manifest = true` disables the repo recipe entirely for a sensitive stack.
+This is safe because the repo already runs arbitrary code via its hooks; a recipe
+choosing more compose flags grants no new privilege, and every hook still runs in
+the same server-scoped environment.
+
+Guardrails: `compose_file`/`env_files` must be lexically repo-relative (absolute
+paths and `..` segments rejected); the manifest file itself must not be a
+symlink (no escaping the repo, no leaking a host file into a parse-error
+notification); `up_args` is an **allowlist** of safe `up` flags in long-form
+only (`--wait`, `--pull=…`, `--scale=…`, `--build`, …), so a repo cannot
+reclaim `-p`/`-f` or the project identity that isolates stacks; unknown keys and
+missing files are hard errors (fail loudly); the manifest is **not**
+`${ENV}`-interpolated (a `${VAR}` is left for docker compose). No `.plico.toml`
+⇒ behaviour is exactly as before. (Ordered multi-hooks and sops secret *files*
+are planned follow-on phases.)
+
 ### Drift detection (reconciliation-lite)
 
 plico verifies a stack's health once, right after `up`. Between deployments —

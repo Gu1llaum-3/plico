@@ -146,6 +146,14 @@ verify_timeout = "90s"                # post-up healthcheck budget
 # schedule = "0 4 * * *"              # override the global schedule (or "@poll")
 # window = "30m"                      # override the global window
 # drift_check = false                 # opt this stack out of drift detection
+# ignore_manifest = true              # ignore the repo-side .plico.toml recipe
+                                      # (kill-switch for a sensitive/untrusted repo)
+
+# Repo-side recipe: a stack's repo may carry a `.plico.toml` (or a `.plico/`
+# directory) that declares NON-SENSITIVE deployment options — compose profiles,
+# extra env_files, remove_orphans, extra `up` args, compose_file. The server
+# config here overrides it, and trust/bootstrap (repo, auth, base_dir,
+# env_passthrough, secrets) NEVER come from the repo. See the README.
 
 # [[stack]]
 # name = "internal-tools"

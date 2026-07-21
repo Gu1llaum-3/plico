@@ -28,8 +28,14 @@ type Options struct {
 	// Wrap rewrites the final argv, e.g. into a `sops exec-env` chain that
 	// feeds decrypted secrets to the command's environment. nil = no wrap.
 	// Applied to Pull and Up, never to PS (see PS).
-	Wrap      func(argv []string) []string
-	ExtraArgs []string // e.g. --env-file /dev/shm/... in tmpfs mode
+	Wrap func(argv []string) []string
+	// ExtraArgs are TOP-LEVEL flags spliced before the subcommand, so they
+	// apply to both pull and up: --env-file (tmpfs sops), --profile, extra
+	// --env-file (manifest).
+	ExtraArgs []string
+	// UpArgs are appended AFTER `up -d` (command position): --remove-orphans
+	// and any manifest up_args.
+	UpArgs []string
 }
 
 type Runtime interface {
@@ -53,7 +59,10 @@ func (d *docker) Pull(ctx context.Context, o Options) error {
 }
 
 func (d *docker) Up(ctx context.Context, o Options) error {
-	_, err := d.run(ctx, o, "up", "-d", "--remove-orphans")
+	// --remove-orphans is no longer hardcoded: the caller decides via UpArgs
+	// (default keeps it, remove_orphans=false drops it).
+	verb := append([]string{"up", "-d"}, o.UpArgs...)
+	_, err := d.run(ctx, o, verb...)
 	return err
 }
 

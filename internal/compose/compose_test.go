@@ -19,11 +19,40 @@ func TestArgvConstruction(t *testing.T) {
 		wantArgs []string
 	}{
 		{
-			name:     "up without prefix",
-			opts:     Options{Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web"},
+			name:     "up without prefix (remove-orphans via UpArgs)",
+			opts:     Options{Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web", UpArgs: []string{"--remove-orphans"}},
 			call:     func(rt Runtime, o Options) error { return rt.Up(context.Background(), o) },
 			wantName: "docker",
 			wantArgs: []string{"compose", "-f", "docker-compose.yml", "-p", "web", "up", "-d", "--remove-orphans"},
+		},
+		{
+			name:     "up with no UpArgs drops remove-orphans",
+			opts:     Options{Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web"},
+			call:     func(rt Runtime, o Options) error { return rt.Up(context.Background(), o) },
+			wantName: "docker",
+			wantArgs: []string{"compose", "-f", "docker-compose.yml", "-p", "web", "up", "-d"},
+		},
+		{
+			name: "profiles are top-level (apply to up) + up_args after up -d",
+			opts: Options{
+				Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web",
+				ExtraArgs: []string{"--profile", "web", "--env-file", "e.env"},
+				UpArgs:    []string{"--remove-orphans", "--wait"},
+			},
+			call:     func(rt Runtime, o Options) error { return rt.Up(context.Background(), o) },
+			wantName: "docker",
+			wantArgs: []string{"compose", "-f", "docker-compose.yml", "-p", "web",
+				"--profile", "web", "--env-file", "e.env", "up", "-d", "--remove-orphans", "--wait"},
+		},
+		{
+			name: "profiles are top-level (apply to pull too)",
+			opts: Options{
+				Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web",
+				ExtraArgs: []string{"--profile", "web"},
+			},
+			call:     func(rt Runtime, o Options) error { return rt.Pull(context.Background(), o) },
+			wantName: "docker",
+			wantArgs: []string{"compose", "-f", "docker-compose.yml", "-p", "web", "--profile", "web", "pull"},
 		},
 		{
 			name: "pull with a wrap (sops exec-env single-string form)",
@@ -42,6 +71,7 @@ func TestArgvConstruction(t *testing.T) {
 			opts: Options{
 				Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web",
 				ExtraArgs: []string{"--env-file", "/dev/shm/plico/web-r1/secrets-0.env"},
+				UpArgs:    []string{"--remove-orphans"},
 			},
 			call:     func(rt Runtime, o Options) error { return rt.Up(context.Background(), o) },
 			wantName: "docker",

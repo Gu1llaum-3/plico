@@ -73,7 +73,9 @@ func TestLoadValidConfigWithDefaults(t *testing.T) {
 		t.Errorf("api.socket legacy default = %q", cfg.Api.Socket)
 	}
 	web := cfg.Stacks[0]
-	if web.Ref != "main" || web.ComposeFile != "docker-compose.yml" || !web.ForcePullEnabled() {
+	// compose_file is no longer defaulted at Load — it resolves in config.Merge
+	// (a repo manifest may supply it), so it stays unset here.
+	if web.Ref != "main" || web.ComposeFile != "" || !web.ForcePullEnabled() {
 		t.Errorf("stack defaults not applied: %+v", web)
 	}
 	if web.HookTimeout.Duration != 2*time.Minute {

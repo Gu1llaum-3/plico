@@ -65,6 +65,7 @@ const (
 	StageGitSync   = "git_sync"
 	StageQueue     = "queue_wait"
 	StageCheckout  = "checkout"
+	StageManifest  = "manifest"
 	StagePreHook   = "pre_hook"
 	StageSops      = "sops"
 	StagePull      = "pull"
@@ -154,6 +155,26 @@ func stackRoot(dir string, st config.StackConfig) string {
 		return dir
 	}
 	return filepath.Join(dir, st.Path)
+}
+
+// resolveRecipe merges the server stack config with the repo-side .plico.toml
+// found under root (read at the checked-out revision). ignore_manifest or the
+// absence of a manifest yields the pre-manifest behaviour.
+func (d *Deployer) resolveRecipe(st config.StackConfig, root string) (config.Recipe, error) {
+	if st.IgnoreManifest {
+		return config.Merge(st, nil), nil
+	}
+	path, err := config.ResolveManifest(root)
+	if err != nil {
+		return config.Recipe{}, err
+	}
+	var m *config.Manifest
+	if path != "" {
+		if m, err = config.LoadManifest(path); err != nil {
+			return config.Recipe{}, err
+		}
+	}
+	return config.Merge(st, m), nil
 }
 
 // RunStack executes one full cycle for a stack. It never panics; every error
@@ -278,6 +299,16 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		return OutcomeFailed
 	}
 
+	// 5. resolve the effective recipe: server config merged with the repo-side
+	// .plico.toml, read at the deployed revision (so it is versioned with the
+	// SHA). ignore_manifest or no manifest ⇒ pure server behaviour.
+	rec, err := d.resolveRecipe(st, root)
+	if err != nil {
+		log.Error("manifest error, deployment aborted", "stage", StageManifest, "error", err)
+		fail(notify.DeployFailed, StageManifest, err.Error(), oldSHA, state.StatusFailed)
+		return OutcomeFailed
+	}
+
 	if !repeat {
 		ev(notify.DeployStart, "", "")
 	}
@@ -315,8 +346,13 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		}
 	}
 
-	// 7. sops plumbing (F16).
-	copts := compose.Options{Dir: root, ComposeFile: st.ComposeFile, Project: st.Name}
+	// 7. sops plumbing (F16). Compose options come from the merged recipe;
+	// setupSops APPENDS its --env-file to ExtraArgs (after profiles/env_files).
+	copts := compose.Options{
+		Dir: root, ComposeFile: rec.ComposeFile, Project: st.Name,
+		ExtraArgs: rec.TopLevelArgs(),
+		UpArgs:    rec.UpArgsResolved(),
+	}
 	cleanup, err := d.setupSops(ctx, st, root, runID, &copts)
 	if err != nil {
 		log.Error("sops setup failed", "stage", StageSops, "error", err)
@@ -326,7 +362,7 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 	defer cleanup()
 
 	// 8. pull — a failure leaves the running stack untouched (F18).
-	if st.ForcePullEnabled() {
+	if rec.ForcePull {
 		if err := d.runtime.Pull(ctx, copts); err != nil {
 			log.Error("pull failed, running stack untouched", "stage", StagePull, "error", err)
 			fail(notify.DeployFailed, StagePull, err.Error(), oldSHA, state.StatusFailed)
@@ -632,7 +668,7 @@ func (d *Deployer) setupSops(ctx context.Context, st config.StackConfig, dir, ru
 		if err != nil {
 			return func() {}, err
 		}
-		opts.ExtraArgs = env.Args
+		opts.ExtraArgs = append(opts.ExtraArgs, env.Args...)
 		return env.Cleanup, nil
 	}
 	// exec-env: paths stay repo-relative, the command runs with Dir = worktree.

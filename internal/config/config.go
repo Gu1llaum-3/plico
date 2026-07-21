@@ -150,6 +150,9 @@ type StackConfig struct {
 	// stack's hooks, so a secret can be exposed only to the hook that needs
 	// it rather than every stack's hooks.
 	EnvPassthrough []string `toml:"env_passthrough"`
+	// IgnoreManifest disables the repo-side .plico.toml recipe for this stack
+	// (the operator kill-switch for a sensitive/untrusted repo). Default false.
+	IgnoreManifest bool `toml:"ignore_manifest"`
 }
 
 // HookEnvPassthrough is the union of the global and this stack's passthrough
@@ -328,9 +331,10 @@ func (c *Config) applyDefaults() {
 			v := *c.DriftCheck // global default already resolved above
 			st.DriftCheck = &v
 		}
-		if st.ComposeFile == "" {
-			st.ComposeFile = "docker-compose.yml"
-		}
+		// compose_file is intentionally NOT defaulted here: the "" vs
+		// operator-set distinction must survive to config.Merge, where a repo
+		// manifest may supply it and the "docker-compose.yml" default is
+		// applied. Only deploy (via Merge) and Validate read st.ComposeFile.
 		if st.SopsMode == "" {
 			st.SopsMode = "exec-env"
 		}

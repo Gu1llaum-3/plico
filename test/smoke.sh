@@ -66,6 +66,19 @@ services:
     environment:
       SECRET_MESSAGE: ${SECRET_MESSAGE}
       PUBLIC_MESSAGE: ${PUBLIC_MESSAGE}
+  extra:
+    image: alpine:3.20
+    command: ["sleep", "300"]
+    profiles: ["extra"]
+EOF
+
+# Repo-side recipe: activate the "extra" profile so its service comes up. Proves
+# the .plico.toml is read from the repo at the deployed SHA and applied end to
+# end (a profile-gated service only starts if plico passed --profile).
+cat > .plico.toml <<'EOF'
+[compose]
+profiles = ["extra"]
+up_args = ["--wait"]
 EOF
 
 # Partial encryption, the diff-friendly workflow: .sops.yaml declares which
@@ -191,6 +204,11 @@ grep -q "age=\[\] pass=\[passed-through\]" "$MARKER" 2>/dev/null \
   || fail "hook env scoping wrong: $(grep '^age=' "$MARKER" 2>/dev/null)"
 docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -q "app running" \
   && ok "container app is running" || fail "container not running"
+# Repo manifest applied: the profile-gated "extra" service only runs if plico
+# read .plico.toml and passed --profile extra.
+docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -q "extra running" \
+  && ok "repo .plico.toml applied (profile-gated service is up)" \
+  || fail "profile-gated service not running — manifest not applied"
 
 # ── 5. SOPS and notification assertions ────────────────────────────────
 CID=$(docker compose -p smoke ps -q app)

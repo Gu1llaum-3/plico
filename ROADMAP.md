@@ -102,8 +102,16 @@ n'existe dans doco-cd.
       / exited≠0) uniquement ; le stop manuel (`exited 0`) et la stack descendue
       (0 service) sont hors périmètre (indistinguables d'un one-shot) — cut 2
       « ensemble de services attendu » si besoin un jour.
-- [ ] **Options compose fines par stack** : `profiles`, `env_files`
-      additionnels, `remove_orphans` désactivable, args `up` supplémentaires
+- [~] **Manifeste de déploiement côté repo (`.plico.toml`)** — recette
+      NON-sensible dans le dépôt (`.plico.toml` ou dossier `.plico/`), lue au SHA
+      déployé, serveur minimal. Frontière de confiance stricte : bootstrap/secrets
+      (repo, auth, base_dir, env_passthrough, sops_mode, schedule) restent
+      serveur ; **le serveur surcharge le repo** ; `ignore_manifest` = kill-switch.
+      **Phase 1 faite** : infra manifeste + **options compose fines** (`profiles`,
+      `env_files`, `remove_orphans`, args `up`, `compose_file`) — remplace l'ancien
+      item « options compose ». **Phase 2** (à venir) : hooks pré/post multiples
+      ordonnés. **Phase 3** (à venir) : refs de fichiers-secrets sops déchiffrés
+      vers un tmpfs plico-contrôlé (`PLICO_SECRETS_DIR`), Linux-only, caveat reboot.
 - [ ] **`plico healthcheck`** : sous-commande qui sonde son propre /healthz
       (HEALTHCHECK Docker, watchdog systemd)
 - [ ] **`/metrics` Prometheus** : `deployments_total`, `deploy_errors_total`,
