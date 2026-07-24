@@ -319,56 +319,80 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		ev(notify.DeployStart, "", "")
 	}
 
-	// 6. pre-deploy hook — the backup gate (F9–F14). Manually skippable
-	// only through the API's force acknowledgement, and always loud (F30).
-	// The hook runs with a scoped environment (baseline + DEPLOY_* + the
-	// global∪stack passthrough), never the daemon's secrets.
+	// 6. pre-deploy hooks — layered blocking gate (F9–F14). The operator's
+	// GLOBAL hooks (L1, [hooks].pre_deploy, absolute server paths) run FIRST,
+	// then the REPO hooks (L3, manifest pre_deploy or the default
+	// .plico/pre-deploy.sh) — global is the "backup is sacred" gate that runs
+	// regardless of the repo. Each layer is opt-outable per stack. Any non-zero
+	// exit aborts. Manually skippable only through the API's force
+	// acknowledgement, and always loud (F30). All hooks run with a scoped
+	// environment (baseline + DEPLOY_* + global∪stack passthrough).
 	hctx := hooks.Context{Stack: st.Name, Dir: root, GitRef: st.Ref, OldSHA: oldSHA, NewSHA: newSHA}
 	hookEnv := st.HookEnvPassthrough(d.cfg.Hooks.EnvPassthrough)
-	if opts.SkipPre {
-		log.Warn("PRE-DEPLOY HOOK MANUALLY SKIPPED: deploying without the backup gate",
-			"stage", StagePreHook)
-		ev(notify.PreHookSkipped, StagePreHook, "pre-deploy hook manually skipped (--skip-pre --force)")
-	} else if len(rec.PreHooks) > 0 {
-		// Manifest-declared ordered pre-hooks: a blocking gate, first non-zero
-		// exit aborts the deploy (same semantics as the single legacy hook).
-		resList, err := hooks.ResolveList(root, rec.PreHooks)
-		if err != nil {
-			log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
-			fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
-			return OutcomeFailed
-		}
-		for i, res := range resList {
-			log.Info("running pre-deploy hook", "hook", res.Path, "index", i, "of", len(resList))
+	// Repo hooks (L3) run only when enabled AND the manifest isn't ignored:
+	// ignore_manifest is a full kill-switch for an untrusted repo — it drops
+	// the whole repo recipe INCLUDING the default .plico/*.sh scripts (the
+	// operator's own global [hooks] still run).
+	repoHooksOn := st.RepoHooksEnabled() && !st.IgnoreManifest
+	runGate := func(resList []hooks.Resolution) bool {
+		for _, res := range resList {
+			log.Info("running pre-deploy hook", "hook", res.Path)
 			hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv)
 			if err != nil {
 				log.Error("pre-deploy hook failed, deployment aborted", "stage", StagePreHook, "hook", res.Path, "error", err)
 				fail(notify.PreHookFailed, StagePreHook,
 					fmt.Sprintf("hook %s: %v\n%s", res.Path, err, execx.Tail(hres.Stderr, 1024)),
 					oldSHA, state.StatusPreHookFailed)
-				return OutcomeFailed
+				return false
 			}
 		}
+		return true
+	}
+	if opts.SkipPre {
+		// The operator's explicit escape hatch skips EVERY pre-hook (global +
+		// repo) — otherwise a broken global backup would block all deploys.
+		log.Warn("PRE-DEPLOY HOOKS MANUALLY SKIPPED (--skip-pre --force): global and repo", "stage", StagePreHook)
+		ev(notify.PreHookSkipped, StagePreHook, "pre-deploy hooks manually skipped (--skip-pre --force)")
 	} else {
-		res, err := hooks.Resolve(root, hooks.RepoPreDeploy, d.cfg.Hooks.PreDeployPath)
-		if err != nil {
-			log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
-			fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
-			return OutcomeFailed
-		}
-		if res.Path == "" {
-			log.Info("no pre-deploy hook found, continuing", "stage", StagePreHook)
-			ev(notify.PreHookSkipped, StagePreHook, "no pre-deploy hook in repo or config")
-		} else {
-			log.Info("running pre-deploy hook", "hook", res.Path, "source", res.Source)
-			hres, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv)
+		ranAny := false
+		// L1 — global operator hooks (absolute), the backup-sacred gate, before the repo.
+		if st.GlobalHooksEnabled() && len(d.cfg.Hooks.PreDeploy) > 0 {
+			resList, err := hooks.ResolveList("", d.cfg.Hooks.PreDeploy)
 			if err != nil {
-				log.Error("pre-deploy hook failed, deployment aborted", "stage", StagePreHook, "error", err)
-				fail(notify.PreHookFailed, StagePreHook,
-					fmt.Sprintf("%v\n%s", err, execx.Tail(hres.Stderr, 1024)),
-					oldSHA, state.StatusPreHookFailed)
+				log.Error("global pre-deploy hook unusable", "stage", StagePreHook, "error", err)
+				fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
 				return OutcomeFailed
 			}
+			if !runGate(resList) {
+				return OutcomeFailed
+			}
+			ranAny = true
+		}
+		// L3 — repo hooks (manifest list, else default .plico/pre-deploy.sh), unless disabled.
+		if repoHooksOn {
+			var resList []hooks.Resolution
+			var err error
+			if len(rec.PreHooks) > 0 {
+				resList, err = hooks.ResolveList(root, rec.PreHooks)
+			} else {
+				var res hooks.Resolution
+				if res, err = hooks.Resolve(root, hooks.RepoPreDeploy, ""); err == nil && res.Path != "" {
+					resList = []hooks.Resolution{res}
+				}
+			}
+			if err != nil {
+				log.Error("pre-deploy hook unusable", "stage", StagePreHook, "error", err)
+				fail(notify.PreHookFailed, StagePreHook, err.Error(), oldSHA, state.StatusPreHookFailed)
+				return OutcomeFailed
+			}
+			if !runGate(resList) {
+				return OutcomeFailed
+			}
+			ranAny = ranAny || len(resList) > 0
+		}
+		if !ranAny {
+			log.Info("no pre-deploy hook found, continuing", "stage", StagePreHook)
+			ev(notify.PreHookSkipped, StagePreHook, "no pre-deploy hook (global or repo)")
 		}
 	}
 
@@ -422,29 +446,51 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		return OutcomeFailed
 	}
 
-	// 11. post-deploy hook, non-blocking (F15); manually skippable (F30,
-	// low risk).
-	if opts.SkipPost {
-		log.Info("post-deploy hook manually skipped", "stage", StagePostHook)
-	} else if len(rec.PostHooks) > 0 {
-		// Manifest-declared ordered post-hooks: resolve+run each INDIVIDUALLY so
-		// one unusable entry does not drop the others (non-blocking stage —
-		// every failure is logged, never fatal, unlike the pre-hook gate).
-		for _, rel := range rec.PostHooks {
-			res, err := hooks.Resolve(root, rel, "")
-			if err != nil || res.Path == "" {
-				log.Warn("post-deploy hook unusable (non-blocking), skipping", "stage", StagePostHook, "hook", rel, "error", err)
-				continue
-			}
-			if _, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv); err != nil {
-				log.Warn("post-deploy hook failed (non-blocking)", "stage", StagePostHook, "hook", res.Path, "error", err)
+	// 11. post-deploy hooks, non-blocking (F15), layered in reverse: REPO hooks
+	// (L3) first, then the operator's GLOBAL hooks (L1, [hooks].post_deploy) —
+	// so the operator brackets the deploy (backup before, audit/notify after).
+	// Each is resolved+run individually so one unusable entry never drops the
+	// others; every failure is logged, never fatal. Manually skippable (F30).
+	runPost := func(path string) {
+		if _, err := d.hooks.Run(ctx, path, hctx, st.HookTimeout.Duration, hookEnv); err != nil {
+			log.Warn("post-deploy hook failed (non-blocking)", "stage", StagePostHook, "hook", path, "error", err)
+		}
+	}
+	// postDeclared runs a DECLARED hook (manifest list entry or a global path):
+	// a missing/unusable one is a warning (it was declared), never fatal.
+	postDeclared := func(root, rel string) {
+		res, err := hooks.Resolve(root, rel, "")
+		if err != nil {
+			log.Warn("post-deploy hook unusable (non-blocking), skipping", "stage", StagePostHook, "hook", rel, "error", err)
+			return
+		}
+		if res.Path == "" {
+			log.Warn("post-deploy hook not found (non-blocking), skipping", "stage", StagePostHook, "hook", rel)
+			return
+		}
+		runPost(res.Path)
+	}
+	switch {
+	case opts.SkipPost:
+		log.Info("post-deploy hooks manually skipped", "stage", StagePostHook)
+	default:
+		if repoHooksOn {
+			if len(rec.PostHooks) > 0 {
+				for _, rel := range rec.PostHooks {
+					postDeclared(root, rel)
+				}
+			} else if res, err := hooks.Resolve(root, hooks.RepoPostDeploy, ""); err != nil {
+				// The default .plico/post-deploy.sh is a convention, not a
+				// declaration: present-but-unusable warns; simply absent is silent.
+				log.Warn("post-deploy hook unusable", "stage", StagePostHook, "error", err)
+			} else if res.Path != "" {
+				runPost(res.Path)
 			}
 		}
-	} else if res, err := hooks.Resolve(root, hooks.RepoPostDeploy, d.cfg.Hooks.PostDeployPath); err != nil {
-		log.Warn("post-deploy hook unusable", "stage", StagePostHook, "error", err)
-	} else if res.Path != "" {
-		if _, err := d.hooks.Run(ctx, res.Path, hctx, st.HookTimeout.Duration, hookEnv); err != nil {
-			log.Warn("post-deploy hook failed (non-blocking)", "stage", StagePostHook, "error", err)
+		if st.GlobalHooksEnabled() {
+			for _, abs := range d.cfg.Hooks.PostDeploy {
+				postDeclared("", abs)
+			}
 		}
 	}
 

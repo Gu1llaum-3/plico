@@ -204,6 +204,9 @@ events = ["all"]
 [hooks]
 # PLICO_SMOKE_PASS is opted in for the hook; SOPS_AGE_KEY_FILE is NOT.
 env_passthrough = ["PLICO_SMOKE_PASS"]
+# Global operator hooks: run on EVERY stack, in addition to the repo's hooks.
+pre_deploy = ["$WS/global-pre.sh"]
+post_deploy = ["$WS/global-post.sh"]
 
 # sops, hooks, compose options, secret files: all declared in the repo's
 # .plico/plico.toml — the server config only names the stack + repo.
@@ -212,6 +215,18 @@ name = "smoke"
 repo = "file://$ORIGIN"
 verify_timeout = "60s"
 EOF
+
+# Global operator hooks (server-side absolute paths), append to the marker so we
+# can assert they ran AND that the global pre runs before the repo pre.
+cat > "$WS/global-pre.sh" <<EOF
+#!/bin/sh
+echo "global-pre for \$DEPLOY_STACK" >> "$MARKER"
+EOF
+cat > "$WS/global-post.sh" <<EOF
+#!/bin/sh
+echo "global-post for \$DEPLOY_STACK" >> "$MARKER"
+EOF
+chmod +x "$WS/global-pre.sh" "$WS/global-post.sh"
 
 # ── 4. daemon: the age key reaches sops through plico's environment ────
 SOPS_AGE_KEY_FILE="$WS/age.key" PLICO_SMOKE_PASS="passed-through" "$PLICO" serve --config "$WS/config.toml" > "$LOG" 2>&1 &
@@ -245,6 +260,18 @@ docker compose -p smoke ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep
 # Ordered manifest hooks: pre (backup marker, above) AND post both ran.
 grep -q "post-hook ran for smoke" "$MARKER" 2>/dev/null \
   && ok "manifest post-deploy hook ran" || fail "post-deploy hook marker missing"
+# Layered hooks: the global operator hooks ran IN ADDITION to the repo hooks,
+# global pre BEFORE repo pre, global post AFTER repo post.
+gp=$(grep -n "global-pre for smoke" "$MARKER" 2>/dev/null | head -1 | cut -d: -f1)
+bl=$(grep -n "^backup for smoke" "$MARKER" 2>/dev/null | head -1 | cut -d: -f1)
+{ [ -n "$gp" ] && [ -n "$bl" ] && [ "$gp" -lt "$bl" ]; } \
+  && ok "global pre-hook ran before the repo pre-hook" \
+  || fail "global pre-hook ordering wrong (global-pre=$gp backup=$bl)"
+pp=$(grep -n "post-hook ran for smoke" "$MARKER" 2>/dev/null | head -1 | cut -d: -f1)
+gpo=$(grep -n "global-post for smoke" "$MARKER" 2>/dev/null | head -1 | cut -d: -f1)
+{ [ -n "$pp" ] && [ -n "$gpo" ] && [ "$pp" -lt "$gpo" ]; } \
+  && ok "global post-hook ran after the repo post-hook" \
+  || fail "global post-hook ordering wrong (repo-post=$pp global-post=$gpo)"
 
 # ── 5. SOPS and notification assertions ────────────────────────────────
 CID=$(docker compose -p smoke ps -q app)

@@ -102,10 +102,13 @@ socket = "/run/plico/plico.sock"
 # git_sync_alert_after = 5
 
 [hooks]
-# Global fallbacks; a hook versioned in the repo (.plico/pre-deploy.sh)
-# always takes priority. exit != 0 in pre-deploy = deployment aborted.
-# pre_deploy_path = "/opt/plico/hooks/pre-deploy.sh"
-# post_deploy_path = "/opt/plico/hooks/post-deploy.sh"
+# Global operator hooks (absolute server paths, ordered) that run on EVERY
+# stack's deploy, IN ADDITION to the repo's own hooks and regardless of what
+# the repo declares — the "backup is sacred" gate. pre_deploy runs BEFORE the
+# repo hooks and is blocking (exit != 0 = deployment aborted); post_deploy runs
+# AFTER and is non-blocking. A stack opts out with global_hooks = false.
+# pre_deploy = ["/opt/plico/hooks/backup.sh"]
+# post_deploy = ["/opt/plico/hooks/notify.sh"]
 timeout = "10m"
 # Hooks run with a SCOPED environment: a safe baseline (PATH, HOME, locale,
 # DOCKER_HOST/CONFIG/CONTEXT) + the DEPLOY_* context, and NOTHING else. The
@@ -146,8 +149,15 @@ verify_timeout = "90s"                # post-up healthcheck budget
 # schedule = "0 4 * * *"              # override the global schedule (or "@poll")
 # window = "30m"                      # override the global window
 # drift_check = false                 # opt this stack out of drift detection
-# ignore_manifest = true              # ignore the repo-side .plico.toml recipe
-                                      # (kill-switch for a sensitive/untrusted repo)
+# global_hooks = false                # opt out of the global [hooks] pre/post
+# repo_hooks = false                  # ignore the repo's own hooks (manifest
+                                      # lists AND the default .plico/*.sh) while
+                                      # KEEPING the rest of its recipe — finer than
+                                      # ignore_manifest
+# ignore_manifest = true              # full kill-switch for an untrusted repo:
+                                      # ignore the entire repo side (compose/sops/
+                                      # secrets recipe AND all repo hooks). The
+                                      # operator's global [hooks] still run.
 
 # Repo-side recipe: a stack's repo may carry a `.plico.toml` (or a `.plico/`
 # directory) declaring the deployment recipe — compose options ([compose]),

@@ -120,6 +120,14 @@ n'existe dans doco-cd.
       plus `.deploy/` — un `.deploy/` de l'utilisateur ne peut plus être
       confondu). Validé bout-en-bout sur une VM réelle **et** dans le smoke CI
       (env + fichier chiffré + hooks pré/post, zéro clair sur disque persistant).
+- [x] **Hooks en couches** — hooks **globaux opérateur** (`[hooks].pre_deploy`/
+      `post_deploy`, chemins absolus serveur) joués sur **chaque** stack **en
+      plus** des hooks du repo (« backup sacré » qui survit à un repo qui
+      l'oublie/le remplace). Ordre : `global pre → repo pre → deploy → repo post
+      → global post`. Opt-out par stack : `global_hooks=false` (couper le
+      global), `repo_hooks=false` (ignorer les hooks du repo, plus fin
+      qu'`ignore_manifest`). `--skip-pre --force` saute **tout** le pré (échappatoire
+      opérateur). **L2** (hooks serveur par stack) différé, non prioritaire.
 - [ ] **`plico healthcheck`** : sous-commande qui sonde son propre /healthz
       (HEALTHCHECK Docker, watchdog systemd)
 - [ ] **`/metrics` Prometheus** : `deployments_total`, `deploy_errors_total`,

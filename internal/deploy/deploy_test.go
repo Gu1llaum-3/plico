@@ -856,6 +856,143 @@ func TestAssess(t *testing.T) {
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
+// --- layered hooks: global server hooks + repo hooks ----------------------
+
+func bp(b bool) *bool { return &b }
+
+// writeAbsHook writes an executable script at an absolute path (a global
+// operator hook lives on the server, not in the repo) and returns it.
+func writeAbsHook(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "hook.sh")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestGlobalHookRunsWithoutRepoHook(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	marker := filepath.Join(t.TempDir(), "m")
+	h.cfg.Hooks.PreDeploy = []string{writeAbsHook(t, `echo global >> "`+marker+`"`)}
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "global\n" {
+		t.Errorf("global hook marker = %q, want \"global\\n\"", string(b))
+	}
+}
+
+func TestGlobalHookRunsBeforeRepoHook(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	marker := filepath.Join(t.TempDir(), "m")
+	h.cfg.Hooks.PreDeploy = []string{writeAbsHook(t, `echo global >> "`+marker+`"`)}
+	h.writePreHook(t, `echo repo >> "`+marker+`"`) // .plico/pre-deploy.sh
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "global\nrepo\n" {
+		t.Errorf("order = %q, want global then repo", string(b))
+	}
+}
+
+func TestGlobalHooksOptOut(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	marker := filepath.Join(t.TempDir(), "m")
+	h.cfg.Hooks.PreDeploy = []string{writeAbsHook(t, `echo global >> "`+marker+`"`)}
+	h.writePreHook(t, `echo repo >> "`+marker+`"`)
+	st := h.stack
+	st.GlobalHooks = bp(false)
+	if got := h.deployer.RunStack(context.Background(), st); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "repo\n" {
+		t.Errorf("marker = %q, want only repo (global opted out)", string(b))
+	}
+}
+
+func TestRepoHooksDisabledKeepsGlobal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	marker := filepath.Join(t.TempDir(), "m")
+	h.cfg.Hooks.PreDeploy = []string{writeAbsHook(t, `echo global >> "`+marker+`"`)}
+	h.writePreHook(t, `echo repo >> "`+marker+`"`)
+	st := h.stack
+	st.RepoHooks = bp(false)
+	if got := h.deployer.RunStack(context.Background(), st); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "global\n" {
+		t.Errorf("marker = %q, want only global (repo hooks disabled)", string(b))
+	}
+}
+
+// ignore_manifest is a full kill-switch: it drops the repo recipe AND the
+// repo's default .plico/*.sh hooks, but the operator's global hooks still run.
+func TestIgnoreManifestSkipsRepoHooksKeepsGlobal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	marker := filepath.Join(t.TempDir(), "m")
+	h.cfg.Hooks.PreDeploy = []string{writeAbsHook(t, `echo global >> "`+marker+`"`)}
+	h.writePreHook(t, `echo repo >> "`+marker+`"`) // repo default .plico/pre-deploy.sh
+	st := h.stack
+	st.IgnoreManifest = true
+	if got := h.deployer.RunStack(context.Background(), st); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "global\n" {
+		t.Errorf("marker = %q, want only global (ignore_manifest drops repo hooks)", string(b))
+	}
+}
+
+func TestGlobalPreHookFailureAborts(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.cfg.Hooks.PreDeploy = []string{writeAbsHook(t, "echo boom >&2; exit 1")}
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeFailed {
+		t.Fatalf("outcome = %s, want failed", got)
+	}
+	if last := h.events.last(); last.Type != notify.PreHookFailed {
+		t.Errorf("want pre_hook_failed, got %s", last.Type)
+	}
+	if len(h.runtime.ups) != 0 {
+		t.Error("a failed global gate must abort before compose up")
+	}
+}
+
+func TestSkipPreSkipsGlobalToo(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	marker := filepath.Join(t.TempDir(), "m")
+	// This global hook would fail if run — --skip-pre must skip it (else a
+	// broken global backup would block every deploy).
+	h.cfg.Hooks.PreDeploy = []string{writeAbsHook(t, `echo global >> "`+marker+`"; exit 1`)}
+	if got := h.deployer.RunStackWith(context.Background(), h.stack, RunOptions{SkipPre: true, Force: true}); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed (--skip-pre bypasses the global gate)", got)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("global pre-hook ran despite --skip-pre")
+	}
+}
+
+func TestGlobalPostHookRunsAfterRepoPost(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	marker := filepath.Join(t.TempDir(), "m")
+	h.cfg.Hooks.PostDeploy = []string{writeAbsHook(t, `echo gpost >> "`+marker+`"`)}
+	h.writeManifest(t, "post_deploy = [\"hooks/rpost.sh\"]\n")
+	h.writeExec(t, "hooks/rpost.sh", `echo rpost >> "`+marker+`"`)
+	if got := h.deployer.RunStack(context.Background(), h.stack); got != OutcomeDeployed {
+		t.Fatalf("outcome = %s, want deployed", got)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "rpost\ngpost\n" {
+		t.Errorf("post order = %q, want repo then global", string(b))
+	}
+}
+
 // --- repo-side manifest (.plico.toml) -------------------------------------
 
 func (h *harness) writeManifest(t *testing.T, content string) {

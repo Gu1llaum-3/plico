@@ -90,9 +90,14 @@ type SmtpConfig struct {
 }
 
 type HooksConfig struct {
-	PreDeployPath  string   `toml:"pre_deploy_path"`  // global fallback (F10)
-	PostDeployPath string   `toml:"post_deploy_path"` // global fallback (F15)
-	Timeout        Duration `toml:"timeout"`          // F13, default 10m
+	// PreDeploy / PostDeploy are GLOBAL operator hooks (absolute server paths,
+	// ordered) that run on EVERY stack's deploy, IN ADDITION to the repo's
+	// hooks and regardless of what the repo declares — the "backup is sacred"
+	// gate. Pre = blocking (runs before the repo hooks); post = non-blocking
+	// (runs after). A stack opts out with global_hooks = false.
+	PreDeploy  []string `toml:"pre_deploy"`
+	PostDeploy []string `toml:"post_deploy"`
+	Timeout    Duration `toml:"timeout"` // F13, default 10m
 	// EnvPassthrough lists environment variable NAMES a hook may receive on
 	// top of the safe baseline + DEPLOY_* (e.g. SOPS_AGE_KEY_FILE, AWS creds
 	// for a restic backup). Everything else in the daemon environment is
@@ -150,9 +155,21 @@ type StackConfig struct {
 	// stack's hooks, so a secret can be exposed only to the hook that needs
 	// it rather than every stack's hooks.
 	EnvPassthrough []string `toml:"env_passthrough"`
-	// IgnoreManifest disables the repo-side .plico.toml recipe for this stack
-	// (the operator kill-switch for a sensitive/untrusted repo). Default false.
+	// IgnoreManifest is the full kill-switch for an untrusted repo: it drops the
+	// entire repo side for this stack — the .plico.toml recipe AND the repo's
+	// hooks (default .plico/*.sh included). The operator's global [hooks] still
+	// run. Default false. (repo_hooks=false is the finer variant: hooks off,
+	// recipe kept.)
 	IgnoreManifest bool `toml:"ignore_manifest"`
+	// GlobalHooks: run the global [hooks].pre_deploy/post_deploy on this stack.
+	// nil = default true; set false to opt this stack out of the operator's
+	// global hooks (e.g. a stateless stack that needs no backup).
+	GlobalHooks *bool `toml:"global_hooks"`
+	// RepoHooks: run the repo's own hooks (manifest pre_deploy/post_deploy and
+	// the default .plico/*.sh) on this stack. nil = default true; set false to
+	// ignore the repo's scripts while keeping the rest of its recipe (finer
+	// than ignore_manifest).
+	RepoHooks *bool `toml:"repo_hooks"`
 }
 
 // HookEnvPassthrough is the union of the global and this stack's passthrough
@@ -166,6 +183,16 @@ func (s StackConfig) HookEnvPassthrough(global []string) []string {
 // CheckEnabled resolves the *bool (false when unset after defaults).
 func (s StackConfig) CheckEnabled() bool {
 	return s.Check != nil && *s.Check
+}
+
+// GlobalHooksEnabled resolves the *bool (default true when unset).
+func (s StackConfig) GlobalHooksEnabled() bool {
+	return s.GlobalHooks == nil || *s.GlobalHooks
+}
+
+// RepoHooksEnabled resolves the *bool (default true when unset).
+func (s StackConfig) RepoHooksEnabled() bool {
+	return s.RepoHooks == nil || *s.RepoHooks
 }
 
 // DriftCheckEnabled resolves the *bool (defaults inherited from the global in
@@ -363,6 +390,13 @@ func (c *Config) Validate() error {
 	}
 	if err := validateEnvNames("hooks.env_passthrough", c.Hooks.EnvPassthrough); err != nil {
 		return err
+	}
+	// Global hooks are operator scripts on the server: their paths must be
+	// absolute (existence/executability is checked at run time).
+	for _, h := range append(append([]string{}, c.Hooks.PreDeploy...), c.Hooks.PostDeploy...) {
+		if !filepath.IsAbs(h) {
+			return fmt.Errorf("hooks pre_deploy/post_deploy %q must be an absolute path", h)
+		}
 	}
 	if _, err := time.LoadLocation(c.Timezone); err != nil {
 		return fmt.Errorf("timezone: %w", err)

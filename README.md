@@ -18,8 +18,11 @@ Every `poll_interval`, for each stack:
 
 1. `git fetch` + compare the `origin/<ref>` SHA with the last deployed SHA
    (persisted in `state.json`). No delta → silent no-op.
-2. **Pre-deploy hook**: `.plico/pre-deploy.sh` from the repo (takes
-   precedence) or a configured global path. It receives `DEPLOY_STACK`,
+2. **Pre-deploy hooks** (layered gate): the operator's **global** hooks
+   (`[hooks].pre_deploy`, absolute server paths) run first — on every stack,
+   regardless of the repo — then the **repo's** hooks (`.plico/pre-deploy.sh`
+   or the manifest `pre_deploy` list). Each layer is opt-outable per stack
+   (`global_hooks`/`repo_hooks`). They receive `DEPLOY_STACK`,
    `DEPLOY_DIR`, `DEPLOY_GIT_REF`, `DEPLOY_OLD_SHA`, `DEPLOY_NEW_SHA`.
    **`exit != 0` → deployment aborted**, notification, retried on the next
    tick.
@@ -237,7 +240,8 @@ It can **never** set bootstrap or trust — `repo`, `ref`, git `auth`, `base_dir
 `env_passthrough` (which secrets a hook may see), `sops_mode`, `schedule` — those
 live only in the server `plico.toml`. And **the server always overrides the
 repo**: an operator setting `compose_file`/`force_pull` in `plico.toml` wins, and
-`ignore_manifest = true` disables the repo recipe entirely for a sensitive stack.
+`ignore_manifest = true` is a full kill-switch for a sensitive stack — it drops
+the entire repo side, recipe and hooks (see Layered hooks).
 This is safe because the repo already runs arbitrary code via its hooks; a recipe
 choosing more compose flags grants no new privilege, and every hook still runs in
 the same server-scoped environment.
@@ -270,11 +274,31 @@ files = ["secrets/tls.enc.key"]   # bind-mount via ${PLICO_SECRETS_DIR}/tls.key
   compose file can bind-mount them RO. Cleartext lives only in RAM; the `.enc`
   marker is stripped from the target name. **Linux-only** (needs a real tmpfs),
   and a reboot clears it — the stack re-materialises them on the next deploy.
-- **`pre_deploy`/`post_deploy`** — ordered hook scripts. Pre-hooks are the
-  blocking backup gate (first non-zero exit aborts); post-hooks are
-  non-blocking. They run in the same server-scoped environment as the default
-  `.plico/*.sh` hooks (no daemon secrets unless `env_passthrough`). If unset,
-  the default single `.plico/pre-deploy.sh`/`post-deploy.sh` still apply.
+- **`pre_deploy`/`post_deploy`** — ordered repo hook scripts. Pre-hooks are a
+  blocking gate (first non-zero exit aborts); post-hooks are non-blocking. They
+  run in the same server-scoped environment as the default `.plico/*.sh` hooks
+  (no daemon secrets unless `env_passthrough`). If unset, the default single
+  `.plico/pre-deploy.sh`/`post-deploy.sh` still apply.
+
+**Layered hooks.** The operator can define **global** hooks in the server
+`[hooks].pre_deploy`/`post_deploy` (absolute paths) that run on **every** stack
+**in addition to** the repo's hooks and regardless of what the repo declares —
+the "backup is sacred" gate that survives a repo forgetting or replacing it.
+Order: `global pre → repo pre → deploy → repo post → global post` (the operator
+brackets the repo). Global hooks are server scripts — reference the deploy tree
+via `$DEPLOY_DIR` rather than relying on the working directory (which is the
+stack's checked-out content root). A stack sets `global_hooks = false` to skip
+the global hooks, or `repo_hooks = false` to ignore the repo's own hooks
+(manifest lists **and** the default `.plico/*.sh`) while keeping the rest of its
+recipe. `deploy-now --skip-pre --force` skips **all** pre-hooks (global
+included), the operator's explicit escape hatch.
+
+`ignore_manifest = true` is the **full kill-switch** for an untrusted repo: it
+drops the entire repo side — the `.plico.toml` recipe (compose options, sops,
+secrets, hook lists) **and** the repo's default `.plico/*.sh` hooks — so no
+repo-provided code runs (the operator's global `[hooks]` still do). `repo_hooks
+= false` is the finer tool: it drops only the repo's hooks while keeping the
+rest of its recipe (compose/sops/secrets).
 
 Guardrails: `compose_file`/`env_files`/`[sops]`/`[secrets]`/hook paths must be
 lexically repo-relative (absolute paths and `..` segments rejected); the

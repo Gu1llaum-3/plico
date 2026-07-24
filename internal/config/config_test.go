@@ -162,6 +162,35 @@ repo = "https://example.com/a.git"
 	}
 }
 
+func TestGlobalAndRepoHooksDefaultTrue(t *testing.T) {
+	t.Parallel()
+	cfg, err := Load(writeConfig(t, `
+base_dir = "/opt/docker"
+[hooks]
+pre_deploy = ["/etc/plico/backup.sh"]
+[[stack]]
+name = "a"
+repo = "https://example.com/a.git"
+[[stack]]
+name = "b"
+repo = "https://example.com/b.git"
+global_hooks = false
+repo_hooks = false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Hooks.PreDeploy) != 1 {
+		t.Errorf("global pre_deploy not decoded: %v", cfg.Hooks.PreDeploy)
+	}
+	if !cfg.Stacks[0].GlobalHooksEnabled() || !cfg.Stacks[0].RepoHooksEnabled() {
+		t.Error("unset toggles must default true")
+	}
+	if cfg.Stacks[1].GlobalHooksEnabled() || cfg.Stacks[1].RepoHooksEnabled() {
+		t.Error("explicit false must opt out")
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	t.Setenv("PLICO_TEST_TOKEN", "x")
 	base := `
@@ -194,6 +223,8 @@ repo = "https://example.com/repo.git"
 		{"escaping path", base + "\npath = \"../../evil\"\n", "repo-relative subdirectory"},
 		{"traversal path segment", base + "\npath = \"a/../../evil\"\n", "repo-relative subdirectory"},
 		{"drift_interval too small", "drift_interval = \"1s\"\n" + base, "drift_interval must be >= 5s"},
+		{"non-absolute global pre-hook", base + "\n[hooks]\npre_deploy = [\"rel/x.sh\"]\n", "absolute path"},
+		{"non-absolute global post-hook", base + "\n[hooks]\npost_deploy = [\"rel/y.sh\"]\n", "absolute path"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
