@@ -115,9 +115,28 @@ password = "${PLICO_BITBUCKET_TOKEN}"
 ```
 
 **SSH remotes** are delegated to the plico user's `~/.ssh` (agent, deploy key,
-`known_hosts`) — plico configures nothing. **Container registry** credentials
-are *not* a plico config key at all; you `docker login` as the plico user. Both
-are covered in [Concepts → Authentication](../concepts/authentication.md).
+`known_hosts`) — plico configures nothing. See
+[Concepts → Authentication](../concepts/authentication.md).
+
+## `[registry.auths."<host>"]`
+
+Per-host **container registry** credentials, the analog of `[git.auths]`, keyed
+by the registry host (`ghcr.io`, `registry.example.com:5000`, or `docker.io` for
+Docker Hub). plico registers itself as a Docker credential helper for these
+hosts, so the token is resolved on demand and **never written to disk**. A
+declared entry missing its username or password fails `plico validate`.
+
+```toml
+[registry.auths."ghcr.io"]
+username = "my-user"
+password = "${PLICO_GHCR_TOKEN}"
+```
+
+Configuring **any** `[registry.auths]` makes it authoritative for plico's pulls:
+the plico user's `~/.docker/config.json` is not consulted during a plico pull, so
+declare every private registry there. See
+[Concepts → Authentication](../concepts/authentication.md) for the mechanism and
+the `docker login` alternative.
 
 ## `[[stack]]`
 

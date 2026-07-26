@@ -80,6 +80,15 @@ func serve(configPath string) error {
 	runtime := compose.NewDocker(runner)
 	hookRunner := hooks.New(runner, log)
 	deployer := deploy.New(cfg, git, runtime, hookRunner, notifier, store, runner, log)
+	// The registry credential helper (spawned by docker in the stack worktree)
+	// re-reads the config by path, so it must be absolute — the helper's cwd is
+	// not the daemon's. Fail loudly rather than proceed with a path the helper
+	// cannot resolve.
+	absConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		return fmt.Errorf("resolving config path %q: %w", configPath, err)
+	}
+	deployer.ConfigPath = absConfig
 	sched, err := scheduler.New(cfg, deployer, store, notifier, log)
 	if err != nil {
 		return fmt.Errorf("scheduler: %w", err)

@@ -115,6 +115,42 @@ type GitConfig struct {
 	Auths map[string]GitAuth `toml:"auths"` // key = host, e.g. "bitbucket.org"
 }
 
+// RegistryAuth is a username/token pair for a container registry, the exact
+// analog of GitAuth. The token reaches `docker` through plico's credential
+// helper (see internal/registryauth); it is never written to disk.
+type RegistryAuth struct {
+	Username string `toml:"username"`
+	Password string `toml:"password"` // token, via ${ENV} interpolation
+}
+
+// RegistryConfig mirrors GitConfig: per-host registry credentials, keyed by the
+// registry host (e.g. "ghcr.io", "registry.example.com"). Server-only, like
+// git.auths — a repo manifest can never grant itself a registry credential.
+type RegistryConfig struct {
+	Auths map[string]RegistryAuth `toml:"auths"`
+}
+
+// CanonicalRegistryHost normalises a registry reference — a [registry.auths]
+// key, or the host docker hands to the credential helper — to a comparable
+// host: lowercased, scheme and path stripped, with the several spellings of
+// Docker Hub folded to "docker.io". Exported so the credential helper
+// (internal/registryauth) and this package's validation share one definition;
+// they MUST agree or a configured registry silently fails to route.
+func CanonicalRegistryHost(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	switch s {
+	case "docker.io", "index.docker.io", "registry-1.docker.io":
+		return "docker.io"
+	}
+	return s
+}
+
 type StackConfig struct {
 	Name string `toml:"name"`
 	Repo string `toml:"repo"`
@@ -232,6 +268,7 @@ type Config struct {
 	Smtp      SmtpConfig      `toml:"smtp"`
 	Hooks     HooksConfig     `toml:"hooks"`
 	Git       GitConfig       `toml:"git"`
+	Registry  RegistryConfig  `toml:"registry"`
 
 	// GitSyncAlertAfter fires git_sync_failed after N consecutive git sync
 	// failures for a stack (0 disables; unset = 5).
@@ -283,6 +320,30 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// LoadRegistryAuths reads just the [registry.auths] table from path, with
+// ${ENV} interpolation, and nothing else. It is used by the credential-helper
+// mode (see internal/registryauth), which must resolve a token on demand
+// without paying for — or being coupled to — full config validation. Unknown
+// keys elsewhere are ignored on purpose: the helper only cares about registry
+// credentials, and the daemon has already validated the whole file.
+func LoadRegistryAuths(path string) (map[string]RegistryAuth, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	text, err := Interpolate(string(raw))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	var partial struct {
+		Registry RegistryConfig `toml:"registry"`
+	}
+	if _, err := toml.Decode(text, &partial); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return partial.Registry.Auths, nil
 }
 
 func (c *Config) applyDefaults() {
@@ -397,6 +458,25 @@ func (c *Config) Validate() error {
 		if !filepath.IsAbs(h) {
 			return fmt.Errorf("hooks pre_deploy/post_deploy %q must be an absolute path", h)
 		}
+	}
+	// A declared registry credential missing its username or token is a
+	// misconfiguration, not something to skip silently (fail loudly). Two hosts
+	// that normalise to the same registry (e.g. "docker.io" and
+	// "index.docker.io") are rejected too: they would collapse to one
+	// credHelpers route and lookup would pick a credential non-deterministically.
+	canon := map[string]string{}
+	for host, a := range c.Registry.Auths {
+		if host == "" {
+			return fmt.Errorf("registry.auths: empty registry host")
+		}
+		if a.Username == "" || a.Password == "" {
+			return fmt.Errorf("registry.auths[%q]: username and password are required", host)
+		}
+		ch := CanonicalRegistryHost(host)
+		if prev, ok := canon[ch]; ok {
+			return fmt.Errorf("registry.auths: %q and %q refer to the same registry %q", prev, host, ch)
+		}
+		canon[ch] = host
 	}
 	if _, err := time.LoadLocation(c.Timezone); err != nil {
 		return fmt.Errorf("timezone: %w", err)

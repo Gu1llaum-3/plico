@@ -20,6 +20,7 @@ import (
 	"github.com/Gu1llaum-3/plico/internal/gitrepo"
 	"github.com/Gu1llaum-3/plico/internal/hooks"
 	"github.com/Gu1llaum-3/plico/internal/notify"
+	"github.com/Gu1llaum-3/plico/internal/registryauth"
 	"github.com/Gu1llaum-3/plico/internal/state"
 )
 
@@ -394,6 +395,56 @@ func TestSopsExecEnvPrefixReachesCompose(t *testing.T) {
 		want := []string{"sops", "exec-env", "secrets/app.enc.env", "'docker' 'compose' 'up' '-d'"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("wrapped argv = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestRegistryAuthEnvReachesPullAndUp(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Registry.Auths = map[string]config.RegistryAuth{
+		"ghcr.io": {Username: "bot", Password: "tok"},
+	}
+	// The wiring is opt-in on a non-empty ConfigPath (the helper resolves tokens
+	// by re-reading it); the path need not exist for this env-plumbing test.
+	h.deployer.ConfigPath = filepath.Join(t.TempDir(), "config.toml")
+
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %v", outcome)
+	}
+	if len(h.runtime.pulls) == 0 || len(h.runtime.ups) == 0 {
+		t.Fatal("expected a pull and an up")
+	}
+	for _, tc := range []struct {
+		what string
+		env  []string
+	}{{"pull", h.runtime.pulls[0].Env}, {"up", h.runtime.ups[0].Env}} {
+		m := map[string]string{}
+		for _, e := range tc.env {
+			if i := strings.IndexByte(e, '='); i >= 0 {
+				m[e[:i]] = e[i+1:]
+			}
+		}
+		if m["DOCKER_CONFIG"] == "" {
+			t.Errorf("%s: DOCKER_CONFIG not injected: %v", tc.what, tc.env)
+		}
+		if m[registryauth.EnvFlag] != "1" {
+			t.Errorf("%s: credential-helper flag not set", tc.what)
+		}
+		if m[registryauth.EnvConfig] != h.deployer.ConfigPath {
+			t.Errorf("%s: helper config path = %q", tc.what, m[registryauth.EnvConfig])
+		}
+	}
+}
+
+func TestRegistryAuthOptInWhenUnconfigured(t *testing.T) {
+	h := newHarness(t) // no Registry.Auths
+	h.deployer.ConfigPath = filepath.Join(t.TempDir(), "config.toml")
+	if outcome := h.deployer.RunStack(context.Background(), h.stack); outcome != OutcomeDeployed {
+		t.Fatalf("outcome = %v", outcome)
+	}
+	for _, e := range h.runtime.ups[0].Env {
+		if strings.HasPrefix(e, "DOCKER_CONFIG=") {
+			t.Errorf("DOCKER_CONFIG must not be touched without [registry.auths]: %q", e)
 		}
 	}
 }

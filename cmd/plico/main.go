@@ -6,7 +6,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Gu1llaum-3/plico/internal/config"
 	"github.com/Gu1llaum-3/plico/internal/gitrepo"
+	"github.com/Gu1llaum-3/plico/internal/registryauth"
 )
 
 func main() {
@@ -21,6 +23,18 @@ func main() {
 			fmt.Println(os.Getenv(gitrepo.EnvPassword))
 		}
 		return
+	}
+
+	// Credential-helper mode: when docker invokes us as docker-credential-plico
+	// (routed by the DOCKER_CONFIG that registryauth.Setup wrote), answer its
+	// registry credential requests from the config file, then exit with the
+	// code docker expects. Also runs before cobra.
+	if os.Getenv(registryauth.EnvFlag) == "1" {
+		code := registryauth.Serve(os.Args[1:], os.Stdin, os.Stdout, os.Stderr,
+			func() (map[string]config.RegistryAuth, error) {
+				return config.LoadRegistryAuths(os.Getenv(registryauth.EnvConfig))
+			})
+		os.Exit(code)
 	}
 
 	if err := rootCmd.Execute(); err != nil {

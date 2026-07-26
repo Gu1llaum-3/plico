@@ -96,8 +96,11 @@ env_passthrough = ["RESTIC_PASSWORD", "RESTIC_REPOSITORY"]
 username = "deploy-bot"
 password = "${PLICO_GITHUB_TOKEN}"
 
-# NOTE: a private container REGISTRY is not configured here — you `docker login`
-# as the plico user and the pull just works. See Concepts → Authentication.
+# Private container registry, keyed by host (the analog of [git.auths]). The
+# token reaches docker via plico's credential helper, never written to disk.
+[registry.auths."ghcr.io"]
+username = "my-user"
+password = "${PLICO_GHCR_TOKEN}"
 
 # ── Stacks ───────────────────────────────────────────────────────────
 # 1) Plain public stack; ignores the global window, deploys as soon as main moves.

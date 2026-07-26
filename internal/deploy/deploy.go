@@ -27,6 +27,7 @@ import (
 	"github.com/Gu1llaum-3/plico/internal/gitrepo"
 	"github.com/Gu1llaum-3/plico/internal/hooks"
 	"github.com/Gu1llaum-3/plico/internal/notify"
+	"github.com/Gu1llaum-3/plico/internal/registryauth"
 	"github.com/Gu1llaum-3/plico/internal/sopsx"
 	"github.com/Gu1llaum-3/plico/internal/state"
 )
@@ -100,6 +101,10 @@ type Deployer struct {
 
 	// TmpfsRoot is overridable in tests; defaults to /dev/shm on Linux.
 	TmpfsRoot string
+	// ConfigPath is the absolute path to the loaded config.toml. The registry
+	// credential helper re-reads it on demand to resolve [registry.auths]
+	// tokens; empty disables registry auth wiring (tests, host-delegated mode).
+	ConfigPath string
 	// tmpfsCheck verifies TmpfsRoot is a real tmpfs before any decrypt-to-RAM;
 	// overridable in tests (the real one refuses on non-Linux). It enforces
 	// "secrets never hit disk in cleartext" at the point of use, so it covers
@@ -419,6 +424,28 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		return OutcomeFailed
 	} else if secretsDir != "" {
 		copts.Env = append(copts.Env, "PLICO_SECRETS_DIR="+secretsDir)
+	}
+
+	// 7c. registry auth ([registry.auths], the analog of git.auths): route the
+	// configured private registries through plico's credential helper for this
+	// pull/up, without ever writing a token. Opt-in: a no-op (no DOCKER_CONFIG
+	// override) when unconfigured, so host-delegated auth is unchanged. Needs
+	// the config path so the helper can resolve tokens on demand.
+	if len(d.cfg.Registry.Auths) > 0 && d.ConfigPath != "" {
+		exe, err := os.Executable()
+		if err != nil {
+			log.Error("registry auth setup failed", "stage", StagePull, "error", err)
+			fail(notify.DeployFailed, StagePull, "registry auth: "+err.Error(), oldSHA, state.StatusFailed)
+			return OutcomeFailed
+		}
+		regEnv, regCleanup, err := registryauth.Setup(d.cfg.Registry.Auths, "", d.ConfigPath, exe)
+		if err != nil {
+			log.Error("registry auth setup failed", "stage", StagePull, "error", err)
+			fail(notify.DeployFailed, StagePull, "registry auth: "+err.Error(), oldSHA, state.StatusFailed)
+			return OutcomeFailed
+		}
+		defer regCleanup()
+		copts.Env = append(copts.Env, regEnv...)
 	}
 
 	// 8. pull — a failure leaves the running stack untouched (F18).

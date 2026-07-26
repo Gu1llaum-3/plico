@@ -331,6 +331,77 @@ repo = "https://example.com/repo.git"
 	}
 }
 
+func TestRegistryAuthParsingAndValidation(t *testing.T) {
+	t.Setenv("PLICO_TEST_REG_TOKEN", "ghp_reg_123")
+	base := `
+base_dir = "/opt/docker"
+[[stack]]
+name = "app"
+repo = "https://example.com/repo.git"
+`
+	// Valid: per-host username/password, password via ${ENV} interpolation.
+	cfg, err := Load(writeConfig(t, base+`
+[registry.auths."ghcr.io"]
+username = "deploy-bot"
+password = "${PLICO_TEST_REG_TOKEN}"
+`))
+	if err != nil {
+		t.Fatalf("valid registry auth should load: %v", err)
+	}
+	got := cfg.Registry.Auths["ghcr.io"]
+	if got.Username != "deploy-bot" {
+		t.Errorf("username = %q", got.Username)
+	}
+	if got.Password != "ghp_reg_123" {
+		t.Errorf("password interpolation failed: %q", got.Password)
+	}
+
+	// Fail loudly: a declared registry with a missing credential is not skipped.
+	if _, err := Load(writeConfig(t, base+`
+[registry.auths."ghcr.io"]
+username = "deploy-bot"
+`)); err == nil {
+		t.Error("registry auth without a password must fail validation")
+	}
+	if _, err := Load(writeConfig(t, base+`
+[registry.auths."ghcr.io"]
+password = "x"
+`)); err == nil {
+		t.Error("registry auth without a username must fail validation")
+	}
+
+	// Two hosts that normalise to the same registry would collapse to one
+	// credHelpers route and pick a credential non-deterministically: rejected.
+	if _, err := Load(writeConfig(t, base+`
+[registry.auths."docker.io"]
+username = "a"
+password = "1"
+[registry.auths."index.docker.io"]
+username = "b"
+password = "2"
+`)); err == nil {
+		t.Error("colliding registry hosts must fail validation")
+	}
+}
+
+func TestCanonicalRegistryHost(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"ghcr.io":                     "ghcr.io",
+		"GHCR.IO":                     "ghcr.io",
+		"https://ghcr.io/v2/":         "ghcr.io",
+		"registry.example.com:5000":   "registry.example.com:5000",
+		"docker.io":                   "docker.io",
+		"index.docker.io":             "docker.io",
+		"https://index.docker.io/v1/": "docker.io",
+	}
+	for in, want := range cases {
+		if got := CanonicalRegistryHost(in); got != want {
+			t.Errorf("CanonicalRegistryHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestHeartbeatConfig(t *testing.T) {
 	t.Parallel()
 	base := `

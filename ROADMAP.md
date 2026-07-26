@@ -135,17 +135,19 @@ n'existe dans doco-cd.
       doco-cd)
 - [ ] **Renovate/Dependabot** sur le repo (deps Go + versions mise épinglées)
 - [ ] Clone shallow (`--depth 1`) en option ; `ref` = tag ou SHA épinglé
-- [ ] **Auth registry natif (`[registry.auths]`)** — analogue de `[git.auths]` :
-      credentials de registry par hôte via `${ENV}`, jamais sur disque
-      persistant. Deux voies d'**orchestration** (pas de réimplémentation —
-      docker fait le vrai pull) : `docker login` dans un `DOCKER_CONFIG` sur
-      **tmpfs** au moment du deploy, ou un **credential helper**
-      `docker-credential-plico` (miroir strict de l'askpass git déjà en place
-      dans `cmd/plico/main.go`). **Piège à gérer** : ne pas masquer le
-      `~/.docker/config.json` de l'hôte (opt-in et/ou fusion de la config
-      existante). Aujourd'hui : délégué à `docker login` côté utilisateur plico
-      (défaut simple, documenté) — ce n'est donc pas « impossible / contre la
-      thèse », juste pas encore fait.
+- [x] **Auth registry natif (`[registry.auths]`)** — analogue de `[git.auths]` :
+      credentials de registry par hôte via `${ENV}`, **jamais écrits sur disque**.
+      Implémenté via un **credential helper** `docker-credential-plico` (miroir
+      strict de l'askpass git dans `cmd/plico/main.go`) : plico écrit un
+      `DOCKER_CONFIG` jetable contenant seulement le *routage* `credHelpers`
+      (aucun secret), et le helper résout le token à la demande en relisant la
+      config (`config.LoadRegistryAuths`). Normalisation Docker Hub
+      (`docker.io` → `https://index.docker.io/v1/`). **Opt-in** : sans
+      `[registry.auths]`, `DOCKER_CONFIG` n'est pas touché (délégation à l'hôte
+      inchangée). **Contrat assumé** (documenté) : dès qu'une entrée existe,
+      plico devient la source de vérité pour ses pulls — le `~/.docker/
+      config.json` de l'hôte n'est pas consulté (pas de fusion en v1). `package
+      internal/registryauth`.
 
 ## 🔒 Durcissement sécurité (issu de l'analyse concurrentielle, juillet 2026)
 

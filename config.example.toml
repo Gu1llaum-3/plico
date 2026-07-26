@@ -118,9 +118,7 @@ timeout = "10m"
 # env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
 
 # Git HTTPS credentials, one table per host (keyed by EXACT hostname). SSH
-# remotes use the plico user's ~/.ssh (agent + known_hosts). Private CONTAINER
-# REGISTRY auth is NOT a plico key: `docker login` as the plico user — the pull
-# reads its ~/.docker/config.json. See docs → Concepts → Authentication.
+# remotes use the plico user's ~/.ssh (agent + known_hosts).
 # [git.auths."bitbucket.org"]
 # username = "deploy-bot"
 # password = "${PLICO_BITBUCKET_TOKEN}"
@@ -128,6 +126,17 @@ timeout = "10m"
 # [git.auths."gitea.example.com"]
 # username = "plico"
 # password = "${PLICO_GITEA_TOKEN}"
+
+# Container registry credentials, one table per registry host (the analog of
+# git.auths). Keyed by host — use "docker.io" for Docker Hub. The token reaches
+# `docker` through plico's credential helper and is never written to disk.
+# Configuring ANY entry makes plico authoritative for its pulls (the plico
+# user's ~/.docker/config.json is not consulted then), so declare every private
+# registry here. Alternative: `docker login` as the plico user. See docs →
+# Concepts → Authentication.
+# [registry.auths."ghcr.io"]
+# username = "my-user"
+# password = "${PLICO_GHCR_TOKEN}"
 
 # ── Stacks ──────────────────────────────────────────────────────────────
 [[stack]]
