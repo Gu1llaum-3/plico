@@ -135,6 +135,17 @@ n'existe dans doco-cd.
       doco-cd)
 - [ ] **Renovate/Dependabot** sur le repo (deps Go + versions mise épinglées)
 - [ ] Clone shallow (`--depth 1`) en option ; `ref` = tag ou SHA épinglé
+- [ ] **Auth registry natif (`[registry.auths]`)** — analogue de `[git.auths]` :
+      credentials de registry par hôte via `${ENV}`, jamais sur disque
+      persistant. Deux voies d'**orchestration** (pas de réimplémentation —
+      docker fait le vrai pull) : `docker login` dans un `DOCKER_CONFIG` sur
+      **tmpfs** au moment du deploy, ou un **credential helper**
+      `docker-credential-plico` (miroir strict de l'askpass git déjà en place
+      dans `cmd/plico/main.go`). **Piège à gérer** : ne pas masquer le
+      `~/.docker/config.json` de l'hôte (opt-in et/ou fusion de la config
+      existante). Aujourd'hui : délégué à `docker login` côté utilisateur plico
+      (défaut simple, documenté) — ce n'est donc pas « impossible / contre la
+      thèse », juste pas encore fait.
 
 ## 🔒 Durcissement sécurité (issu de l'analyse concurrentielle, juillet 2026)
 

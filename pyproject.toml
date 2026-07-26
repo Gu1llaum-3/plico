@@ -1,0 +1,12 @@
+[project]
+name = "plico"
+version = "0.1.0"
+description = "Documentation toolchain for plico (Zensical static site — dev-only, no Python package is shipped)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "zensical>=0.0.51",
+]

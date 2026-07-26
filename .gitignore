@@ -9,3 +9,9 @@ config.toml
 # Test artifacts
 *.test
 coverage.out
+
+# Docs toolchain (Zensical / uv)
+/site/
+.venv/
+__pycache__/
+*.pyc

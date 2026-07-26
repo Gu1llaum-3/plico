@@ -52,3 +52,11 @@ run = "sh test/release_test.sh"
 [tasks.shellcheck]
 description = "Lint shell scripts"
 run = "shellcheck install.sh test/install_test.sh test/release_test.sh"
+
+[tasks.docs]
+description = "Build the documentation site into site/ (Zensical via uv)"
+run = "uv run zensical build --clean"
+
+[tasks.docs-serve]
+description = "Preview the documentation site with live reload (localhost:8000)"
+run = "uv run zensical serve --open"

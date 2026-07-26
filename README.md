@@ -12,122 +12,20 @@ restic, and SOPS secrets that are **never written to disk in cleartext**.
 plico **orchestrates** mature CLIs — `git`, `sops`, `docker compose` — via
 `os/exec`. It reimplements neither Git, nor Compose, nor SOPS.
 
-## How it works
+## 📖 Documentation
 
-Every `poll_interval`, for each stack:
+**Full documentation → <https://gu1llaum-3.github.io/plico/>**
 
-1. `git fetch` + compare the `origin/<ref>` SHA with the last deployed SHA
-   (persisted in `state.json`). No delta → silent no-op.
-2. **Pre-deploy hooks** (layered gate): the operator's **global** hooks
-   (`[hooks].pre_deploy`, absolute server paths) run first — on every stack,
-   regardless of the repo — then the **repo's** hooks (`.plico/pre-deploy.sh`
-   or the manifest `pre_deploy` list). Each layer is opt-outable per stack
-   (`global_hooks`/`repo_hooks`). They receive `DEPLOY_STACK`,
-   `DEPLOY_DIR`, `DEPLOY_GIT_REF`, `DEPLOY_OLD_SHA`, `DEPLOY_NEW_SHA`.
-   **`exit != 0` → deployment aborted**, notification, retried on the next
-   tick.
-   ⚠️ The daemon runs with `UMask=0022` so cloned files stay readable by
-   containers bind-mounting them under an arbitrary uid — hooks inherit it:
-   a hook writing sensitive data (a database dump before backup, say) must
-   set `umask 077` at the top of the script or write to a
-   permission-restricted directory.
-   ⚠️ Hooks run with a **scoped environment**: a safe baseline (`PATH`,
-   `HOME`, locale, `DOCKER_HOST`/`DOCKER_CONFIG`/`DOCKER_CONTEXT`) plus the
-   `DEPLOY_*` variables — the daemon's secrets (`SOPS_AGE_KEY_FILE`, notifier
-   and git tokens) are **withheld** so a repo-controlled hook cannot exfiltrate
-   them. A hook that genuinely needs another variable (e.g. `RESTIC_PASSWORD`,
-   AWS creds) opts in via `[hooks].env_passthrough` (global) or a stack's
-   `env_passthrough` (added to the global list). `SSH_AUTH_SOCK` is not in the
-   baseline — add it via passthrough for a backup-over-ssh hook.
-3. SOPS decryption in memory: `sops exec-env secrets.enc.env -- docker
-   compose … up -d`. tmpfs mode (`/dev/shm`) available on Linux.
-4. `docker compose pull` (`force_pull` option) then `up -d --remove-orphans`.
-   A failed pull leaves the running stack untouched.
-5. Post-up verification: every service `running` and `healthy` (or without a
-   healthcheck) within `verify_timeout`; immediate failure on `unhealthy`.
-6. Optional post-deploy hook (non-blocking), notification, state persisted.
+- [Getting started](https://gu1llaum-3.github.io/plico/getting-started/installation/)
+  — install, configure, and run your first deployment.
+- [Concepts](https://gu1llaum-3.github.io/plico/concepts/pipeline/) — the deploy
+  pipeline, scheduling & windows, layered hooks, secrets, drift detection.
+- [Reference](https://gu1llaum-3.github.io/plico/reference/config/) — every
+  config key, per-stack option, repo manifest, and CLI command.
+- [Operations](https://gu1llaum-3.github.io/plico/operations/layout/) — system
+  layout, systemd supervision, upgrades, and diagnostics.
 
-A run still in flight at the next tick is **skipped**, never piled up.
-
-### Per-stack scheduling
-
-Without a `schedule`, a stack is deployed as soon as a git delta is seen.
-With a `schedule` (cron, evaluated in `timezone`), each firing **opens a
-deployment window** of `window` duration (default 1 h): during the window,
-every poll tick may deploy; outside it, the stack is untouched.
-
-```toml
-schedule = "0 22 * * *"   # global: a 22:00 window for every stack
-window = "2h"
-
-[[stack]]
-name = "critical"
-schedule = "0 4 * * *"    # override: this one at 4 AM
-window = "30m"
-
-[[stack]]
-name = "dev"
-schedule = "@poll"        # opt-out: deploy on every tick, as without a schedule
-
-[[stack]]
-name = "watched"
-schedule = "0 22 * * *"
-check = true              # outside the window: fetch + diff on every tick and
-                          # a "deployment queued" notification (once per
-                          # revision) — without deploying anything
-```
-
-**The window is authoritative**: plico never deploys outside it, give or
-take one `poll_interval` of tolerance on the tick that discovers the firing
-(ticker jitter must not turn a healthy firing into a missed window). A
-firing whose window has entirely passed (daemon down, host paused, previous
-run covering the whole window) is **logged as WARN and never replayed
-late**. The schedule anchor (last accounted firing + the cron expression it
-was computed under) is persisted in `state.json`: a restart *during* a
-still-open window re-opens it; an already-honored window is not replayed;
-**editing the `schedule` re-anchors at restart** (no phantom firings under
-the new expression). The number of attempts within a window is roughly
-`window / poll_interval` — size it generously if you want retries; a run
-dispatched at the end of a window may outlive it and is attributed to the
-window that launched it. `/healthz` exposes `next_run` per stack. **DST**: a
-firing falling in the skipped hour does not run; in the repeated hour it
-runs once (first occurrence).
-
-### Monorepo: several stacks in one repo
-
-By default one repo is one stack, cloned into `<base_dir>/<name>`. Set a
-`path` to point a stack at a **subdirectory** of its repo instead — the
-`compose_file`, `sops_files` and the `.plico/` hooks resolve under it, and
-`docker compose` runs with it as its working directory (so relative
-`build:`/`env_file:` paths inside the compose file resolve correctly).
-
-```toml
-[[stack]]
-name = "traefik"
-repo = "https://github.com/acme/infra.git"
-path = "traefik"      # <repo>/traefik/{docker-compose.yml,.plico/pre-deploy.sh,…}
-
-[[stack]]
-name = "nextcloud"
-repo = "https://github.com/acme/infra.git"   # same repo, different subdir
-path = "nextcloud"
-```
-
-**Change detection is scoped to the subdirectory.** A commit that touches only
-`traefik/` redeploys `traefik` alone — `nextcloud` sees the moved repo HEAD but,
-finding nothing changed under its own subtree, stays untouched (no hook, no
-pull, no notification). This is decided by `git diff --name-only <old>..<new> --
-<path>`; a forced run (`deploy-now --force`) and the very first deploy bypass
-it, and if the diff cannot be computed (e.g. the old revision was dropped by an
-upstream force-push) plico deploys to be safe rather than miss a real change.
-
-Notes and limits: each stack still gets its **own clone** (a few MB duplicated
-per stack — plico does not share one checkout across stacks); `$DEPLOY_DIR`
-handed to hooks is the **subdirectory**, not the repo root; and a change to a
-file *outside* every stack's `path` (a shared file at the repo root) triggers no
-redeploy, since compose/sops/hooks all live under `path`.
-
-## Installation
+## Quick install
 
 On the server (Linux/systemd):
 
@@ -137,10 +35,7 @@ less install.sh          # read before running
 sudo sh install.sh
 ```
 
-The installer downloads the latest release (checksums verified), creates the
-`plico` user, the directories, the systemd unit and an example
-configuration — it never starts a service without an active configuration.
-To activate:
+Then activate the service:
 
 ```sh
 sudo cp /etc/plico/config.toml.example /etc/plico/config.toml
@@ -149,298 +44,8 @@ sudo systemctl enable --now plico
 plico status
 ```
 
-Upgrading: re-run `sudo sh install.sh` (atomic binary replacement, restart
-only when something changed, automatic rollback if the service does not come
-back). Pinning a version, local/offline binaries, `--operator`, `--config`
-for automation, macOS/FreeBSD, migrating from the historical layout and
-diagnostics: see [the installation guide](docs/installation.md).
-
-## Configuration
-
-The commented reference is [`config.example.toml`](config.example.toml),
-installed on the server as `/etc/plico/config.toml.example`. Secrets (git
-tokens, ntfy) are referenced with `${ENV_VAR}` interpolation and provided
-through `/etc/plico/plico.env` — a missing variable prevents the daemon from
-starting and fails `plico validate`.
-
-- `GET /healthz` (127.0.0.1:9444): **semantic** healthcheck — 503 when the
-  scheduler stops ticking or a run exceeds `run_timeout`.
-- Structured JSON logs (slog), one correlation `run_id` per deployment.
-
-### Notifications
-
-Three channels — `[ntfy]`, repeatable `[[webhook]]` (generic JSON, works
-as-is with Google Chat and Teams), `[smtp]` — each with its own optional
-`events` list. **The default is failure-oriented**: `pre_hook_failed`,
-`pre_hook_skipped`, `deploy_failed`, `window_missed` (a scheduled window
-produced no run), `git_sync_failed` (git fetch failing repeatedly — revoked
-token, moved repo). `deploy_success`, `deploy_queued` and `deploy_start` are
-opt-in per channel, and `events = ["all"]` selects everything:
-
-```toml
-[ntfy]
-url = "https://ntfy.example.com/plico"
-events = ["deploy_failed", "pre_hook_failed", "window_missed",
-          "git_sync_failed", "deploy_success"]   # + success, for this channel
-
-[[webhook]]
-url = "https://chat.googleapis.com/v1/spaces/.../messages?key=..."
-# no events key = failures only
-```
-
-A failing channel never breaks a deployment (the send error is logged
-locally), and a failure alert survives even a run killed by `run_timeout`.
-
-### Liveness heartbeat
-
-`[heartbeat]` turns plico into an outbound **dead-man's switch**: while the
-daemon is healthy (same predicate as `/healthz` — scheduler ticking, no stuck
-run) it GETs the configured URL every `interval`; when degraded or dead it
-stays **silent**, so the monitor alerts on the *missing* beat. It is the
-outbound mirror of `/healthz` — it works when the monitor cannot reach the
-host (behind NAT/firewall), and the silence covers both "plico degraded" and
-"plico dead" (a dead process cannot send a status). Paste the push URL your
-monitor gives you (Uptime Kuma push, Healthchecks.io, …) verbatim:
-
-```toml
-[heartbeat]
-url = "https://kuma.example.com/api/push/aBcD1234?status=up&msg=OK"
-interval = "30s"
-```
-
-A failed deployment does **not** stop the beat — the daemon is alive and
-scheduling; deploy failures are the notifiers' job. Per-stack deployment
-status is a separate concern (use `plico status` or your own monitoring).
-plico beats immediately on start, then every `interval`. Set your monitor's
-grace period to **≥ 2× `interval`** so a single missed beat (restart, GC
-pause, brief blip) does not raise a false alarm.
-
-### Repo-side deployment recipe (`.plico.toml`)
-
-A stack's git repo can carry its own **non-sensitive** deployment recipe, so the
-server `plico.toml` stays minimal (repos, auth, schedule, notifiers) and the
-*how* lives with the code, versioned at the deployed revision. Two layouts under
-the stack's content root (respects `path` for monorepos):
-
-- a single file `.plico.toml`, or
-- a `.plico/` directory holding `plico.toml` (plus scripts, in later phases).
-
-```toml
-# .plico.toml — checked out at the deployed SHA
-[compose]
-compose_file   = "docker-compose.prod.yml"
-profiles       = ["web", "worker"]   # --profile, applied to pull AND up
-env_files      = ["config/app.env"]  # extra --env-file (interpolation)
-remove_orphans = false               # default true
-up_args        = ["--wait"]          # appended after `up -d`
-```
-
-**The trust boundary is strict.** The repo recipe carries only orchestration.
-It can **never** set bootstrap or trust — `repo`, `ref`, git `auth`, `base_dir`,
-`env_passthrough` (which secrets a hook may see), `sops_mode`, `schedule` — those
-live only in the server `plico.toml`. And **the server always overrides the
-repo**: an operator setting `compose_file`/`force_pull` in `plico.toml` wins, and
-`ignore_manifest = true` is a full kill-switch for a sensitive stack — it drops
-the entire repo side, recipe and hooks (see Layered hooks).
-This is safe because the repo already runs arbitrary code via its hooks; a recipe
-choosing more compose flags grants no new privilege, and every hook still runs in
-the same server-scoped environment.
-
-The recipe also covers secrets and hooks — all repo-side, encrypted files
-committed IN the repo, only the age key stays on the server:
-
-```toml
-# .plico/plico.toml (directory form: manifest + scripts)
-pre_deploy  = [".plico/backup.sh", ".plico/migrate.sh"]  # ordered; a blocking gate
-post_deploy = [".plico/notify.sh"]                       # ordered; non-blocking
-
-[compose]
-profiles = ["monitoring"]
-
-[sops]                            # encrypted ENV files → sops exec-env / tmpfs
-files = ["secrets/app.enc.env"]   # injected as ${VAR} for compose interpolation
-mode  = "exec-env"                # or "tmpfs"
-
-[secrets]                         # encrypted FILES → decrypted onto tmpfs
-files = ["secrets/tls.enc.key"]   # bind-mount via ${PLICO_SECRETS_DIR}/tls.key
-```
-
-- **`[sops]`** — sops-encrypted dotenv files, committed in the repo, decrypted
-  in memory (never on disk) and injected as environment for `${VAR}`
-  interpolation. The server's `sops_files`, if set, override this wholesale.
-- **`[secrets]`** — sops-encrypted *files* (certs, keys) an app reads as files,
-  not env. plico decrypts them onto a stable per-stack **tmpfs** dir
-  (`/dev/shm/plico/<stack>-secrets`) exposed as **`$PLICO_SECRETS_DIR`**, so the
-  compose file can bind-mount them RO. Cleartext lives only in RAM; the `.enc`
-  marker is stripped from the target name. **Linux-only** (needs a real tmpfs),
-  and a reboot clears it — the stack re-materialises them on the next deploy.
-- **`pre_deploy`/`post_deploy`** — ordered repo hook scripts. Pre-hooks are a
-  blocking gate (first non-zero exit aborts); post-hooks are non-blocking. They
-  run in the same server-scoped environment as the default `.plico/*.sh` hooks
-  (no daemon secrets unless `env_passthrough`). If unset, the default single
-  `.plico/pre-deploy.sh`/`post-deploy.sh` still apply.
-
-**Layered hooks.** The operator can define **global** hooks in the server
-`[hooks].pre_deploy`/`post_deploy` (absolute paths) that run on **every** stack
-**in addition to** the repo's hooks and regardless of what the repo declares —
-the "backup is sacred" gate that survives a repo forgetting or replacing it.
-Order: `global pre → repo pre → deploy → repo post → global post` (the operator
-brackets the repo). Global hooks are server scripts — reference the deploy tree
-via `$DEPLOY_DIR` rather than relying on the working directory (which is the
-stack's checked-out content root). A stack sets `global_hooks = false` to skip
-the global hooks, or `repo_hooks = false` to ignore the repo's own hooks
-(manifest lists **and** the default `.plico/*.sh`) while keeping the rest of its
-recipe. `deploy-now --skip-pre --force` skips **all** pre-hooks (global
-included), the operator's explicit escape hatch.
-
-`ignore_manifest = true` is the **full kill-switch** for an untrusted repo: it
-drops the entire repo side — the `.plico.toml` recipe (compose options, sops,
-secrets, hook lists) **and** the repo's default `.plico/*.sh` hooks — so no
-repo-provided code runs (the operator's global `[hooks]` still do). `repo_hooks
-= false` is the finer tool: it drops only the repo's hooks while keeping the
-rest of its recipe (compose/sops/secrets).
-
-Guardrails: `compose_file`/`env_files`/`[sops]`/`[secrets]`/hook paths must be
-lexically repo-relative (absolute paths and `..` segments rejected); the
-manifest file itself must not be a symlink (no escaping the repo, no leaking a
-host file into a parse-error notification); a plico-decrypted secret file lands
-only in the plico-owned tmpfs dir, never a repo-chosen path; `up_args` is an
-**allowlist** of safe `up` flags in long-form only (`--wait`, `--pull=…`,
-`--scale=…`, `--build`, …), so a repo cannot reclaim `-p`/`-f` or the project
-identity that isolates stacks; unknown keys and missing files/hooks are hard
-errors (fail loudly); the manifest is **not** `${ENV}`-interpolated (a `${VAR}`
-is left for docker compose). No `.plico.toml` ⇒ behaviour is exactly as before.
-
-### Drift detection (reconciliation-lite)
-
-plico verifies a stack's health once, right after `up`. Between deployments —
-which a schedule can space days apart — a container can crash, be OOM-killed,
-or go `unhealthy` and nothing would notice (`/healthz` and the heartbeat cover
-the *daemon*, not the stacks' containers). Drift detection closes that gap: on
-by default, every `drift_interval` (2m) plico re-reads each deployed stack's
-`docker compose ps` and, on a **regression** (a service unhealthy, dead,
-crashed, or crash-looping), sends a `drift_detected` notification — and a
-`drift_resolved` one when it recovers.
-
-**Detection only — plico never auto-remediates.** Unlike Flux/Argo it does not
-re-apply desired state: a blind re-`up` on a failed migration or a corrupted
-volume can destroy data. The rule stands — backup + alert + human.
-
-```toml
-drift_check = true    # global default; set false to disable, or per stack
-drift_interval = "2m"
-```
-
-It is quiet in every ambiguous case: it only checks a stack whose last deploy
-succeeded (a verify-failed deploy that left the old version running is not
-watched until the next success), skips a stack a deploy currently owns, and
-swallows a transient `docker` error rather than cry wolf. One alert per drift
-episode (deduped), then one on recovery — except a successful redeploy closes
-an open episode silently (the deploy already re-established health). Tearing a
-drifted stack down (`compose down`) is not treated as recovery either.
-`drift_detected` is failure-oriented (on by default per channel);
-`drift_resolved` is a recovery signal, opt-in like `deploy_success`.
-
-Known limit (cut 1): a service **stopped by hand** (`compose stop` → exited 0,
-indistinguishable from a one-shot init container) and a **fully downed** stack
-(0 services) are not flagged — only unhealthy/dead/crashed services are.
-
-### System layout
-
-New installations separate persistent data from runtime:
-
-| Path | Content | Back up |
-|---|---|---|
-| `/opt/docker/<stack>` | Git worktrees, rebuildable | optional |
-| `/var/lib/plico/state.json` | SHAs, failures, queued revisions, cron anchors | **yes** |
-| `/run/plico/plico.sock*` | volatile socket and lock | no |
-| `/etc/plico` | configuration, environment, age key | **yes** |
-
-Never place a database or irreplaceable uploads inside a worktree: plico may
-delete and re-clone it to repair Git. Older configurations without
-`state_file` or `[api].socket` keep the exact historical layout under
-`base_dir`.
-
-### SOPS secrets: partial encryption recommended
-
-plico decrypts through `sops exec-env`: the repo's `.sops.yaml` is only used
-for encryption, the decryption metadata being embedded in the file itself.
-**Partial encryption** (only sensitive values encrypted, the rest readable
-in git diffs) is therefore supported natively:
-
-```yaml
-# .sops.yaml at the stack repo root
-creation_rules:
-  - path_regex: secrets/.*\.enc\.env$
-    encrypted_regex: "(SECRET|PASSWORD|TOKEN|KEY)"
-    mac_only_encrypted: true
-    age: age1...   # recipient(s)
-```
-
-```sh
-sops encrypt --in-place secrets/app.enc.env   # or: sops edit
-```
-
-⚠️ Without `mac_only_encrypted: true`, the MAC also covers cleartext values:
-a hand edit (outside `sops edit`/`sops set`) breaks decryption — plico will
-fail at the `sops` stage with "MAC mismatch".
-
-### Client CLI
-
-The daemon exposes a local API on a unix socket (`[api] socket`, recommended
-at `/run/plico/plico.sock`; historical fallback `<base_dir>/plico.sock`).
-Commands go through the daemon's locks — never a deployment concurrent with
-the scheduler:
-
-```sh
-plico status                      # per stack: status, SHA, pending, next window
-plico check-now  --stack X|--all  # immediate fetch + diff, notifies without deploying
-plico deploy-now --stack X|--all  # immediate deployment, window or not
-plico deploy-now --stack X --force            # redeploy the current revision
-plico deploy-now --stack X --force --skip-pre # skip the backup gate (loud, notified)
-plico dry-run    --stack X        # delta + pending commits, without acting
-plico validate                    # check the configuration without starting
-```
-
-Client commands only load `base_dir` and `[api].socket`: they do not need
-the Git/ntfy tokens that live only in the systemd environment. `--socket`
-skips reading the configuration entirely.
-
-`--skip-pre` is refused without `--force` — on the client **and** the daemon
-side — and fires a `pre_hook_skipped` notification. Every command accepts
-`-c` (config, to locate the socket) or `--socket`.
-
-### Git auth
-
-Per-host HTTPS via `[git.auths."<host>"]`: plico passes itself as
-`GIT_ASKPASS` to the git subprocess — the token appears **neither on disk,
-nor in argv, nor in `.git/config`**. SSH remotes use the system agent.
-
-### Supervision (systemd)
-
-Process babysitting is delegated to the supervisor; plico keeps the
-scheduling internal.
-
-The installer deploys [`packaging/plico.service`](packaging/plico.service).
-`RuntimeDirectory=plico` creates `/run/plico`, `StateDirectory=plico`
-prepares `/var/lib/plico`, and `EnvironmentFile=-/etc/plico/plico.env` keeps
-secrets out of the unit. The `-` makes the file optional on a fresh install.
-
-Applying a configuration change is `plico validate` then
-`sudo systemctl restart plico`: the restart drains in-flight runs and the
-persisted schedule anchors re-open a still-open deployment window — a
-restart **is** the reload mechanism, there is no SIGHUP.
-
-## Rollback (v1 = manual, by design)
-
-- **Code / compose configuration**: `git revert` in the stack repo; plico
-  redeploys the previous revision on the next tick.
-- **Data**: the backup taken by the pre-deploy hook (dump + restic) is
-  restored manually. No automatic restore in v1 — that is a choice.
-
-After a failed post-up verification, plico still records the new SHA so a
-broken revision is not redeployed in a loop: recovery goes through
-`git revert` (or `plico deploy-now --force`).
+See the [installation guide](https://gu1llaum-3.github.io/plico/getting-started/installation/)
+for pinned versions, offline binaries, and the full option list.
 
 ## Development
 
@@ -451,24 +56,13 @@ mise install          # go, lefthook, golangci-lint, sops, age (pinned in mise.t
 mise run build        # → bin/plico
 ```
 
-Available tasks: `mise run build | test | lint | fmt | smoke | install-test
-| release-test | shellcheck`.
+Available tasks: `mise run build | test | lint | fmt | smoke | install-test |
+release-test | shellcheck`, plus `docs | docs-serve` for the documentation site.
+Working conventions live in [`CLAUDE.md`](CLAUDE.md); scope decisions and
+rejected alternatives in [`ROADMAP.md`](ROADMAP.md).
 
-`mise run smoke` runs [`test/smoke.sh`](test/smoke.sh): a complete local
-GitOps environment (`file://` git repo, real Docker stack, **age + sops**
-encrypted secrets) verifying the nominal deployment, in-memory secret
-injection (no cleartext on disk or in logs), then the backup-gate blocking a
-bad revision. Requires a Docker daemon.
-
-## Roadmap
-
-- **v1**: webhook + SMTP notifiers, Uptime Kuma heartbeat. Already shipped:
-  per-stack cron scheduling and windows, check/apply distinction, the client
-  CLI over a unix socket. Config changes are applied with
-  `systemctl restart plico` — a graceful drain with persisted schedule
-  anchors, so a restart is the official reload mechanism (SIGHUP and
-  config.d deep-merge were considered and rejected, see
-  [ROADMAP](ROADMAP.md)).
-- **Later**: **Podman** support (the runtime already sits behind a
-  `compose.Runtime` interface), Prometheus metrics, container image,
-  webhook ingestion.
+`mise run smoke` runs [`test/smoke.sh`](test/smoke.sh): a complete local GitOps
+environment (`file://` git repo, real Docker stack, **age + sops** encrypted
+secrets) verifying the nominal deployment, in-memory secret injection (no
+cleartext on disk or in logs), then the backup gate blocking a bad revision.
+Requires a Docker daemon.

@@ -117,7 +117,10 @@ timeout = "10m"
 # (never KEY=VALUE). A per-stack env_passthrough is added to this global list.
 # env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
 
-# Git HTTPS credentials, one table per host. SSH remotes use the system agent.
+# Git HTTPS credentials, one table per host (keyed by EXACT hostname). SSH
+# remotes use the plico user's ~/.ssh (agent + known_hosts). Private CONTAINER
+# REGISTRY auth is NOT a plico key: `docker login` as the plico user — the pull
+# reads its ~/.docker/config.json. See docs → Concepts → Authentication.
 # [git.auths."bitbucket.org"]
 # username = "deploy-bot"
 # password = "${PLICO_BITBUCKET_TOKEN}"
