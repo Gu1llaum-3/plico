@@ -102,7 +102,7 @@ n'existe dans doco-cd.
       / exited≠0) uniquement ; le stop manuel (`exited 0`) et la stack descendue
       (0 service) sont hors périmètre (indistinguables d'un one-shot) — cut 2
       « ensemble de services attendu » si besoin un jour.
-- [~] **Manifeste de déploiement côté repo (`.plico.toml`)** — recette
+- [x] **Manifeste de déploiement côté repo (`.plico.toml`)** — recette
       NON-sensible dans le dépôt (`.plico.toml` ou dossier `.plico/`), lue au SHA
       déployé, serveur minimal. Frontière de confiance stricte : bootstrap/secrets
       (repo, auth, base_dir, env_passthrough, sops_mode, schedule) restent
