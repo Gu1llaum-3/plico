@@ -72,6 +72,15 @@ func serve(configPath string) error {
 	if err != nil {
 		return err
 	}
+	// Tombstones of decommissioned stacks outlive their config entry only
+	// until the operator removes the stack from config.toml and restarts.
+	inConfig := make(map[string]bool, len(cfg.Stacks))
+	for _, st := range cfg.Stacks {
+		inConfig[st.Name] = true
+	}
+	if err := store.PruneDecommissioned(func(name string) bool { return inConfig[name] }); err != nil {
+		return fmt.Errorf("pruning decommissioned stacks: %w", err)
+	}
 
 	notifier := buildNotifier(cfg, log)
 

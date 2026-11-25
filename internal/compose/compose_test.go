@@ -175,3 +175,24 @@ func TestParsePSGarbage(t *testing.T) {
 		t.Fatal("want parse error")
 	}
 }
+
+// Decommission must stop the project without ever touching its volumes: the
+// data a stack owns outlives the stack, so `down -v` is forbidden.
+func TestDownNeverRemovesVolumes(t *testing.T) {
+	t.Parallel()
+	fake := &execx.FakeRunner{Script: []execx.Response{{}}}
+	opts := Options{Dir: "/opt/docker/web", ComposeFile: "docker-compose.yml", Project: "web"}
+	if err := NewDocker(fake).Down(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.Calls[0]
+	want := []string{"compose", "-f", "docker-compose.yml", "-p", "web", "down", "--remove-orphans"}
+	if !reflect.DeepEqual(c.Args, want) {
+		t.Errorf("Args = %v\nwant  %v", c.Args, want)
+	}
+	for _, a := range c.Args {
+		if a == "-v" || a == "--volumes" {
+			t.Errorf("down must never remove volumes, got %q in %v", a, c.Args)
+		}
+	}
+}

@@ -1035,3 +1035,46 @@ func TestDriftIndependentOfDeploymentWindow(t *testing.T) {
 		t.Errorf("nightly must be drift-due at noon regardless of window, got %v", got)
 	}
 }
+
+// A decommissioned stack is out of the schedule altogether: it is never
+// dispatched (apply or check), never probed for drift, and never reported as
+// a missed window — stopping it on purpose is not a missed deployment.
+func TestDecommissionedStackIsOutOfSchedule(t *testing.T) {
+	t.Parallel()
+	loc := paris(t)
+	store := testStore(t)
+	boot := time.Date(2026, 7, 19, 3, 0, 0, 0, loc)
+	cfg := nightlyConfig(time.Hour)
+	yes := true
+	cfg.Stacks[0].Check = &yes
+	cfg.Stacks[0].DriftCheck = &yes
+	cfg.Stacks[1].DriftCheck = &yes
+	cfg.DriftInterval = config.Duration{Duration: time.Minute}
+	if err := store.Put("nightly", state.StackState{Decommissioned: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put("always", state.StackState{Decommissioned: true}); err != nil {
+		t.Fatal(err)
+	}
+	s := mustNewAt(t, cfg, &countingRunner{}, store, boot)
+	before, _ := store.Get("nightly")
+
+	for _, at := range []time.Time{
+		time.Date(2026, 7, 19, 4, 0, 30, 0, loc), // window opening
+		time.Date(2026, 7, 19, 9, 0, 0, 0, loc),  // long after the window: would be "missed"
+	} {
+		apply, check, events := s.due(at)
+		if len(apply)+len(check) != 0 {
+			t.Errorf("at %v: decommissioned stacks dispatched: apply=%v check=%v", at, apply, check)
+		}
+		if len(events) != 0 {
+			t.Errorf("at %v: decommissioned stacks must not notify: %+v", at, events)
+		}
+		if got := s.driftDue(at); len(got) != 0 {
+			t.Errorf("at %v: decommissioned stacks probed for drift: %v", at, got)
+		}
+	}
+	if after, _ := store.Get("nightly"); !after.LastFiring.Equal(before.LastFiring) {
+		t.Errorf("anchor must not advance for a decommissioned stack: %v -> %v", before.LastFiring, after.LastFiring)
+	}
+}

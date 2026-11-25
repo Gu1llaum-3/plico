@@ -386,6 +386,42 @@ grep -q "smoke: pre_hook_failed" "$NTFY_LOG" 2>/dev/null \
   && ok "pre_hook_failed notification carries the hook stderr end to end" \
   || fail "pre_hook_failed notification missing or without hook stderr"
 
+# ── 7b. decommission: stop for good, never redeployed, worktree kept ──
+# Prompt first: a mismatched confirmation must stop nothing.
+echo "not-the-name" | "$PLICO" decommission --stack smoke --config "$WS/config.toml" >/dev/null 2>&1 \
+  && fail "decommission accepted a mismatched confirmation" \
+  || ok "decommission refuses a mismatched confirmation"
+[ -n "$(docker compose -p smoke ps -q 2>/dev/null)" ] \
+  && ok "stack still running after the refused confirmation" \
+  || fail "refused decommission stopped the stack"
+
+"$PLICO" decommission --stack smoke --yes --config "$WS/config.toml" >/dev/null 2>&1 \
+  && ok "decommission --yes succeeds" || fail "decommission --yes failed"
+[ -z "$(docker compose -p smoke ps -q -a 2>/dev/null)" ] \
+  && ok "decommission stopped every container of the stack" \
+  || fail "containers of the decommissioned stack are still present"
+[ -d "$BASE/smoke/.git" ] \
+  && ok "decommission keeps the worktree" || fail "decommission removed the worktree"
+grep -q '"decommissioned": *true' "$BASE/state.json" \
+  && ok "tombstone recorded in state" || fail "no decommission tombstone in state"
+
+# The stop is notified end to end, through the real ntfy channel.
+i=0
+while [ $i -lt 10 ]; do
+  grep -q "smoke: stack_decommissioned" "$NTFY_LOG" 2>/dev/null && break
+  i=$((i+1)); sleep 1
+done
+grep -q "smoke: stack_decommissioned" "$NTFY_LOG" 2>/dev/null \
+  && ok "decommission notified over ntfy" || fail "no stack_decommissioned notification"
+
+# A new revision upstream must not bring the stack back (two poll ticks, 5s each).
+sed -i.bak 's/"301"/"302"/' docker-compose.yml && rm -f docker-compose.yml.bak
+git add -A && git commit -qm "v3 after decommission" && git push -q origin main
+sleep 12
+[ -z "$(docker compose -p smoke ps -q -a 2>/dev/null)" ] \
+  && ok "decommissioned stack is not redeployed by a new revision" \
+  || fail "decommissioned stack was redeployed"
+
 # ── 8. monorepo: two stacks in one repo, path-scoped change detection ──
 # One repo, two subdirs (a/, b/), each a stack via `path`. Proves end to end
 # (real git diff, real compose cwd) that a commit touching only a/ redeploys

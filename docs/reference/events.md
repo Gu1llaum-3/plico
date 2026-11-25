@@ -34,6 +34,7 @@ url = "https://chat.googleapis.com/v1/spaces/.../messages?key=..."
 | `deploy_queued` | opt-in | Out-of-window `check`: a new revision is pending, not deployed. |
 | `deploy_start` | opt-in | A deployment run started. |
 | `deploy_success` | opt-in | A deployment completed and verified. |
+| `stack_decommissioned` | ✅ default | An operator stopped a stack for good with `plico decommission` (volumes kept). |
 | `drift_resolved` | opt-in | A previously-drifted stack recovered. |
 
 ## Behaviour

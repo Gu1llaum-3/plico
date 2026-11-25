@@ -102,7 +102,7 @@ func init() {
 					return err
 				}
 				return printResults(cmd, results, "not deployed",
-					deploy.OutcomeFailed.String(), deploy.OutcomeSkipped.String())
+					deploy.OutcomeFailed.String(), deploy.OutcomeSkipped.String(), deploy.OutcomeDecommissioned.String())
 			},
 		}
 		conn.registerClientFlags(cmd)

@@ -35,13 +35,16 @@ const (
 	// DriftResolved: a drifted stack returned to health. A recovery/positive
 	// signal, opt-in per channel like deploy_success.
 	DriftResolved EventType = "drift_resolved"
+	// StackDecommissioned: an operator stopped a stack for good on this host
+	// (`plico decommission`). Destructive, so it notifies by default.
+	StackDecommissioned EventType = "stack_decommissioned"
 )
 
 // AllEvents lists every event type, for config validation.
 var AllEvents = []EventType{
 	DeployQueued, DeployStart, PreHookFailed, PreHookSkipped,
 	DeployFailed, DeploySuccess, WindowMissed, GitSyncFailed,
-	DriftDetected, DriftResolved,
+	DriftDetected, DriftResolved, StackDecommissioned,
 }
 
 // DefaultEvents is what a channel receives when it does not configure an
@@ -49,7 +52,7 @@ var AllEvents = []EventType{
 // deploy_start are opt-in per channel.
 var DefaultEvents = []EventType{
 	PreHookFailed, PreHookSkipped, DeployFailed, WindowMissed, GitSyncFailed,
-	DriftDetected,
+	DriftDetected, StackDecommissioned,
 }
 
 // ParseEvents validates a config-provided list. Empty means DefaultEvents;

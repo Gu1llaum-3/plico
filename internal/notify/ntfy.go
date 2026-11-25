@@ -61,7 +61,7 @@ func priorityFor(t EventType) string {
 	switch t {
 	case PreHookFailed, DeployFailed, GitSyncFailed, DriftDetected:
 		return "high"
-	case PreHookSkipped, WindowMissed:
+	case PreHookSkipped, WindowMissed, StackDecommissioned:
 		return "default"
 	case DeploySuccess, DriftResolved:
 		return "default"
@@ -76,6 +76,8 @@ func tagsFor(t EventType) string {
 		return "rotating_light"
 	case PreHookSkipped, WindowMissed:
 		return "warning"
+	case StackDecommissioned:
+		return "octagonal_sign"
 	case DeploySuccess, DriftResolved:
 		return "white_check_mark"
 	default:
