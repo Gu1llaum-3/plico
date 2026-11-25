@@ -42,6 +42,11 @@ type StackState struct {
 	// LastQueuedSHA dedupes the out-of-window "deployment queued"
 	// notification (F6): one announcement per pending revision.
 	LastQueuedSHA string `json:"last_queued_sha,omitempty"`
+	// Decommissioned is a tombstone set by `plico decommission`: the stack
+	// was stopped on purpose and must never be deployed or checked again while
+	// it stays in config.toml. It is dropped by PruneDecommissioned once the
+	// stack is removed from config.
+	Decommissioned bool `json:"decommissioned,omitempty"`
 }
 
 // Store is a concurrency-safe view of the state file.
@@ -93,6 +98,14 @@ func (s *Store) Put(stack string, st StackState) error {
 	return s.writeLocked()
 }
 
+// IsDecommissioned reports whether the stack carries a decommission tombstone.
+// It is the single definition of that check, shared by the deployer, the
+// scheduler and the API.
+func (s *Store) IsDecommissioned(stack string) bool {
+	st, _ := s.Get(stack)
+	return st.Decommissioned
+}
+
 // Update mutates one stack's state under the store lock. Writers owning
 // different fields (the deployer and the scheduler's schedule anchor) must
 // use it so they never clobber each other's fields with a stale full Put.
@@ -129,4 +142,23 @@ func (s *Store) writeLocked() error {
 		return err
 	}
 	return os.Rename(tmp.Name(), s.path)
+}
+
+// PruneDecommissioned drops the tombstones of decommissioned stacks that are
+// no longer in the configuration. Called at daemon startup, so removing a
+// stack from config.toml and restarting is what forgets it entirely.
+func (s *Store) PruneDecommissioned(inConfig func(stack string) bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for name, st := range s.data {
+		if st.Decommissioned && !inConfig(name) {
+			delete(s.data, name)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.writeLocked()
 }

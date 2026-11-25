@@ -63,6 +63,44 @@ plico deploy-now --stack webapp --force --skip-pre  # skip the gate (loud, notif
     Enforced on both the client **and** the daemon side, and it fires a
     `pre_hook_skipped` notification. It skips **all** pre-hooks, global included.
 
+## `plico decommission`
+
+Stop one stack for good on this host. It runs `docker compose down` **without
+volumes**, then marks the stack as decommissioned so no scheduler tick deploys,
+fetches or probes it again. The worktree, the named volumes and the secrets are
+left in place.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--stack <name>` | — | Stack to decommission (**required**, one stack only, never `*`). |
+| `--yes` | `false` | Skip the interactive confirmation (scripts). |
+
+Without `--yes`, plico asks you to type the stack name; anything else aborts
+and stops nothing. The daemon also requires an explicit confirmation, so the
+socket API cannot bypass it.
+
+Constraints:
+
+- The stack must still be in `config.toml`: its compose file and sops wiring
+  come from there. Decommission first, then remove it from the config.
+- It refuses while a run is in progress for the stack. Retry when the run ends.
+- If `compose down` fails, the stack stays decommissioned, so nothing redeploys
+  it while containers may still run. Fix the cause and run the command again.
+- The tombstone is dropped at the next daemon start, once the stack is no longer
+  in `config.toml`. Until then, `status` may still list the stack.
+- A decommissioned stack is out of the schedule: no deployment, no check, no
+  drift probe, and no "window missed" notification. A named `deploy-now` or
+  `check-now` on it is refused with the reason. `deploy-now --all` reports it as
+  `decommissioned` and exits non-zero, so the skip is never silent.
+
+```sh
+plico decommission --stack webapp            # asks for the name
+plico decommission --stack webapp --yes      # scripted
+```
+
+The handover procedure that uses this command is documented under
+"Moving a stack with data" in the operations section.
+
 ## `plico dry-run`
 
 Show what would be deployed — the git delta and pending commits — without

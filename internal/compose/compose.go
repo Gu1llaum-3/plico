@@ -46,6 +46,9 @@ type Options struct {
 type Runtime interface {
 	Pull(ctx context.Context, o Options) error
 	Up(ctx context.Context, o Options) error
+	// Down stops and removes the project's containers and networks. It never
+	// removes volumes: data outlives the stack (see `plico decommission`).
+	Down(ctx context.Context, o Options) error
 	PS(ctx context.Context, o Options) ([]Service, error)
 }
 
@@ -68,6 +71,11 @@ func (d *docker) Up(ctx context.Context, o Options) error {
 	// (default keeps it, remove_orphans=false drops it).
 	verb := append([]string{"up", "-d"}, o.UpArgs...)
 	_, err := d.run(ctx, o, verb...)
+	return err
+}
+
+func (d *docker) Down(ctx context.Context, o Options) error {
+	_, err := d.run(ctx, o, "down", "--remove-orphans")
 	return err
 }
 

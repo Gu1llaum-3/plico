@@ -254,6 +254,11 @@ func (s *Scheduler) due(now time.Time) (apply, check []config.StackConfig, event
 	}
 	s.mu.Lock()
 	for _, st := range s.cfg.Stacks {
+		// A decommissioned stack is out of the schedule: no dispatch, no
+		// firing accounting, no missed-window report (see decommissioned).
+		if s.store.IsDecommissioned(st.Name) {
+			continue
+		}
 		ss, scheduled := s.scheds[st.Name]
 		if !scheduled {
 			apply = append(apply, st)
@@ -474,6 +479,9 @@ func (s *Scheduler) driftDue(now time.Time) []config.StackConfig {
 	var due []config.StackConfig
 	for _, st := range s.cfg.Stacks {
 		if !st.DriftCheckEnabled() { // global default resolved per-stack at config load
+			continue
+		}
+		if s.store.IsDecommissioned(st.Name) {
 			continue
 		}
 		last := s.lastDrift[st.Name]

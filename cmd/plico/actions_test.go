@@ -17,7 +17,7 @@ func TestPrintResultsExitSemantics(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetOut(nopWriter{})
 
-	deployBad := []string{deploy.OutcomeFailed.String(), deploy.OutcomeSkipped.String()}
+	deployBad := []string{deploy.OutcomeFailed.String(), deploy.OutcomeSkipped.String(), deploy.OutcomeDecommissioned.String()}
 
 	// deploy-now: skipped means the requested deployment did not happen.
 	err := printResults(cmd, []api.ActionResult{{Stack: "web", Outcome: "skipped"}}, "not deployed", deployBad...)
@@ -31,6 +31,12 @@ func TestPrintResultsExitSemantics(t *testing.T) {
 	err = printResults(cmd, []api.ActionResult{{Stack: "web", Outcome: "deployed"}}, "not deployed", deployBad...)
 	if err != nil {
 		t.Errorf("successful deploy must exit zero: %v", err)
+	}
+
+	// deploy-now: a decommissioned stack was not deployed: exit non-zero.
+	err = printResults(cmd, []api.ActionResult{{Stack: "web", Outcome: "decommissioned"}}, "not deployed", deployBad...)
+	if err == nil {
+		t.Error("deploy-now --all must exit non-zero on a decommissioned stack")
 	}
 
 	// check-now: skipped is benign (a deploy owns the stack right now).

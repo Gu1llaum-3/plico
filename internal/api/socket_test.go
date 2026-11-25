@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -24,10 +25,19 @@ import (
 
 // fakeTrigger records every action requested through the socket API.
 type fakeTrigger struct {
-	mu      sync.Mutex
-	deploys []deploy.RunOptions
-	ctxErrs []error
-	checks  int
+	mu       sync.Mutex
+	deploys  []deploy.RunOptions
+	ctxErrs  []error
+	checks   int
+	decoms   []string
+	decomErr error
+}
+
+func (f *fakeTrigger) Decommission(_ context.Context, st config.StackConfig) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.decoms = append(f.decoms, st.Name)
+	return f.decomErr
 }
 
 func (f *fakeTrigger) RunStackWith(ctx context.Context, _ config.StackConfig, opts deploy.RunOptions) deploy.Outcome {
@@ -355,5 +365,122 @@ func TestSocketStatusIncludesStacks(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("status body missing %s: %s", want, rec.Body.String())
 		}
+	}
+}
+
+func TestDecommissionRequiresConfirmation(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	rec := do(t, s, http.MethodPost, "/v1/decommission", `{"stack":"web"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 without confirm", rec.Code)
+	}
+	if len(trigger.decoms) != 0 {
+		t.Fatal("an unconfirmed decommission must not reach the deployer")
+	}
+}
+
+func TestDecommissionRefusesAllAndDeployOptions(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	for _, body := range []string{
+		`{"stack":"*","confirm":true}`,
+		`{"stack":"","confirm":true}`,
+		`{"stack":"web","confirm":true,"force":true}`,
+	} {
+		if rec := do(t, s, http.MethodPost, "/v1/decommission", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, rec.Code)
+		}
+	}
+	if len(trigger.decoms) != 0 {
+		t.Fatalf("refused requests reached the deployer: %v", trigger.decoms)
+	}
+}
+
+func TestDecommissionCallsDeployerOnce(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	rec := do(t, s, http.MethodPost, "/v1/decommission", `{"stack":"web","confirm":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(trigger.decoms) != 1 || trigger.decoms[0] != "web" {
+		t.Errorf("decoms = %v, want [web]", trigger.decoms)
+	}
+	if !strings.Contains(rec.Body.String(), "decommissioned") {
+		t.Errorf("body = %s", rec.Body.String())
+	}
+}
+
+func TestDecommissionFailureIs409(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	trigger.decomErr = deploy.ErrStackBusy
+	rec := do(t, s, http.MethodPost, "/v1/decommission", `{"stack":"web","confirm":true}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("busy stack: status = %d, want 409", rec.Code)
+	}
+	trigger.decomErr = errors.New("sops decrypt failed")
+	rec = do(t, s, http.MethodPost, "/v1/decommission", `{"stack":"web","confirm":true}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("internal failure: status = %d, want 500 (not a conflict)", rec.Code)
+	}
+}
+
+func TestDecommissionedStackRefusesDeployWithReason(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	if err := s.store.Put("web", state.StackState{Decommissioned: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, s, http.MethodPost, "/v1/deploy", `{"stack":"web"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 for a decommissioned stack", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "decommissioned") {
+		t.Errorf("reason missing from body: %s", rec.Body.String())
+	}
+	if len(trigger.deploys) != 0 {
+		t.Error("a decommissioned stack must not reach the deployer")
+	}
+}
+
+func TestDeployAllReportsDecommissionedStacks(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	if err := s.store.Put("web", state.StackState{Decommissioned: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, s, http.MethodPost, "/v1/deploy", `{"stack":"*"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if len(trigger.deploys) != 1 {
+		t.Errorf("deploys = %d, want 1 (only the live stack)", len(trigger.deploys))
+	}
+	if !strings.Contains(rec.Body.String(), `"stack":"web","outcome":"decommissioned"`) {
+		t.Errorf("--all must report the decommissioned stack explicitly: %s", rec.Body.String())
+	}
+}
+
+func TestDecommissionPreconditionIs422(t *testing.T) {
+	t.Parallel()
+	s, trigger := socketSetup(t)
+	trigger.decomErr = fmt.Errorf("no worktree: %w", deploy.ErrPrecondition)
+	rec := do(t, s, http.MethodPost, "/v1/decommission", `{"stack":"web","confirm":true}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 for a precondition failure", rec.Code)
+	}
+}
+
+func TestDryRunDecommissionedIs422(t *testing.T) {
+	t.Parallel()
+	s, _ := socketSetup(t)
+	if err := s.store.Put("web", state.StackState{Decommissioned: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, s, http.MethodPost, "/v1/dry-run", `{"stack":"web"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rec.Code)
 	}
 }

@@ -35,6 +35,15 @@ type fakeRuntime struct {
 	psErr    error
 	pulls    []compose.Options
 	ups      []compose.Options
+	downs    []compose.Options
+	downErr  error
+}
+
+func (f *fakeRuntime) Down(_ context.Context, o compose.Options) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.downs = append(f.downs, o)
+	return f.downErr
 }
 
 func (f *fakeRuntime) Pull(_ context.Context, o compose.Options) error {

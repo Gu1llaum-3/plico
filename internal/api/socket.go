@@ -29,6 +29,7 @@ type Trigger interface {
 	RunStackWith(ctx context.Context, st config.StackConfig, opts deploy.RunOptions) deploy.Outcome
 	CheckStack(ctx context.Context, st config.StackConfig) deploy.Outcome
 	DryRun(ctx context.Context, st config.StackConfig) (deploy.DryRunReport, error)
+	Decommission(ctx context.Context, st config.StackConfig) error
 }
 
 // SocketServer serves the client CLI over a unix socket (F24–F28, F30).
@@ -72,6 +73,7 @@ func NewSocket(cfg *config.Config, sched *scheduler.Scheduler, store *state.Stor
 	mux.HandleFunc("POST /v1/check", s.handleCheck)
 	mux.HandleFunc("POST /v1/deploy", s.handleDeploy)
 	mux.HandleFunc("POST /v1/dry-run", s.handleDryRun)
+	mux.HandleFunc("POST /v1/decommission", s.handleDecommission)
 	s.server = &http.Server{
 		Handler: mux,
 		// Responses may legitimately take minutes, but request bodies are tiny.
@@ -219,12 +221,15 @@ func (s *SocketServer) Handler() http.Handler { return s.server.Handler }
 
 // ── requests / responses ────────────────────────────────────────────────
 
-// ActionRequest is the body of /v1/check, /v1/deploy and /v1/dry-run.
+// ActionRequest is the body of /v1/check, /v1/deploy, /v1/dry-run and /v1/decommission.
 type ActionRequest struct {
 	Stack    string `json:"stack"` // "*" explicitly targets all stacks (not for dry-run)
 	Force    bool   `json:"force,omitempty"`
 	SkipPre  bool   `json:"skip_pre,omitempty"`
 	SkipPost bool   `json:"skip_post,omitempty"`
+	// Confirm acknowledges a destructive action (decommission). Enforced
+	// server-side so no client can skip the confirmation the CLI prompts for.
+	Confirm bool `json:"confirm,omitempty"`
 }
 
 // ActionResult is one stack's result for check/deploy actions.
@@ -253,6 +258,47 @@ func (s *SocketServer) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDecommission stops one stack for good (see deploy.Decommission). It
+// is deliberately narrow: exactly one named stack, explicit confirmation, and
+// no deployment options.
+func (s *SocketServer) handleDecommission(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.decodeAction(w, r)
+	if !ok {
+		return
+	}
+	if req.Stack == "" || req.Stack == "*" {
+		httpError(w, http.StatusBadRequest, "decommission targets exactly one named stack")
+		return
+	}
+	if req.Force || req.SkipPre || req.SkipPost {
+		httpError(w, http.StatusBadRequest, "decommission does not accept deployment options")
+		return
+	}
+	if !req.Confirm {
+		httpError(w, http.StatusBadRequest, "decommission requires explicit confirmation")
+		return
+	}
+	stacks, err := s.selectStacks(req.Stack)
+	if err != nil {
+		httpError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.log.Warn("decommission requested via client API", "stack", req.Stack)
+	if err := s.trigger.Decommission(context.WithoutCancel(r.Context()), stacks[0]); err != nil {
+		if errors.Is(err, deploy.ErrStackBusy) {
+			httpError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, deploy.ErrPrecondition) {
+			httpError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, []ActionResult{{Stack: req.Stack, Outcome: deploy.OutcomeDecommissioned.String()}})
+}
+
 func (s *SocketServer) handleDryRun(w http.ResponseWriter, r *http.Request) {
 	req, ok := s.decodeAction(w, r)
 	if !ok {
@@ -273,6 +319,10 @@ func (s *SocketServer) handleDryRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(stacks) != 1 {
 		httpError(w, http.StatusBadRequest, "dry-run requires exactly one --stack")
+		return
+	}
+	if s.store.IsDecommissioned(req.Stack) {
+		httpError(w, http.StatusUnprocessableEntity, fmt.Sprintf("stack %q is decommissioned", req.Stack))
 		return
 	}
 	report, err := s.trigger.DryRun(r.Context(), stacks[0])
@@ -309,6 +359,12 @@ func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name
 		httpError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	// Fail loudly: a named decommissioned stack gets an explicit refusal, not
+	// a silent "skipped" that the client would have to dig out of the daemon log.
+	if req.Stack != "*" && s.store.IsDecommissioned(req.Stack) {
+		httpError(w, http.StatusUnprocessableEntity, fmt.Sprintf("stack %q is decommissioned: remove it from config.toml to forget it", req.Stack))
+		return
+	}
 	s.log.Info("manual action requested via client API", "action", name,
 		"stack", req.Stack, "force", req.Force, "skip_pre", req.SkipPre, "skip_post", req.SkipPost)
 
@@ -319,6 +375,12 @@ func (s *SocketServer) handleAction(w http.ResponseWriter, r *http.Request, name
 	results := make([]ActionResult, len(stacks))
 	var wg sync.WaitGroup
 	for i, st := range stacks {
+		// --all names every stack, so a tombstoned one is reported as such
+		// rather than silently left out of the results.
+		if s.store.IsDecommissioned(st.Name) {
+			results[i] = ActionResult{Stack: st.Name, Outcome: deploy.OutcomeDecommissioned.String()}
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

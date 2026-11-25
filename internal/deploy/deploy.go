@@ -40,8 +40,9 @@ const (
 	OutcomeUpToDate                // no git delta, nothing done
 	OutcomeDeployed
 	OutcomeFailed
-	OutcomeQueued  // check only: a delta is pending until the next window (F6)
-	OutcomeDrifted // health check only: a deployed stack has degraded
+	OutcomeQueued         // check only: a delta is pending until the next window (F6)
+	OutcomeDrifted        // health check only: a deployed stack has degraded
+	OutcomeDecommissioned // --all only: the stack was stopped with decommission
 )
 
 func (o Outcome) String() string {
@@ -56,6 +57,8 @@ func (o Outcome) String() string {
 		return "queued"
 	case OutcomeDrifted:
 		return "drifted"
+	case OutcomeDecommissioned:
+		return "decommissioned"
 	default:
 		return "failed"
 	}
@@ -63,17 +66,18 @@ func (o Outcome) String() string {
 
 // Pipeline stages, used in logs and notifications.
 const (
-	StageGitSync   = "git_sync"
-	StageQueue     = "queue_wait"
-	StageCheckout  = "checkout"
-	StageManifest  = "manifest"
-	StagePreHook   = "pre_hook"
-	StageSops      = "sops"
-	StagePull      = "pull"
-	StageUp        = "up"
-	StageVerify    = "verify"
-	StagePostHook  = "post_hook"
-	StageStateSave = "state_save"
+	StageGitSync      = "git_sync"
+	StageQueue        = "queue_wait"
+	StageCheckout     = "checkout"
+	StageManifest     = "manifest"
+	StagePreHook      = "pre_hook"
+	StageSops         = "sops"
+	StagePull         = "pull"
+	StageUp           = "up"
+	StageVerify       = "verify"
+	StagePostHook     = "post_hook"
+	StageStateSave    = "state_save"
+	StageDecommission = "decommission"
 )
 
 const (
@@ -202,6 +206,11 @@ func (d *Deployer) RunStackWith(ctx context.Context, st config.StackConfig, opts
 		return OutcomeSkipped
 	}
 	defer lock.Unlock()
+
+	if d.store.IsDecommissioned(st.Name) {
+		d.log.Warn("stack is decommissioned, not deploying (remove it from config.toml)", "stack", st.Name)
+		return OutcomeSkipped
+	}
 
 	runID := newRunID()
 	log := d.log.With("run_id", runID, "stack", st.Name)
@@ -558,6 +567,9 @@ func (d *Deployer) CheckStack(ctx context.Context, st config.StackConfig) Outcom
 		return OutcomeSkipped // a deploy is running; it owns the stack
 	}
 	defer lock.Unlock()
+	if d.store.IsDecommissioned(st.Name) {
+		return OutcomeSkipped
+	}
 
 	runID := newRunID()
 	log := d.log.With("run_id", runID, "stack", st.Name, "mode", "check")
@@ -637,6 +649,9 @@ func (d *Deployer) DryRun(ctx context.Context, st config.StackConfig) (DryRunRep
 		return DryRunReport{}, fmt.Errorf("a run is in progress for stack %q, try again later", st.Name)
 	}
 	defer lock.Unlock()
+	if d.store.IsDecommissioned(st.Name) {
+		return DryRunReport{}, fmt.Errorf("stack %q is decommissioned", st.Name)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, d.cfg.RunTimeout.Duration)
 	defer cancel()
@@ -688,6 +703,9 @@ func (d *Deployer) CheckHealth(ctx context.Context, st config.StackConfig) Outco
 		return OutcomeSkipped // a deploy owns the stack; its own verify covers health
 	}
 	defer lock.Unlock()
+	if d.store.IsDecommissioned(st.Name) {
+		return OutcomeSkipped
+	}
 
 	// Bound the probe by the health-check budget (verify_timeout), NOT the
 	// whole-deploy run_timeout: this lock is held across the ps, and a wedged
