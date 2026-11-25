@@ -49,6 +49,7 @@ nav = [
     { "Supervision (systemd)" = "operations/supervision.md" },
     { "Upgrades & rollback" = "operations/upgrades.md" },
     { "Migrating older installs" = "operations/migration.md" },
+    { "Moving a stack with data" = "operations/moving-stateful-stacks.md" },
     { "Diagnostics" = "operations/diagnostics.md" },
   ] },
 ]
